@@ -69,8 +69,10 @@ frame from encrypted records. A Rust client running from an isolated Linux
 container has also completed a real encrypted session against macOS 26.6
 `screensharingd`, recovered 53,215 decrypted ARD bytes from three authenticated
 records, and decoded the MVS updates into the complete 1920x1080 framebuffer.
-The saved plaintext stream also replays offline to a byte-identical image, so
-future decoder tests do not require a live Screen Sharing connection. See
+The canonical plaintext stream is stored once as
+`tests/fixtures/real-macos-mvs-1920x1080.bin` and replays offline to a stable
+pixel hash, so future decoder tests do not require a live Screen Sharing
+connection. See
 [`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md) for confirmed evidence
 and the exact remaining work.
 

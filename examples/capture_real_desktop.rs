@@ -203,10 +203,6 @@ fn capture(
         .into());
     }
 
-    write_hex(
-        &output_dir.join("real-ard-plaintext-stream.hex"),
-        &plaintext_stream,
-    )?;
     write_ppm_crop(
         &output_dir.join("real-frame-full.ppm"),
         &framebuffer,
@@ -385,20 +381,6 @@ fn write_ppm_crop(
                 (usize::from(row) * usize::from(framebuffer.width()) + usize::from(column)) * 4;
             output.write_all(&framebuffer.rgba()[offset..offset + 3])?;
         }
-    }
-    output.flush()
-}
-
-fn write_hex(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut output = BufWriter::new(File::create(path)?);
-    for line in bytes.chunks(16) {
-        for (index, byte) in line.iter().enumerate() {
-            if index != 0 {
-                output.write_all(b" ")?;
-            }
-            write!(output, "{byte:02x}")?;
-        }
-        output.write_all(b"\n")?;
     }
     output.flush()
 }

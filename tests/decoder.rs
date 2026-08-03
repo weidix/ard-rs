@@ -420,6 +420,45 @@ fn decodes_native_screen_sharing_solid_oracle_packet() {
 }
 
 #[test]
+fn decodes_native_type_four_bilevel_color_bits() {
+    // DecodeMVSUpdate selects the second color for a zero bit and the first
+    // color for a one bit. Each row below therefore starts black and ends
+    // with seven white pixels.
+    let mut secondary = vec![
+        (1, 1),   // two-color tile
+        (0, 1),   // replace both remembered colors
+        (255, 8), // first color: neutral white
+        (32, 6),
+        (32, 6),
+        (0, 8), // second color: neutral black
+        (32, 6),
+        (32, 6),
+        (0, 8), // every row has an explicit bit mask
+    ];
+    secondary.extend(std::iter::repeat_n((0x7f, 8), 8));
+    let packet =
+        partial_mvs_packet_with_secondary(&[(0, 1), (4, 3), (0, 1), (0x6d, 8)], &secondary);
+
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    decoder
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &packet, &mut framebuffer)
+        .unwrap();
+
+    for y in 0..8 {
+        for x in 0..8 {
+            let offset = (y * 8 + x) * 4;
+            let expected = if x == 0 {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            };
+            assert_eq!(&framebuffer.rgba()[offset..offset + 4], expected);
+        }
+    }
+}
+
+#[test]
 fn decodes_native_screen_sharing_zero_dct_oracle_packet() {
     // Exact minimum Rice/DCT record accepted by Screen Sharing on 2026-07-25.
     // Zero DC predictors plus an immediate AC end-of-block produce gray.

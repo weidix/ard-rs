@@ -6,18 +6,12 @@ use std::path::PathBuf;
 
 use ard_rs::{ArdMessageDispatcher, Decoder, Framebuffer, PixelFormat};
 
-fn decode_hex_fixture(text: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    text.split_ascii_whitespace()
-        .map(|octet| Ok(u8::from_str_radix(octet, 16)?))
-        .collect()
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = env::args_os()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/native-mvs-white-64x64.ppm"));
-    let capture = decode_hex_fixture(include_str!("../tests/fixtures/native-mvs-white-64x64.hex"))?;
+    let capture = include_bytes!("../tests/fixtures/native-mvs-white-64x64.bin");
 
     let mut dispatcher = ArdMessageDispatcher::new(1024, 1024)?;
     let mut decoder = Decoder::new(PixelFormat::XRGB8888)?;

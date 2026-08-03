@@ -345,8 +345,8 @@ impl MvsState {
                                 tile_width,
                                 tile_height,
                                 first_color,
-                                first_color,
                                 second_color,
+                                first_color,
                             )?;
                         } else {
                             if secondary.read(1)? == 0 {

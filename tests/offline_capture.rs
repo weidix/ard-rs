@@ -4,21 +4,12 @@ use ard_rs::{
 };
 use sha1::{Digest, Sha1};
 
-fn decode_hex_fixture(text: &str) -> Vec<u8> {
-    text.split_ascii_whitespace()
-        .map(|octet| {
-            assert_eq!(octet.len(), 2, "fixture octets must contain two hex digits");
-            u8::from_str_radix(octet, 16).expect("fixture must contain hexadecimal octets")
-        })
-        .collect()
-}
-
 #[test]
 fn replays_live_macos_ard_handshake_offline() {
-    let capture = decode_hex_fixture(include_str!("fixtures/macos-ard-handshake.hex"));
+    let capture = include_bytes!("fixtures/macos-ard-handshake.bin");
     assert_eq!(capture.len(), 18);
     assert_eq!(
-        ProtocolVersion::parse(&capture).unwrap(),
+        ProtocolVersion::parse(capture).unwrap(),
         ProtocolVersion::ARD_3_889
     );
 
@@ -38,7 +29,7 @@ fn replays_live_macos_ard_handshake_offline() {
 
 #[test]
 fn decodes_saved_native_oracle_mvs_frame_without_a_connection() {
-    let capture = decode_hex_fixture(include_str!("fixtures/native-mvs-white-64x64.hex"));
+    let capture = include_bytes!("fixtures/native-mvs-white-64x64.bin");
     assert_eq!(capture.len(), 31);
 
     let mut dispatcher = ArdMessageDispatcher::new(1024, 1024).unwrap();
@@ -72,11 +63,11 @@ fn decodes_saved_native_oracle_mvs_frame_without_a_connection() {
 }
 
 #[test]
-fn decodes_real_macos_mvs_capture_without_a_connection() {
-    let capture = decode_hex_fixture(include_str!("fixtures/real-macos-mvs-256x256.hex"));
-    assert_eq!(capture.len(), 4_448);
+fn decodes_complete_real_macos_mvs_frame_without_a_connection() {
+    let capture = include_bytes!("fixtures/real-macos-mvs-1920x1080.bin");
+    assert_eq!(capture.len(), 53_215);
 
-    let mut dispatcher = ArdMessageDispatcher::new(8 * 1024 * 1024, 1024).unwrap();
+    let mut dispatcher = ArdMessageDispatcher::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
     let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
     let mut framebuffer = Framebuffer::new(1920, 1080).unwrap();
     let mut messages = Vec::new();
@@ -98,24 +89,27 @@ fn decodes_real_macos_mvs_capture_without_a_connection() {
             },
             ArdServerMessage::FramebufferUpdate {
                 rectangle_count: 1,
-                bytes: 4_299,
+                bytes: 53_066,
             },
         ]
     );
+    assert!(
+        framebuffer
+            .rgba()
+            .chunks_exact(4)
+            .all(|pixel| pixel[3] == 255)
+    );
 
-    let mut ppm = b"P6\n256 256\n255\n".to_vec();
-    for y in 0..256 {
-        for x in 0..256 {
-            let offset = (y * usize::from(framebuffer.width()) + x) * 4;
-            ppm.extend_from_slice(&framebuffer.rgba()[offset..offset + 3]);
-        }
+    let mut ppm = b"P6\n1920 1080\n255\n".to_vec();
+    for pixel in framebuffer.rgba().chunks_exact(4) {
+        ppm.extend_from_slice(&pixel[..3]);
     }
     let digest: [u8; 20] = Sha1::digest(&ppm).into();
     assert_eq!(
         digest,
         [
-            0x0a, 0xf5, 0x20, 0x14, 0x9d, 0x7f, 0xc1, 0x09, 0xfe, 0x76, 0xba, 0x8c, 0x35, 0xaa,
-            0xe8, 0x44, 0x41, 0xef, 0x0c, 0x19,
+            0x85, 0x8c, 0x9d, 0x68, 0xb7, 0x5a, 0x06, 0x4d, 0x3c, 0x73, 0x05, 0xe2, 0x53, 0xd3,
+            0xa3, 0xfd, 0x81, 0xe4, 0x21, 0x50,
         ]
     );
 }

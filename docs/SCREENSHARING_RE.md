@@ -507,10 +507,8 @@ to 4,448 bytes of ordinary ARD server-message data:
 The first record exposed a real decoder defect: zero-sized rectangles were
 previously discarded before MVS type-2 control data could be consumed. The
 decoder now routes zero-sized MVS rectangles through the codec while rejecting
-zero-sized type-0/type-1 image updates. The combined plaintext is committed as
-`tests/fixtures/real-macos-mvs-256x256.hex`; offline replay reproduces the
-captured upper-left 256x256 PPM byte-for-byte and checks SHA-1
-`0af520149d7fc109fe76ba8c35aae84441ef0c19`.
+zero-sized type-0/type-1 image updates. This partial capture was superseded by
+the complete-frame fixture described below and is no longer stored separately.
 
 The first decoder pass showed magenta/purple 8x8 blocks in otherwise neutral
 UI regions. Comparing the type-5 chroma predictor with the installed
@@ -524,27 +522,34 @@ negative, odd, even, and nonzero-delta predictor cases.
 A second live request captured the complete framebuffer reported by the same
 Mac. The server returned 53,215 plaintext bytes in three authenticated
 encrypted records, containing two framebuffer updates. The decoder recovered
-all 2,073,600 pixels of the 1920x1080 desktop. The complete-frame PPM has
-SHA-256 `bb93b27fcbf9e726301817d0d357b2075ba91f6e856e510b4d1654dbd5485125`;
+all 2,073,600 pixels of the 1920x1080 desktop, matching the current display's
+native 1920x1080 mode. After all decoder fixes, the complete-frame PPM has
+SHA-256 `79083937e8c8075a51d9c188208c268029ddccce5e04e49fa9d73631314e83e8`;
 the saved plaintext stream has SHA-256
 `5681ac38d2d73b56ae4c9fbf9b5c4b3b26bd47c2bd7fe8ffa8145aedc58044e7`.
 
-The live artifacts are under `target/real-ard-full-frame/`. They can be replayed
-without a network connection or password:
+Full-frame inspection also exposed inverted black/gray 8x8 regions in text.
+Every affected tile was an MVS type-4 two-color tile. The native
+`DecodeMVSUpdate` branch selects the second remembered color for a zero bit and
+the first color for a one bit; the Rust call supplied those choices in the
+opposite order. Correcting the order removes all detected anomalous dark 8x8
+tiles, and a focused two-color bit-mask test preserves the native semantics.
+
+The canonical live plaintext is stored only at
+`tests/fixtures/real-macos-mvs-1920x1080.bin`. It can be replayed without a
+network connection or password:
 
 ```sh
 cargo run --example decode_plaintext_capture -- \
-  target/real-ard-full-frame/real-ard-plaintext-stream.bin \
+  tests/fixtures/real-macos-mvs-1920x1080.bin \
   1920 1080 \
-  target/real-ard-full-frame/real-frame-full-offline.ppm
+  target/real-frame-full.ppm
 ```
 
-The offline result is byte-for-byte identical to the image produced during the
-live session. Visual inspection of the complete frame confirms that the
-magenta/purple 8x8 corruption is gone. These complete-frame artifacts remain
-under `target/` rather than committed fixtures because they contain real
-desktop pixels; the smaller redacted regression fixture remains suitable for
-automated tests.
+Visual inspection of the complete replay confirms that both the magenta/purple
+corruption and the inverted black/gray blocks are gone. Generated PPM/PNG files
+remain under `target/`; only the single compressed plaintext input is committed
+as a fixture.
 
 The fixture contains compressed real desktop pixels, but no password,
 authentication response, wrapped session block, session key, IV, encrypted
