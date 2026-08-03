@@ -872,6 +872,7 @@ fn start_receiver(
         let mut client = match ArdClient::connect(config) {
             Ok(client) => client,
             Err(error) => {
+                eprintln!("ARD 连接失败：{error}");
                 let _ = proxy.send_event(ViewerEvent::Status(format!("连接失败：{error}")));
                 return;
             }
@@ -882,6 +883,7 @@ fn start_receiver(
             let info = match client.next_frame() {
                 Ok(info) => info,
                 Err(error) => {
+                    eprintln!("ARD 接收失败：{error}");
                     let _ = proxy.send_event(ViewerEvent::Status(format!("连接已断开：{error}")));
                     return;
                 }

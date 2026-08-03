@@ -372,15 +372,31 @@ impl ArdClient {
     pub fn next_frame(&mut self) -> Result<ArdFrameInfo, ArdClientError> {
         let mut wire_bytes = 0_usize;
         loop {
-            let wire = read_encrypted_record_wire(&mut self.stream)?;
+            let record_sequence = self.verified.sequence();
+            let wire = read_encrypted_record_wire(&mut self.stream).map_err(|error| {
+                ArdClientError::Message(format!(
+                    "读取服务端加密记录 #{record_sequence} 失败：{error}"
+                ))
+            })?;
             wire_bytes = wire_bytes.saturating_add(wire.len());
             let mut framebuffer_updates = 0_usize;
             let mut rectangle_count = 0_usize;
             let mut payload_bytes = 0_usize;
-            for payload in self.verified.push(&wire)? {
-                let messages =
-                    self.dispatcher
-                        .push(&payload, &mut self.decoder, &mut self.framebuffer)?;
+            let payloads = self.verified.push(&wire).map_err(|error| {
+                ArdClientError::Message(format!(
+                    "校验或解密服务端记录 #{record_sequence} 失败：{error}"
+                ))
+            })?;
+            for payload in payloads {
+                let messages = self
+                    .dispatcher
+                    .push(&payload, &mut self.decoder, &mut self.framebuffer)
+                    .map_err(|error| {
+                        ArdClientError::Message(format!(
+                            "解析或解码服务端记录 #{record_sequence} 失败（已缓冲 {} 字节）：{error}",
+                            self.dispatcher.buffered_bytes()
+                        ))
+                    })?;
                 for message in messages {
                     if let ArdServerMessage::FramebufferUpdate {
                         rectangle_count: rectangles,
