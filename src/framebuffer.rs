@@ -1,5 +1,7 @@
 use crate::{Error, Result};
 
+/// Compatibility framebuffer used by the general-purpose decoder path.
+/// GPU-native MVS decoding bypasses this storage entirely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Framebuffer {
     width: u16,
@@ -20,6 +22,21 @@ impl Framebuffer {
         })
     }
 
+    /// Creates a dimension-only framebuffer for GPU-native decoding. Pixel
+    /// storage is allocated lazily only if a non-MVS compatibility encoding
+    /// actually writes CPU pixels.
+    pub(crate) fn new_metadata(width: u16, height: u16) -> Result<Self> {
+        let _ = usize::from(width)
+            .checked_mul(usize::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(Error::LimitExceeded("framebuffer size"))?;
+        Ok(Self {
+            width,
+            height,
+            rgba: Vec::new(),
+        })
+    }
+
     pub fn width(&self) -> u16 {
         self.width
     }
@@ -33,12 +50,16 @@ impl Framebuffer {
     }
 
     pub fn rgba_mut(&mut self) -> &mut [u8] {
+        self.ensure_pixels();
         &mut self.rgba
     }
 
     pub fn resize(&mut self, width: u16, height: u16) -> Result<()> {
-        let replacement = Self::new(width, height)?;
-        *self = replacement;
+        *self = if self.rgba.is_empty() {
+            Self::new_metadata(width, height)?
+        } else {
+            Self::new(width, height)?
+        };
         Ok(())
     }
 
@@ -58,8 +79,13 @@ impl Framebuffer {
     }
 
     pub(crate) fn set_pixel(&mut self, x: u16, y: u16, rgba: [u8; 4]) {
+        self.ensure_pixels();
         let offset = (usize::from(y) * usize::from(self.width) + usize::from(x)) * 4;
         self.rgba[offset..offset + 4].copy_from_slice(&rgba);
+    }
+
+    pub(crate) fn set_ycbcr(&mut self, x: u16, y: u16, sample: [u8; 3]) {
+        self.set_pixel(x, y, ycbcr_to_rgba(sample));
     }
 
     pub(crate) fn copy_rect(
@@ -77,6 +103,7 @@ impl Framebuffer {
         };
         self.validate_rect(rect)?;
         self.validate_rect(&source)?;
+        self.ensure_pixels();
         let len = usize::from(rect.width)
             .checked_mul(usize::from(rect.height))
             .and_then(|pixels| pixels.checked_mul(4))
@@ -98,4 +125,26 @@ impl Framebuffer {
         }
         Ok(())
     }
+
+    fn ensure_pixels(&mut self) {
+        if self.rgba.is_empty() && self.width != 0 && self.height != 0 {
+            self.rgba
+                .resize(usize::from(self.width) * usize::from(self.height) * 4, 0);
+        }
+    }
+}
+
+fn ycbcr_to_rgba(sample: [u8; 3]) -> [u8; 4] {
+    let y = i32::from(sample[0]);
+    let cb = i32::from(sample[1]) - 128;
+    let cr = i32::from(sample[2]) - 128;
+    let red = y + ((91_881 * cr + 32_768) >> 16);
+    let green = y + ((32_768 - 22_554 * cb - 46_802 * cr) >> 16);
+    let blue = y + ((116_130 * cb + 32_768) >> 16);
+    [
+        red.clamp(0, 255) as u8,
+        green.clamp(0, 255) as u8,
+        blue.clamp(0, 255) as u8,
+        255,
+    ]
 }

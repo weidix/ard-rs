@@ -28,6 +28,31 @@ fn replays_live_macos_ard_handshake_offline() {
 }
 
 #[test]
+fn gpu_mvs_path_keeps_real_frame_as_tile_commands_and_coefficients() {
+    let capture = include_bytes!("fixtures/real-macos-mvs-1920x1080.bin");
+    let mut dispatcher = ArdMessageDispatcher::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
+    let mut decoder = Decoder::new_gpu_mvs(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(1920, 1080).unwrap();
+    for fragment in capture.chunks(257) {
+        dispatcher
+            .push(fragment, &mut decoder, &mut framebuffer)
+            .unwrap();
+    }
+
+    // No CPU RGB/YUV framebuffer is expanded on the GPU-native path.
+    assert!(framebuffer.rgba().iter().all(|&byte| byte == 0));
+    let frames = decoder.take_gpu_mvs_frames();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].tiles.len(), 240 * 135);
+    assert!(frames[0].tiles.iter().any(|tile| {
+        matches!(
+            tile.tile,
+            ard_rs::MvsGpuTile::RiceDct(_) | ard_rs::MvsGpuTile::Dct(_)
+        )
+    }));
+}
+
+#[test]
 fn decodes_saved_native_oracle_mvs_frame_without_a_connection() {
     let capture = include_bytes!("fixtures/native-mvs-white-64x64.bin");
     assert_eq!(capture.len(), 31);

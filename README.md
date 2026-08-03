@@ -3,6 +3,38 @@
 Pure Rust, platform-independent parsing and framebuffer decoding for Apple
 Remote Desktop (ARD) screen sharing.
 
+## Native GPU viewer
+
+`ard-viewer` is a receive-only desktop viewer for macOS, Windows, and Linux.
+It connects directly to the ARD TCP service; it does not include a relay,
+browser server, mouse input, or keyboard input.
+
+```sh
+cargo build --release --features viewer --bin ard-viewer
+ARD_PASSWORD='screen-sharing-password' \
+  cargo run --release --features viewer --bin ard-viewer -- \
+  192.168.1.20:5900 username
+```
+
+The modern MVS path does not create a CPU RGB or YUV framebuffer. After ARD
+record authentication and decryption, the CPU performs the stateful protocol
+and variable-length Rice/Huffman parsing needed by the custom Apple codec and
+emits bounded 8x8 tile commands with native DCT coefficients. A wgpu compute
+pipeline performs inverse DCT, MVS Rice chroma expansion, tile composition,
+and color conversion into a GPU-only presentation texture. The render pass
+then scales that texture with aspect-ratio-preserving letterboxing.
+
+```text
+TCP -> authenticated decrypt -> MVS tile/DCT parser
+    -> GPU storage buffers -> compute IDCT/tile expansion
+    -> GPU presentation texture -> Metal / D3D12 / Vulkan
+```
+
+The CPU RGBA decoder remains available as the compatibility and test path for
+Raw, Zlib, ZRLE, and callers of the original library API. The viewer itself
+negotiates MVS (plus desktop-size updates) so it cannot silently fall back to
+a CPU image-frame path.
+
 Reverse-engineering notes are in
 [`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md). A step-by-step playbook
 for reproducing the native-code investigation and oracle validation is in
@@ -55,6 +87,9 @@ on a VNC library or a native operating-system library.
 - independent persistent zlib state for every Apple stream
 - RGBA framebuffer updates with checked dimensions, allocations, runs, and
   palette indexes
+- optional receive-only native GUI with direct TCP authentication, encrypted
+  session streaming, GPU-native MVS tile/DCT output, compute-shader IDCT, and
+  Metal/D3D12/Vulkan presentation
 
 Apple MVS (`1011`) is identified as a distinct codec and is never fed to a VNC
 or zlib decoder. Its two bitstreams, Rice/DCT state, per-tile differential
@@ -82,20 +117,25 @@ differential records can refine DCT state when a longer stream contains them.
 
 ## Pure Rust guarantee
 
-Runtime dependencies are Rust-only crates: `flate2` with its `rust_backend`,
-RustCrypto AES/digest primitives, `num-bigint`, and `subtle`. No system zlib,
-Apple framework, OpenSSL, FFI, or native dynamic library is linked. The crate
-retains `#![forbid(unsafe_code)]`.
+Core runtime dependencies are Rust-only crates: `flate2` with its
+`rust_backend`, RustCrypto AES/digest primitives, `num-bigint`, and `subtle`.
+The optional `viewer` feature adds winit and wgpu, selecting the operating
+system's normal windowing and GPU backend. Project code retains
+`#![forbid(unsafe_code)]`.
 
 ## Verification
 
 ```sh
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
+cargo test --all-targets --features viewer
+cargo clippy --all-targets --features viewer -- -D warnings
 cargo check --target aarch64-unknown-linux-musl
 cargo check --target x86_64-unknown-linux-musl
 cargo check --target x86_64-pc-windows-gnu
 cargo check --target wasm32-wasip1
+cargo check --target x86_64-unknown-linux-musl --features viewer --bin ard-viewer
+cargo check --target x86_64-pc-windows-gnu --features viewer --bin ard-viewer
 ```
 
 The test suite includes the exact ARD banner and security offer captured from

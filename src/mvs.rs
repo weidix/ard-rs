@@ -60,6 +60,47 @@ struct DctTile {
     coefficients: [[i16; 64]; 3],
 }
 
+/// GPU-facing content of one decoded 8×8 MVS tile. DCT tiles retain the
+/// codec coefficients and are not inverse-transformed on the CPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MvsGpuTile {
+    SolidYcbcr([u8; 3]),
+    SolidRgba([u8; 4]),
+    PixelsYcbcr(Box<[[u8; 3]; 64]>),
+    PixelsRgba(Box<[[u8; 4]; 64]>),
+    /// Partial-update Rice tile: luminance uses IDCT while chroma contains
+    /// DC-only samples expanded with the codec's dedicated rounding rule.
+    RiceDct(Box<[[i16; 64]; 3]>),
+    Dct(Box<[[i16; 64]; 3]>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvsGpuTileUpdate {
+    pub x: u16,
+    pub y: u16,
+    pub width: u8,
+    pub height: u8,
+    pub tile: MvsGpuTile,
+}
+
+/// One MVS update ready for GPU tile expansion and presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvsGpuFrame {
+    pub framebuffer_width: u16,
+    pub framebuffer_height: u16,
+    pub luminance_quantization: [u16; 64],
+    pub chrominance_quantization: [u16; 64],
+    pub tiles: Vec<MvsGpuTileUpdate>,
+}
+
+/// A literal color carried by a non-DCT MVS tile. This is tile command data,
+/// not an intermediate full-frame image.
+#[derive(Debug, Clone, Copy)]
+enum MvsPixel {
+    Rgba([u8; 4]),
+    Ycbcr([u8; 3]),
+}
+
 impl Default for DctTile {
     fn default() -> Self {
         Self {
@@ -68,13 +109,14 @@ impl Default for DctTile {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TileState {
     generation: u32,
     copy_source: Option<usize>,
     dct: DctTile,
     dct_valid: bool,
     luma_count: u8,
+    gpu_tile: MvsGpuTile,
 }
 
 impl Default for TileState {
@@ -85,6 +127,7 @@ impl Default for TileState {
             dct: DctTile::default(),
             dct_valid: false,
             luma_count: 1,
+            gpu_tile: MvsGpuTile::SolidRgba([0, 0, 0, 255]),
         }
     }
 }
@@ -193,7 +236,8 @@ impl MvsState {
         payload: &[u8],
         framebuffer: &mut Framebuffer,
         max_output_bytes: usize,
-    ) -> Result<()> {
+        render_cpu: bool,
+    ) -> Result<Vec<MvsGpuTileUpdate>> {
         self.ensure_framebuffer_state(framebuffer)?;
         if payload.len() < 6 {
             return Err(Error::NeedMore {
@@ -220,12 +264,6 @@ impl MvsState {
         if output_bytes > max_output_bytes {
             return Err(Error::LimitExceeded("ARD MVS rectangle"));
         }
-        let mut decoded = Vec::new();
-        decoded
-            .try_reserve_exact(pixel_count)
-            .map_err(|_| Error::LimitExceeded("ARD MVS rectangle"))?;
-        decoded.resize(pixel_count, [0, 0, 0, 255]);
-
         let mut primary = BitReader::new(&payload[6..secondary_offset]);
         let mut secondary = BitReader::new(&payload[secondary_offset..]);
         let _initial_state = primary.read(1)?;
@@ -235,9 +273,9 @@ impl MvsState {
             .checked_mul(tiles_high)
             .ok_or(Error::LimitExceeded("ARD MVS tile count"))?;
         let mut tile_index = 0_usize;
-        let mut first_color = [255, 255, 255, 255];
-        let mut second_color = [254, 213, 181, 255];
-        let mut solid_color = [0, 0, 0, 255];
+        let mut first_color = MvsPixel::Rgba([255, 255, 255, 255]);
+        let mut second_color = MvsPixel::Rgba([254, 213, 181, 255]);
+        let mut solid_color = MvsPixel::Rgba([0, 0, 0, 255]);
         // ExpandBlockRice's previous-block pointer is initialized to null for
         // each partial update and advances only within this rectangle.
         let mut previous_coefficients = None;
@@ -245,6 +283,7 @@ impl MvsState {
         let generation = self.generation;
         let luminance_quantization = self.luminance_quantization;
         let chrominance_quantization = self.chrominance_quantization;
+        let mut updates = Vec::with_capacity(total_tiles);
 
         while tile_index < total_tiles {
             let update_type = primary.read(3)?;
@@ -276,59 +315,31 @@ impl MvsState {
                 }
                 let mut decoded_dct = None;
                 let mut copy_source = None;
-                match update_type {
-                    0 => fill_tile(
-                        &mut decoded,
-                        usize::from(rect.width),
-                        tile_x,
-                        tile_y,
-                        tile_width,
-                        tile_height,
-                        [255, 255, 255, 255],
-                    ),
+                let gpu_tile = match update_type {
+                    0 => MvsGpuTile::SolidRgba([255, 255, 255, 255]),
                     1 => {
                         if tile_x < 8 {
                             return Err(Error::Invalid("ARD MVS left-copy at rectangle edge"));
                         }
-                        copy_tile(
-                            &mut decoded,
-                            usize::from(rect.width),
-                            tile_x - 8,
-                            tile_y,
-                            tile_x,
-                            tile_y,
-                            tile_width,
-                            tile_height,
-                        );
                         copy_source = global_tile.checked_sub(1);
+                        self.tiles[copy_source.expect("left source checked")]
+                            .gpu_tile
+                            .clone()
                     }
                     2 => {
                         if tile_y < 8 {
                             return Err(Error::Invalid("ARD MVS above-copy at rectangle edge"));
                         }
-                        copy_tile(
-                            &mut decoded,
-                            usize::from(rect.width),
-                            tile_x,
-                            tile_y - 8,
-                            tile_x,
-                            tile_y,
-                            tile_width,
-                            tile_height,
-                        );
                         copy_source = global_tile.checked_sub(self.tiles_wide);
+                        self.tiles[copy_source.expect("above source checked")]
+                            .gpu_tile
+                            .clone()
                     }
-                    3 => decode_bilevel_tile(
+                    3 => decode_bilevel_gpu_tile(
                         &mut secondary,
-                        &mut decoded,
-                        usize::from(rect.width),
-                        tile_x,
-                        tile_y,
-                        tile_width,
-                        tile_height,
-                        [255, 255, 255, 255],
-                        [0, 0, 0, 255],
-                        [255, 255, 255, 255],
+                        MvsPixel::Rgba([255, 255, 255, 255]),
+                        MvsPixel::Rgba([0, 0, 0, 255]),
+                        MvsPixel::Rgba([255, 255, 255, 255]),
                     )?,
                     4 => {
                         if secondary.read(1)? != 0 {
@@ -336,49 +347,28 @@ impl MvsState {
                                 first_color = read_ycbcr20(&mut secondary)?;
                                 second_color = read_ycbcr20(&mut secondary)?;
                             }
-                            decode_bilevel_tile(
+                            decode_bilevel_gpu_tile(
                                 &mut secondary,
-                                &mut decoded,
-                                usize::from(rect.width),
-                                tile_x,
-                                tile_y,
-                                tile_width,
-                                tile_height,
                                 first_color,
                                 second_color,
                                 first_color,
-                            )?;
+                            )?
                         } else {
                             if secondary.read(1)? == 0 {
                                 solid_color = read_ycbcr20(&mut secondary)?;
                             }
-                            fill_tile(
-                                &mut decoded,
-                                usize::from(rect.width),
-                                tile_x,
-                                tile_y,
-                                tile_width,
-                                tile_height,
-                                solid_color,
-                            );
+                            gpu_solid(solid_color)
                         }
                     }
                     5 => {
-                        let (coefficients, luma_count) = decode_rice_dct_tile(
+                        let (coefficients, luma_count) = decode_rice_dct_coefficients(
                             &mut secondary,
-                            &mut decoded,
-                            usize::from(rect.width),
-                            tile_x,
-                            tile_y,
-                            tile_width,
-                            tile_height,
                             &mut previous_coefficients,
-                            &luminance_quantization,
-                            &chrominance_quantization,
                             payload[1],
                             payload[2],
                         )?;
                         decoded_dct = Some((coefficients, luma_count));
+                        MvsGpuTile::RiceDct(Box::new(coefficients))
                     }
                     6 | 7 => {
                         let cache_index = if update_type == 6 {
@@ -391,28 +381,26 @@ impl MvsState {
                             self.last_cache_index + 1
                         };
                         let tile = self.cached_tile(cache_index)?;
-                        render_dct_tile(
-                            &tile.coefficients,
-                            &mut decoded,
-                            usize::from(rect.width),
-                            tile_x,
-                            tile_y,
-                            tile_width,
-                            tile_height,
-                            &luminance_quantization,
-                            &chrominance_quantization,
-                        );
+                        MvsGpuTile::Dct(Box::new(tile.coefficients))
                     }
                     _ => unreachable!("three-bit MVS update type"),
-                }
+                };
                 let state = &mut self.tiles[global_tile];
                 state.generation = generation;
                 state.copy_source = copy_source;
+                state.gpu_tile = gpu_tile.clone();
                 if let Some((coefficients, luma_count)) = decoded_dct {
                     state.dct = DctTile { coefficients };
                     state.dct_valid = true;
                     state.luma_count = luma_count;
                 }
+                updates.push(MvsGpuTileUpdate {
+                    x: rect.x + tile_x as u16,
+                    y: rect.y + tile_y as u16,
+                    width: tile_width as u8,
+                    height: tile_height as u8,
+                    tile: gpu_tile,
+                });
                 tile_index += 1;
             }
         }
@@ -420,16 +408,17 @@ impl MvsState {
         if primary.read(8)? != 0x6d || secondary.read(8)? != 0x6d {
             return Err(Error::Invalid("invalid ARD MVS partial-update marker"));
         }
-        for y in 0..usize::from(rect.height) {
-            for x in 0..usize::from(rect.width) {
-                framebuffer.set_pixel(
-                    rect.x + x as u16,
-                    rect.y + y as u16,
-                    decoded[y * usize::from(rect.width) + x],
+        if render_cpu {
+            for update in &updates {
+                render_gpu_tile_to_framebuffer(
+                    update,
+                    framebuffer,
+                    &luminance_quantization,
+                    &chrominance_quantization,
                 );
             }
         }
-        Ok(())
+        Ok(updates)
     }
 
     pub(crate) fn decode_full_update(
@@ -438,7 +427,8 @@ impl MvsState {
         payload: &[u8],
         framebuffer: &mut Framebuffer,
         max_output_bytes: usize,
-    ) -> Result<()> {
+        render_cpu: bool,
+    ) -> Result<Vec<MvsGpuTileUpdate>> {
         self.ensure_framebuffer_state(framebuffer)?;
         if payload.len() < 3 {
             return Err(Error::NeedMore {
@@ -470,6 +460,7 @@ impl MvsState {
         let chrominance_limit = payload[2].min(64);
         let luminance_quantization = self.luminance_quantization;
         let chrominance_quantization = self.chrominance_quantization;
+        let mut updates = Vec::with_capacity(tiles);
         for tile_index in 0..tiles {
             let local_tile_x = (tile_index % tiles_wide) * 8;
             let local_tile_y = (tile_index / tiles_wide) * 8;
@@ -488,7 +479,7 @@ impl MvsState {
             match bits.read(2)? {
                 0 => {}
                 1 => {
-                    let baseline = self.tiles[global_tile];
+                    let baseline = self.tiles[global_tile].clone();
                     if !baseline.dct_valid {
                         return Err(Error::Invalid(
                             "ARD MVS differential tile has no Rice/DCT baseline",
@@ -500,25 +491,35 @@ impl MvsState {
                         luminance_limit,
                         chrominance_limit,
                     )?;
-                    blit_dct_to_framebuffer(
-                        &coefficients,
-                        framebuffer,
-                        x,
-                        y,
-                        tile_width,
-                        tile_height,
-                        &luminance_quantization,
-                        &chrominance_quantization,
-                    );
+                    if render_cpu {
+                        blit_dct_to_framebuffer(
+                            &coefficients,
+                            framebuffer,
+                            x,
+                            y,
+                            tile_width,
+                            tile_height,
+                            &luminance_quantization,
+                            &chrominance_quantization,
+                        );
+                    }
                     self.insert_cache_tile(DctTile { coefficients });
                     let state = &mut self.tiles[global_tile];
                     state.copy_source = None;
                     state.dct = DctTile { coefficients };
                     state.dct_valid = true;
                     state.luma_count = luma_count;
+                    state.gpu_tile = MvsGpuTile::Dct(Box::new(coefficients));
+                    updates.push(MvsGpuTileUpdate {
+                        x: x as u16,
+                        y: y as u16,
+                        width: tile_width as u8,
+                        height: tile_height as u8,
+                        tile: state.gpu_tile.clone(),
+                    });
                 }
                 2 => {
-                    let state = self.tiles[global_tile];
+                    let state = self.tiles[global_tile].clone();
                     let source = state
                         .copy_source
                         .ok_or(Error::Invalid("ARD MVS copy tile has no source"))?;
@@ -531,21 +532,32 @@ impl MvsState {
                     }
                     let source_x = (source % self.tiles_wide) * 8;
                     let source_y = (source / self.tiles_wide) * 8;
-                    framebuffer.copy_rect(
-                        &Rectangle {
-                            x: u16::try_from(x)
-                                .map_err(|_| Error::LimitExceeded("ARD MVS tile x"))?,
-                            y: u16::try_from(y)
-                                .map_err(|_| Error::LimitExceeded("ARD MVS tile y"))?,
-                            width: tile_width as u16,
-                            height: tile_height as u16,
-                            encoding: rect.encoding,
-                        },
-                        u16::try_from(source_x)
-                            .map_err(|_| Error::LimitExceeded("ARD MVS source x"))?,
-                        u16::try_from(source_y)
-                            .map_err(|_| Error::LimitExceeded("ARD MVS source y"))?,
-                    )?;
+                    if render_cpu {
+                        framebuffer.copy_rect(
+                            &Rectangle {
+                                x: u16::try_from(x)
+                                    .map_err(|_| Error::LimitExceeded("ARD MVS tile x"))?,
+                                y: u16::try_from(y)
+                                    .map_err(|_| Error::LimitExceeded("ARD MVS tile y"))?,
+                                width: tile_width as u16,
+                                height: tile_height as u16,
+                                encoding: rect.encoding,
+                            },
+                            u16::try_from(source_x)
+                                .map_err(|_| Error::LimitExceeded("ARD MVS source x"))?,
+                            u16::try_from(source_y)
+                                .map_err(|_| Error::LimitExceeded("ARD MVS source y"))?,
+                        )?;
+                    }
+                    let gpu_tile = source_state.gpu_tile.clone();
+                    self.tiles[global_tile].gpu_tile = gpu_tile.clone();
+                    updates.push(MvsGpuTileUpdate {
+                        x: x as u16,
+                        y: y as u16,
+                        width: tile_width as u8,
+                        height: tile_height as u8,
+                        tile: gpu_tile,
+                    });
                 }
                 3 => {
                     let cache_index = if bits.read(1)? != 0 {
@@ -560,16 +572,27 @@ impl MvsState {
                         (high << 8) | low
                     };
                     let tile = self.cached_tile(cache_index)?;
-                    blit_dct_to_framebuffer(
-                        &tile.coefficients,
-                        framebuffer,
-                        x,
-                        y,
-                        tile_width,
-                        tile_height,
-                        &luminance_quantization,
-                        &chrominance_quantization,
-                    );
+                    if render_cpu {
+                        blit_dct_to_framebuffer(
+                            &tile.coefficients,
+                            framebuffer,
+                            x,
+                            y,
+                            tile_width,
+                            tile_height,
+                            &luminance_quantization,
+                            &chrominance_quantization,
+                        );
+                    }
+                    let gpu_tile = MvsGpuTile::Dct(Box::new(tile.coefficients));
+                    self.tiles[global_tile].gpu_tile = gpu_tile.clone();
+                    updates.push(MvsGpuTileUpdate {
+                        x: x as u16,
+                        y: y as u16,
+                        width: tile_width as u8,
+                        height: tile_height as u8,
+                        tile: gpu_tile,
+                    });
                 }
                 _ => unreachable!("two-bit MVS selector"),
             }
@@ -577,7 +600,7 @@ impl MvsState {
         if bits.read(8)? != 0x6d || bits.read(8)? != 0x76 || bits.read(8)? != 0x73 {
             return Err(Error::Invalid("invalid ARD MVS full-update marker"));
         }
-        Ok(())
+        Ok(updates)
     }
 }
 
@@ -761,30 +784,6 @@ fn decode_chrominance_ac_symbol(bits: &mut BitReader<'_>) -> Result<u8> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_dct_tile(
-    coefficients: &[[i16; 64]; 3],
-    pixels: &mut [[u8; 4]],
-    stride: usize,
-    tile_x: usize,
-    tile_y: usize,
-    width: usize,
-    height: usize,
-    luminance_quantization: &[u16; 64],
-    chrominance_quantization: &[u16; 64],
-) {
-    let luminance = inverse_dct(&coefficients[0], luminance_quantization);
-    let cb = inverse_dct(&coefficients[1], chrominance_quantization);
-    let cr = inverse_dct(&coefficients[2], chrominance_quantization);
-    for y in 0..height {
-        for x in 0..width {
-            let index = y * 8 + x;
-            pixels[(tile_y + y) * stride + tile_x + x] =
-                ycbcr_to_rgba(luminance[index], cb[index] - 128, cr[index] - 128);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn blit_dct_to_framebuffer(
     coefficients: &[[i16; 64]; 3],
     framebuffer: &mut Framebuffer,
@@ -801,64 +800,22 @@ fn blit_dct_to_framebuffer(
     for y in 0..height {
         for x in 0..width {
             let index = y * 8 + x;
-            framebuffer.set_pixel(
+            framebuffer.set_ycbcr(
                 (tile_x + x) as u16,
                 (tile_y + y) as u16,
-                ycbcr_to_rgba(luminance[index], cb[index] - 128, cr[index] - 128),
+                [luminance[index] as u8, cb[index] as u8, cr[index] as u8],
             );
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn fill_tile(
-    pixels: &mut [[u8; 4]],
-    stride: usize,
-    tile_x: usize,
-    tile_y: usize,
-    width: usize,
-    height: usize,
-    color: [u8; 4],
-) {
-    for y in 0..height {
-        for x in 0..width {
-            pixels[(tile_y + y) * stride + tile_x + x] = color;
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn copy_tile(
-    pixels: &mut [[u8; 4]],
-    stride: usize,
-    source_x: usize,
-    source_y: usize,
-    destination_x: usize,
-    destination_y: usize,
-    width: usize,
-    height: usize,
-) {
-    for y in 0..height {
-        for x in 0..width {
-            let source = pixels[(source_y + y) * stride + source_x + x];
-            pixels[(destination_y + y) * stride + destination_x + x] = source;
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_bilevel_tile(
+fn decode_bilevel_gpu_tile(
     bits: &mut BitReader<'_>,
-    pixels: &mut [[u8; 4]],
-    stride: usize,
-    tile_x: usize,
-    tile_y: usize,
-    width: usize,
-    height: usize,
-    uniform_color: [u8; 4],
-    zero_color: [u8; 4],
-    one_color: [u8; 4],
-) -> Result<()> {
+    uniform_color: MvsPixel,
+    zero_color: MvsPixel,
+    one_color: MvsPixel,
+) -> Result<MvsGpuTile> {
+    let mut pixels = [uniform_color; 64];
     let uniform_rows = bits.read(8)? as u8;
     for y in 0..8 {
         let row_is_uniform = uniform_rows & (0x80 >> y) != 0;
@@ -867,10 +824,7 @@ fn decode_bilevel_tile(
         } else {
             bits.read(8)? as u8
         };
-        if y >= height {
-            continue;
-        }
-        for x in 0..width {
+        for x in 0..8 {
             let color = if row_is_uniform {
                 uniform_color
             } else if row_bits & (0x80 >> x) == 0 {
@@ -878,45 +832,22 @@ fn decode_bilevel_tile(
             } else {
                 one_color
             };
-            pixels[(tile_y + y) * stride + tile_x + x] = color;
+            pixels[y * 8 + x] = color;
         }
     }
-    Ok(())
+    Ok(gpu_pixels(pixels))
 }
 
-fn read_ycbcr20(bits: &mut BitReader<'_>) -> Result<[u8; 4]> {
-    let y = bits.read(8)? as i32;
-    let cb = (bits.read(6)? as i32) * 4 - 128;
-    let cr = (bits.read(6)? as i32) * 4 - 128;
-    Ok(ycbcr_to_rgba(y, cb, cr))
+fn read_ycbcr20(bits: &mut BitReader<'_>) -> Result<MvsPixel> {
+    let y = bits.read(8)? as u8;
+    let cb = (bits.read(6)? * 4) as u8;
+    let cr = (bits.read(6)? * 4) as u8;
+    Ok(MvsPixel::Ycbcr([y, cb, cr]))
 }
 
-fn ycbcr_to_rgba(y: i32, cb: i32, cr: i32) -> [u8; 4] {
-    // Screen Sharing uses two rounded integer lookup tables for red/blue and
-    // two 16.16 fixed-point tables, with a half-unit bias, for green.
-    let red = y + rounded_chroma_offset(91_881, cr);
-    let green = y + ((32_768 - 22_554 * cb - 46_802 * cr) >> 16);
-    let blue = y + rounded_chroma_offset(116_130, cb);
-    [
-        red.clamp(0, 255) as u8,
-        green.clamp(0, 255) as u8,
-        blue.clamp(0, 255) as u8,
-        255,
-    ]
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_rice_dct_tile(
+fn decode_rice_dct_coefficients(
     bits: &mut BitReader<'_>,
-    pixels: &mut [[u8; 4]],
-    stride: usize,
-    tile_x: usize,
-    tile_y: usize,
-    width: usize,
-    height: usize,
     previous_coefficients: &mut Option<([[i16; 64]; 3], u8)>,
-    luminance_quantization: &[u16; 64],
-    chrominance_quantization: &[u16; 64],
     luminance_limit: u8,
     chrominance_limit: u8,
 ) -> Result<([[i16; 64]; 3], u8)> {
@@ -950,16 +881,119 @@ fn decode_rice_dct_tile(
         (current, coefficient_limit)
     };
 
-    let luma = inverse_dct(&coefficients[0], luminance_quantization);
-    let cb = dc_sample(coefficients[1][0], chrominance_quantization[0]) - 128;
-    let cr = dc_sample(coefficients[2][0], chrominance_quantization[0]) - 128;
-    for y in 0..height {
-        for x in 0..width {
-            pixels[(tile_y + y) * stride + tile_x + x] = ycbcr_to_rgba(luma[y * 8 + x], cb, cr);
-        }
-    }
     *previous_coefficients = Some((coefficients, coefficient_limit));
     Ok((coefficients, coefficient_limit))
+}
+
+fn gpu_solid(pixel: MvsPixel) -> MvsGpuTile {
+    match pixel {
+        MvsPixel::Rgba(rgba) => MvsGpuTile::SolidRgba(rgba),
+        MvsPixel::Ycbcr(sample) => MvsGpuTile::SolidYcbcr(sample),
+    }
+}
+
+fn gpu_pixels(pixels: [MvsPixel; 64]) -> MvsGpuTile {
+    if pixels
+        .iter()
+        .all(|pixel| matches!(pixel, MvsPixel::Ycbcr(_)))
+    {
+        MvsGpuTile::PixelsYcbcr(Box::new(pixels.map(|pixel| match pixel {
+            MvsPixel::Ycbcr(sample) => sample,
+            MvsPixel::Rgba(_) => unreachable!("pixel kind checked"),
+        })))
+    } else {
+        MvsGpuTile::PixelsRgba(Box::new(pixels.map(mvs_pixel_to_rgba)))
+    }
+}
+
+fn mvs_pixel_to_rgba(pixel: MvsPixel) -> [u8; 4] {
+    match pixel {
+        MvsPixel::Rgba(rgba) => rgba,
+        MvsPixel::Ycbcr([y, cb, cr]) => {
+            let y = i32::from(y);
+            let cb = i32::from(cb) - 128;
+            let cr = i32::from(cr) - 128;
+            let red = y + ((91_881 * cr + 32_768) >> 16);
+            let green = y + ((32_768 - 22_554 * cb - 46_802 * cr) >> 16);
+            let blue = y + ((116_130 * cb + 32_768) >> 16);
+            [
+                red.clamp(0, 255) as u8,
+                green.clamp(0, 255) as u8,
+                blue.clamp(0, 255) as u8,
+                255,
+            ]
+        }
+    }
+}
+
+fn render_gpu_tile_to_framebuffer(
+    update: &MvsGpuTileUpdate,
+    framebuffer: &mut Framebuffer,
+    luminance_quantization: &[u16; 64],
+    chrominance_quantization: &[u16; 64],
+) {
+    match &update.tile {
+        MvsGpuTile::SolidYcbcr(sample) => {
+            for y in 0..u16::from(update.height) {
+                for x in 0..u16::from(update.width) {
+                    framebuffer.set_ycbcr(update.x + x, update.y + y, *sample);
+                }
+            }
+        }
+        MvsGpuTile::SolidRgba(rgba) => {
+            for y in 0..u16::from(update.height) {
+                for x in 0..u16::from(update.width) {
+                    framebuffer.set_pixel(update.x + x, update.y + y, *rgba);
+                }
+            }
+        }
+        MvsGpuTile::PixelsYcbcr(pixels) => {
+            for y in 0..usize::from(update.height) {
+                for x in 0..usize::from(update.width) {
+                    framebuffer.set_ycbcr(
+                        update.x + x as u16,
+                        update.y + y as u16,
+                        pixels[y * 8 + x],
+                    );
+                }
+            }
+        }
+        MvsGpuTile::PixelsRgba(pixels) => {
+            for y in 0..usize::from(update.height) {
+                for x in 0..usize::from(update.width) {
+                    framebuffer.set_pixel(
+                        update.x + x as u16,
+                        update.y + y as u16,
+                        pixels[y * 8 + x],
+                    );
+                }
+            }
+        }
+        MvsGpuTile::RiceDct(coefficients) => {
+            let luminance = inverse_dct(&coefficients[0], luminance_quantization);
+            let cb = dc_sample_value(coefficients[1][0], chrominance_quantization[0]);
+            let cr = dc_sample_value(coefficients[2][0], chrominance_quantization[0]);
+            for y in 0..usize::from(update.height) {
+                for x in 0..usize::from(update.width) {
+                    framebuffer.set_ycbcr(
+                        update.x + x as u16,
+                        update.y + y as u16,
+                        [luminance[y * 8 + x] as u8, cb as u8, cr as u8],
+                    );
+                }
+            }
+        }
+        MvsGpuTile::Dct(coefficients) => blit_dct_to_framebuffer(
+            coefficients,
+            framebuffer,
+            usize::from(update.x),
+            usize::from(update.y),
+            usize::from(update.width),
+            usize::from(update.height),
+            luminance_quantization,
+            chrominance_quantization,
+        ),
+    }
 }
 
 fn predict_chroma_dc(predictor: i16, delta: i16) -> i16 {
@@ -1090,7 +1124,12 @@ fn inverse_dct(coefficients: &[i16; 64], quantization: &[u16; 64]) -> [i32; 64] 
     output
 }
 
+#[cfg(test)]
 fn dc_sample(coefficient: i16, quantization: u16) -> i32 {
+    dc_sample_value(coefficient, quantization)
+}
+
+fn dc_sample_value(coefficient: i16, quantization: u16) -> i32 {
     let dequantized = i32::from(coefficient) * i32::from(quantization);
     (((dequantized + 4) >> 3) + 128).clamp(0, 255)
 }
@@ -1134,15 +1173,6 @@ fn decode_dc_rice(bits: &mut BitReader<'_>) -> Result<i16> {
     let magnitude =
         i16::try_from(magnitude).map_err(|_| Error::LimitExceeded("ARD MVS DC Rice value"))?;
     Ok(if sign == 0 { magnitude } else { -magnitude })
-}
-
-fn rounded_chroma_offset(coefficient: i32, delta: i32) -> i32 {
-    let product = coefficient * delta;
-    if product < 0 {
-        -((-product + 32_768) >> 16)
-    } else {
-        (product + 32_768) >> 16
-    }
 }
 
 #[derive(Debug, Clone)]

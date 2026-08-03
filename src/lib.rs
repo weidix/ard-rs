@@ -7,6 +7,8 @@
 //! version, security methods and framebuffer encodings.
 
 mod auth;
+#[cfg(feature = "viewer")]
+mod client;
 mod decoder;
 mod dispatcher;
 mod error;
@@ -18,10 +20,13 @@ mod transport;
 mod wire;
 
 pub use auth::{ArdType30ClientExchange, build_ard_type30_client_exchange};
+#[cfg(feature = "viewer")]
+pub use client::{ArdClient, ArdClientConfig, ArdClientError, ArdFrameInfo};
 pub use decoder::{DecodeLimits, Decoder};
 pub use dispatcher::{ArdMessageDispatcher, ArdServerMessage};
 pub use error::{Error, Result};
 pub use framebuffer::Framebuffer;
+pub use mvs::{MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate};
 pub use oracle::{EncryptedTransportOracle, OracleReport};
 pub use protocol::{
     ArdAuthChallenge, ArdAuthResponse, ArdClientInit, ArdEncryptionControl, ArdServerInitExtension,

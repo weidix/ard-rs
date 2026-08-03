@@ -30,6 +30,8 @@ pub struct Decoder {
     streams: [Decompress; 5],
     mvs: MvsState,
     pending_encryption_control: Option<ArdEncryptionControl>,
+    gpu_mvs_output: bool,
+    pending_gpu_mvs_frames: Vec<crate::MvsGpuFrame>,
 }
 
 impl Decoder {
@@ -47,7 +49,23 @@ impl Decoder {
             streams: core::array::from_fn(|_| Decompress::new(true)),
             mvs: MvsState::default(),
             pending_encryption_control: None,
+            gpu_mvs_output: false,
+            pending_gpu_mvs_frames: Vec::new(),
         })
+    }
+
+    /// Enables GPU-native MVS output. Protocol parsing, entropy decoding and
+    /// state reconstruction remain on the CPU, but inverse DCT and full-frame
+    /// pixel expansion are omitted. Call [`Self::take_gpu_mvs_frames`] after
+    /// dispatching server messages.
+    pub fn new_gpu_mvs(pixel_format: PixelFormat) -> Result<Self> {
+        let mut decoder = Self::new(pixel_format)?;
+        decoder.gpu_mvs_output = true;
+        Ok(decoder)
+    }
+
+    pub fn take_gpu_mvs_frames(&mut self) -> Vec<crate::MvsGpuFrame> {
+        core::mem::take(&mut self.pending_gpu_mvs_frames)
     }
 
     pub fn limits(&self) -> DecodeLimits {
@@ -131,25 +149,46 @@ impl Decoder {
                 if rect.width == 0 || rect.height == 0 {
                     return Err(Error::Invalid("zero-sized ARD MVS image update"));
                 }
-                next_mvs.decode_partial_update(
+                let tiles = next_mvs.decode_partial_update(
                     rect,
                     update,
                     framebuffer,
                     self.limits.max_decompressed_bytes,
-                )?
+                    !self.gpu_mvs_output,
+                )?;
+                if self.gpu_mvs_output {
+                    self.pending_gpu_mvs_frames.push(crate::MvsGpuFrame {
+                        framebuffer_width: framebuffer.width(),
+                        framebuffer_height: framebuffer.height(),
+                        luminance_quantization: *next_mvs.quantization_tables().0,
+                        chrominance_quantization: *next_mvs.quantization_tables().1,
+                        tiles,
+                    });
+                }
             }
             1 => {
                 if rect.width == 0 || rect.height == 0 {
                     return Err(Error::Invalid("zero-sized ARD MVS image update"));
                 }
                 let mut next_framebuffer = framebuffer.clone();
-                next_mvs.decode_full_update(
+                let tiles = next_mvs.decode_full_update(
                     rect,
                     update,
                     &mut next_framebuffer,
                     self.limits.max_decompressed_bytes,
+                    !self.gpu_mvs_output,
                 )?;
-                *framebuffer = next_framebuffer;
+                if self.gpu_mvs_output {
+                    self.pending_gpu_mvs_frames.push(crate::MvsGpuFrame {
+                        framebuffer_width: framebuffer.width(),
+                        framebuffer_height: framebuffer.height(),
+                        luminance_quantization: *next_mvs.quantization_tables().0,
+                        chrominance_quantization: *next_mvs.quantization_tables().1,
+                        tiles,
+                    });
+                } else {
+                    *framebuffer = next_framebuffer;
+                }
             }
             _ => return Err(Error::Invalid("invalid ARD MVS update type")),
         }
