@@ -12,6 +12,7 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 
 use aes::Aes128;
 use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use flate2::{Compress, Compression, FlushCompress};
 use md5::{Digest, Md5};
 
 use crate::{
@@ -88,6 +89,7 @@ pub struct OracleReport {
     pub client_banner: [u8; 12],
     pub shared_session: bool,
     pub viewer_information: Option<ArdViewerInformation>,
+    pub viewer_encodings: Vec<i32>,
     pub set_encryption_level: Option<ArdSetEncryptionLevel>,
     pub activation_received: bool,
     pub server_to_client_records: usize,
@@ -104,6 +106,7 @@ impl EncryptedTransportOracle {
             client_banner: [0; 12],
             shared_session: false,
             viewer_information: None,
+            viewer_encodings: Vec::new(),
             set_encryption_level: None,
             activation_received: false,
             server_to_client_records: 0,
@@ -206,12 +209,21 @@ impl EncryptedTransportOracle {
             .record_decoder(MAX_PLAINTEXT_RECORD)
             .map_err(io::Error::other)?;
 
-        // The first encrypted payload is the white MVS frame the client asked
-        // for; later FramebufferUpdateRequests get the solid frame.
-        let mut pending_frames: Vec<Vec<u8>> = vec![
-            mvs_white_rectangle(self.width, self.height),
-            mvs_solid_ycbcr_rectangle(self.width, self.height, 200, 128, 128),
-        ];
+        // Exercise the first preferred family advertised by the client. MVS
+        // validates the GPU-native path; full-colour zlib validates the
+        // RDM-compatible lossless path with a persistent compression stream.
+        let mut pending_frames: Vec<Vec<u8>> = if report.viewer_encodings.contains(&1011) {
+            vec![
+                mvs_white_rectangle(self.width, self.height),
+                mvs_solid_ycbcr_rectangle(self.width, self.height, 200, 128, 128),
+            ]
+        } else {
+            let mut compressor = Compress::new(Compression::default(), true);
+            vec![
+                zlib_solid_rectangle(&mut compressor, self.width, self.height, [255, 255, 255])?,
+                zlib_solid_rectangle(&mut compressor, self.width, self.height, [32, 96, 192])?,
+            ]
+        };
         let first = pending_frames.remove(0);
         let record = encoder.encode_wire(&first).map_err(io::Error::other)?;
         stream.write_all(&record)?;
@@ -245,7 +257,12 @@ impl EncryptedTransportOracle {
             report.client_to_server_records += 1;
             if let Some(&message_type) = payload.first() {
                 report.client_message_types.push(message_type);
-                if message_type == 3
+                if message_type == 9 && payload.len() != 16 {
+                    return Err(io::Error::other(
+                        "invalid automatic framebuffer-update message",
+                    ));
+                }
+                if matches!(message_type, 3 | 9)
                     && let Some(frame) = pending_frames.first()
                 {
                     let record = encoder.encode_wire(frame).map_err(io::Error::other)?;
@@ -314,6 +331,12 @@ impl EncryptedTransportOracle {
                     }
                     let mut encodings = vec![0_u8; count.saturating_mul(4)];
                     stream.read_exact(&mut encodings)?;
+                    report.viewer_encodings = encodings
+                        .chunks_exact(4)
+                        .map(|encoding| {
+                            i32::from_be_bytes(encoding.try_into().expect("encoding width checked"))
+                        })
+                        .collect();
                 }
                 3 => {
                     let mut request = [0_u8; 9];
@@ -440,6 +463,42 @@ fn frame_mvs_rectangle(payload: &[u8], width: u16, height: u16) -> Vec<u8> {
     update.extend_from_slice(&(Encoding::ArdMvs as i32).to_be_bytes());
     update.extend_from_slice(payload);
     update
+}
+
+fn zlib_solid_rectangle(
+    compressor: &mut Compress,
+    width: u16,
+    height: u16,
+    rgb: [u8; 3],
+) -> io::Result<Vec<u8>> {
+    let pixels = usize::from(width)
+        .checked_mul(usize::from(height))
+        .ok_or_else(|| io::Error::other("oracle framebuffer size overflow"))?;
+    let mut plain = Vec::with_capacity(pixels.saturating_mul(4));
+    for _ in 0..pixels {
+        // XRGB8888 is little-endian on the wire: B, G, R, unused.
+        plain.extend_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
+    }
+    let before_out = compressor.total_out();
+    let mut compressed = vec![0; plain.len().saturating_mul(2).saturating_add(128)];
+    compressor
+        .compress(&plain, &mut compressed, FlushCompress::Sync)
+        .map_err(io::Error::other)?;
+    let produced = usize::try_from(compressor.total_out() - before_out)
+        .map_err(|_| io::Error::other("oracle compressed size overflow"))?;
+    compressed.truncate(produced);
+
+    let mut update = vec![0, 0, 0, 1];
+    update.extend_from_slice(&0_u16.to_be_bytes());
+    update.extend_from_slice(&0_u16.to_be_bytes());
+    update.extend_from_slice(&width.to_be_bytes());
+    update.extend_from_slice(&height.to_be_bytes());
+    update.extend_from_slice(&(Encoding::Zlib as i32).to_be_bytes());
+    let compressed_len = u32::try_from(compressed.len())
+        .map_err(|_| io::Error::other("oracle compressed rectangle is too large"))?;
+    update.extend_from_slice(&compressed_len.to_be_bytes());
+    update.extend_from_slice(&compressed);
+    Ok(update)
 }
 
 fn mvs_white_rectangle(width: u16, height: u16) -> Vec<u8> {

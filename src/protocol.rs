@@ -796,6 +796,31 @@ pub fn build_framebuffer_update_request(
     out
 }
 
+/// Builds Apple's 16-byte automatic framebuffer-update request.
+///
+/// The installed Screen Sharing client sends message type `9` with flag `1`,
+/// a big-endian millisecond interval, and an optional update rectangle. An
+/// interval of zero is the native default and lets the server deliver updates
+/// as soon as they are available instead of waiting for a request after every
+/// decoded frame.
+pub fn build_ard_auto_frame_update(
+    interval_ms: u32,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+) -> [u8; 16] {
+    let mut out = [0; 16];
+    out[0] = 9;
+    out[2..4].copy_from_slice(&1_u16.to_be_bytes());
+    out[4..8].copy_from_slice(&interval_ms.to_be_bytes());
+    out[8..10].copy_from_slice(&x.to_be_bytes());
+    out[10..12].copy_from_slice(&y.to_be_bytes());
+    out[12..14].copy_from_slice(&width.to_be_bytes());
+    out[14..16].copy_from_slice(&height.to_be_bytes());
+    out
+}
+
 pub fn parse_framebuffer_update(
     bytes: &[u8],
     decoder: &mut Decoder,

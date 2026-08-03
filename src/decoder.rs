@@ -28,6 +28,7 @@ pub struct Decoder {
     pixel_format: PixelFormat,
     limits: DecodeLimits,
     streams: [Decompress; 5],
+    zlib_scratch: [Vec<u8>; 4],
     mvs: MvsState,
     pending_encryption_control: Option<ArdEncryptionControl>,
     gpu_mvs_output: bool,
@@ -47,6 +48,7 @@ impl Decoder {
             // Apple keeps independent persistent streams for halftone,
             // grayscale, thousands, full-colour zlib, and ZRLE.
             streams: core::array::from_fn(|_| Decompress::new(true)),
+            zlib_scratch: core::array::from_fn(|_| Vec::new()),
             mvs: MvsState::default(),
             pending_encryption_control: None,
             gpu_mvs_output: false,
@@ -352,7 +354,13 @@ impl Decoder {
                 available: payload.len(),
             });
         }
-        self.blit_pixels(rect, &payload[..expected], bpp, framebuffer)?;
+        blit_pixels(
+            self.pixel_format,
+            rect,
+            &payload[..expected],
+            bpp,
+            framebuffer,
+        )?;
         Ok(expected)
     }
 
@@ -384,43 +392,28 @@ impl Decoder {
         let expected = row_bytes
             .checked_mul(usize::from(rect.height))
             .ok_or(Error::LimitExceeded("decompressed rectangle"))?;
+        let pixel_format = self.pixel_format;
         let decoded = decompress_exact(
             &mut self.streams[stream],
             compressed,
             expected,
             self.limits.max_decompressed_bytes,
+            &mut self.zlib_scratch[stream],
         )?;
         match stream {
-            0 => blit_halftone(rect, &decoded, row_bytes, framebuffer),
-            1 => blit_grayscale(rect, &decoded, row_bytes, framebuffer),
-            2 => blit_rgb555(rect, &decoded, framebuffer),
-            3 => self.blit_pixels(
+            0 => blit_halftone(rect, decoded, row_bytes, framebuffer),
+            1 => blit_grayscale(rect, decoded, row_bytes, framebuffer),
+            2 => blit_rgb555(rect, decoded, framebuffer),
+            3 => blit_pixels(
+                pixel_format,
                 rect,
-                &decoded,
-                self.pixel_format.bytes_per_pixel()?,
+                decoded,
+                pixel_format.bytes_per_pixel()?,
                 framebuffer,
             ),
             _ => unreachable!(),
         }?;
         Ok(cursor.position())
-    }
-
-    fn blit_pixels(
-        &self,
-        rect: Rectangle,
-        bytes: &[u8],
-        bpp: usize,
-        framebuffer: &mut Framebuffer,
-    ) -> Result<()> {
-        for row in 0..rect.height {
-            for column in 0..rect.width {
-                let index =
-                    (usize::from(row) * usize::from(rect.width) + usize::from(column)) * bpp;
-                let rgba = self.pixel_format.decode_pixel(&bytes[index..index + bpp])?;
-                framebuffer.set_pixel(rect.x + column, rect.y + row, rgba);
-            }
-        }
-        Ok(())
     }
 
     fn decode_zrle(
@@ -575,25 +568,24 @@ fn fixed_payload_len(payload: &[u8], needed: usize) -> Result<usize> {
     }
 }
 
-fn decompress_exact(
+fn decompress_exact<'a>(
     stream: &mut Decompress,
     input: &[u8],
     expected: usize,
     max: usize,
-) -> Result<Vec<u8>> {
+    output: &'a mut Vec<u8>,
+) -> Result<&'a [u8]> {
     if expected > max {
         return Err(Error::LimitExceeded("decompressed rectangle"));
     }
-    let mut output = vec![
-        0;
-        expected
-            .checked_add(1)
-            .ok_or(Error::LimitExceeded("decompressed rectangle"))?
-    ];
+    let output_len = expected
+        .checked_add(1)
+        .ok_or(Error::LimitExceeded("decompressed rectangle"))?;
+    output.resize(output_len, 0);
     let before_in = stream.total_in();
     let before_out = stream.total_out();
     let status = stream
-        .decompress(input, &mut output, FlushDecompress::Sync)
+        .decompress(input, output, FlushDecompress::Sync)
         .map_err(|_| Error::Decompression)?;
     let consumed =
         usize::try_from(stream.total_in() - before_in).map_err(|_| Error::Decompression)?;
@@ -603,7 +595,7 @@ fn decompress_exact(
         return Err(Error::Decompression);
     }
     output.truncate(expected);
-    Ok(output)
+    Ok(output.as_slice())
 }
 
 fn decompress_available(stream: &mut Decompress, input: &[u8], max: usize) -> Result<Vec<u8>> {
@@ -642,6 +634,45 @@ fn decompress_available(stream: &mut Decompress, input: &[u8], max: usize) -> Re
         return Err(Error::Decompression);
     }
     Ok(output)
+}
+
+fn blit_pixels(
+    pixel_format: PixelFormat,
+    rect: Rectangle,
+    bytes: &[u8],
+    bpp: usize,
+    framebuffer: &mut Framebuffer,
+) -> Result<()> {
+    if pixel_format == PixelFormat::XRGB8888 {
+        let source_row_bytes = usize::from(rect.width) * 4;
+        let destination_row_bytes = usize::from(framebuffer.width()) * 4;
+        let destination_x = usize::from(rect.x) * 4;
+        let destination_y = usize::from(rect.y);
+        let destination = framebuffer.rgba_mut();
+        for row in 0..usize::from(rect.height) {
+            let source_start = row * source_row_bytes;
+            let destination_start = (destination_y + row) * destination_row_bytes + destination_x;
+            let source_row = &bytes[source_start..source_start + source_row_bytes];
+            let destination_row =
+                &mut destination[destination_start..destination_start + source_row_bytes];
+            for (source, target) in source_row
+                .chunks_exact(4)
+                .zip(destination_row.chunks_exact_mut(4))
+            {
+                target.copy_from_slice(&[source[2], source[1], source[0], 255]);
+            }
+        }
+        return Ok(());
+    }
+
+    for row in 0..rect.height {
+        for column in 0..rect.width {
+            let index = (usize::from(row) * usize::from(rect.width) + usize::from(column)) * bpp;
+            let rgba = pixel_format.decode_pixel(&bytes[index..index + bpp])?;
+            framebuffer.set_pixel(rect.x + column, rect.y + row, rgba);
+        }
+    }
+    Ok(())
 }
 
 fn blit_halftone(

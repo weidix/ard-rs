@@ -40,12 +40,27 @@ The framework data symbols contain:
 | `kSSVideoEncoding_Zlib` | 6 | negotiated-pixel zlib |
 | `kSSVideoEncoding_ZRLE` | 16 | ZRLE |
 
-The installed quality lists are:
+The installed Apple quality lists are:
 
 - low: `[1000, 6, 16]`
 - medium: `[1001, 6, 16]`
 - high/adaptive: `[1011, 1002, 6, 16]`
 - full quality: `[6, 16]`
+
+Remote Desktop Manager exposes high and adaptive separately: high prefers the
+16-bit sub-zlib codec (`1002`), while adaptive prefers MVS (`1011`). The viewer
+therefore exposes these profiles (and appends DesktopSize `-223`):
+
+| Viewer profile | Advertised image encodings |
+| --- | --- |
+| low | `[1000, 6, 16]` |
+| medium | `[1001, 6, 16]` |
+| high | `[1002, 6, 16]` |
+| adaptive | `[1011, 1002, 6, 16]` |
+| full | `[6, 16]` |
+
+RDM documents full quality as full-colour zlib and adaptive quality as Apple
+MVS in its [ARD session settings](https://docs.devolutions.net/fr/rdm/kb/knowledge-base/entry-settings/configure-ard-session-entry-in-rdm/).
 
 ## Apple zlib rectangle framing
 
@@ -132,6 +147,36 @@ The current native client also extends initialization. It sent `0xc1` in the
 one-byte `ClientInit` position (so it must be preserved as flags rather than
 restricted to the standard `0/1` boolean), followed after `ServerInit` by
 client message `10 00 00 01`. The Rust protocol layer parses both records.
+
+## Confirmed automatic framebuffer updates (`0x09`)
+
+The installed framework's `_RFBAutoFrameUpdate` builder sends a fixed 16-byte
+client message. Multi-byte fields are big-endian:
+
+| Offset | Size | Meaning |
+| ---: | ---: | --- |
+| 0 | 1 | message type `9` |
+| 1 | 1 | zero padding |
+| 2 | 2 | enabled flag (`1`) |
+| 4 | 4 | minimum update interval in milliseconds |
+| 8 | 2 | x |
+| 10 | 2 | y |
+| 12 | 2 | width |
+| 14 | 2 | height |
+
+The native client calls `_RFBAutoFrameUpdate(session, 1, interval, rect)` and
+its default `frameUpdateInterval` is zero. The client converts seconds to
+milliseconds, so the default wire interval is also zero and permits the
+server's maximum supported update rate. `screensharingd` dispatches type `9`
+to `HandleAutoFrameBufferUpdateMessage`, which starts monitoring screen
+changes and pushes framebuffer updates.
+
+The previous Rust viewer instead sent one incremental type-`3`
+FramebufferUpdateRequest only after receiving and decoding the preceding
+update. Network latency plus decode time therefore serialized the entire frame
+pipeline and capped its refresh rate. `ArdClient` now sends the encrypted type
+`9` subscription immediately after transport activation; request-response
+polling remains available only as an explicit compatibility mode.
 
 ## MVS wire structure
 
@@ -433,13 +478,9 @@ The Rust implementation now provides:
 - redacted state diagnostics.
 
 The CBC helper is checked against the NIST SP 800-38A AES-128-CBC vector. The
-targeted transport suite currently contains 13 passing tests, the type-30
-suite contains 3 passing tests, the decoder suite contains 28 passing tests,
-the library unit suite contains 7 passing tests, the new `0x12` suite contains
-5 passing tests, the decrypted-payload dispatcher suite contains 6 passing
-tests, the extended ServerInit suite contains 4 passing tests, and the
-encrypted-session loop contains 1 passing test. A complete all-target run is
-still required after the remaining work.
+transport, type-30, decoder, dispatcher, ServerInit, automatic-update, and
+encrypted-session suites pass in both the core and feature-enabled all-target
+runs, including strict Clippy linting.
 
 ### Decrypted-payload dispatcher
 
@@ -474,14 +515,18 @@ drives the whole modern path against a client:
 4. a real 1103 control rectangle whose two blocks are AES-128-encrypted with
    the derived authentication value;
 5. validation of the client's eight-byte activation message;
-6. AES-CBC records carrying MVS white and solid rectangles, with the client
-   direction decrypted and redacted (message types only).
+6. validation of the encrypted type-`9` automatic-update subscription;
+7. AES-CBC records carrying either MVS white/solid rectangles or two updates
+   from one persistent full-colour zlib stream, with the client direction
+   decrypted and redacted.
 
-The in-process integration test `tests/encrypted_session_loop.rs` runs a Rust
-client through the complete session: banner, type-30 exchange, extended
-ServerInit, `0x21`/`0x12`, 1103 unwrap, activation, encrypted
-FramebufferUpdateRequests, and decoding of the white MVS frame from decrypted
-records. This validates the full Rust stack end to end and prepares the exact
+The in-process integration tests run a Rust client through the complete
+session: banner, type-30 exchange, extended ServerInit, `0x21`/`0x12`, 1103
+unwrap, activation, encrypted automatic-update subscription, and decoding of
+both adaptive MVS and full-quality zlib frames from decrypted records. They
+also verify that traffic accounting uses the encrypted record bytes rather
+than the smaller decrypted message size. This validates the full Rust stack
+end to end and prepares the exact
 artifact needed for the native-client run: build for
 `aarch64-unknown-linux-musl`, run it in a Linux container, and connect Screen
 Sharing to it. That native run still has to happen; until it does, the

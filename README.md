@@ -16,13 +16,31 @@ ARD_PASSWORD='screen-sharing-password' \
   192.168.1.20:5900 username
 ```
 
-The modern MVS path does not create a CPU RGB or YUV framebuffer. After ARD
-record authentication and decryption, the CPU performs the stateful protocol
-and variable-length Rice/Huffman parsing needed by the custom Apple codec and
-emits bounded 8x8 tile commands with native DCT coefficients. A wgpu compute
-pipeline performs inverse DCT, MVS Rice chroma expansion, tile composition,
-and color conversion into a GPU-only presentation texture. The render pass
-then scales that texture with aspect-ratio-preserving letterboxing.
+The viewer defaults to RDM-compatible full quality (`[Zlib, ZRLE]`). It also
+supports the native low, medium, high, and adaptive profiles:
+
+```sh
+# Maximum fidelity and bandwidth (the default)
+ard-viewer --quality full 192.168.1.20:5900 username
+
+# Apple MVS adaptive streaming and GPU tile decoding
+ard-viewer --quality adaptive 192.168.1.20:5900 username
+
+# Optional minimum server update interval; zero is native maximum rate
+ard-viewer --frame-interval-ms 16 192.168.1.20:5900 username
+```
+
+After encrypted transport activation, the client sends Apple's automatic
+frame-update subscription with a zero interval by default. This lets
+`screensharingd` push changed frames without waiting for a decode/render cycle
+and removes the previous request-response refresh-rate limit. The window title
+reports decoded framebuffer updates per second and actual encrypted inbound
+Mbit/s.
+
+In adaptive mode, the CPU performs MVS state and Rice/Huffman parsing and emits
+bounded 8x8 tile commands with native DCT coefficients. A wgpu compute pipeline
+performs inverse DCT, chroma expansion, tile composition, and color conversion
+into a GPU-only presentation texture.
 
 ```text
 TCP -> authenticated decrypt -> MVS tile/DCT parser
@@ -30,10 +48,10 @@ TCP -> authenticated decrypt -> MVS tile/DCT parser
     -> GPU presentation texture -> Metal / D3D12 / Vulkan
 ```
 
-The CPU RGBA decoder remains available as the compatibility and test path for
-Raw, Zlib, ZRLE, and callers of the original library API. The viewer itself
-negotiates MVS (plus desktop-size updates) so it cannot silently fall back to
-a CPU image-frame path.
+The full, high, medium, and low profiles use the CPU RGBA decoder for Raw,
+Zlib, ZRLE, and Apple's three sub-zlib encodings, then upload complete snapshots
+to the same GPU presentation texture. Pending full-frame snapshots are
+coalesced so a slow window cannot grow latency or memory without bound.
 
 Reverse-engineering notes are in
 [`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md). A step-by-step playbook
@@ -68,11 +86,16 @@ on a VNC library or a native operating-system library.
   into the persistent decoder state and exposing `1103` controls
 - a pure-Rust encrypted-transport oracle server that completes the type-30
   exchange, sends a real 1103 control rectangle, validates the client's
-  activation, and exchanges AES-CBC records carrying MVS frames
+  activation and automatic-update subscription, and exchanges AES-CBC records
+  carrying either MVS or persistent full-colour zlib frames
 - bounded parsing of security offers, `ServerInit`, and `FramebufferUpdate`
 - Apple's extended `ServerInit` command-support block, including the
   `0x12`-advertising bitfield that gates the encrypted transport
 - client message generation for pixel format, encodings, and update requests
+- Apple's server-driven automatic frame-update message (`0x09`), including a
+  configurable interval and the native zero-interval maximum-rate default
+- RDM-compatible low, medium, high, adaptive MVS, and full-quality encoding
+  profiles
 - raw and full-colour zlib rectangles
 - ZRLE tiles (raw, solid, packed palette, plain RLE, and palette RLE)
 - Apple encoding `1000`: zlib-compressed 1-bit halftone
@@ -87,8 +110,9 @@ on a VNC library or a native operating-system library.
 - independent persistent zlib state for every Apple stream
 - RGBA framebuffer updates with checked dimensions, allocations, runs, and
   palette indexes
-- optional receive-only native GUI with direct TCP authentication, encrypted
-  session streaming, GPU-native MVS tile/DCT output, compute-shader IDCT, and
+- optional receive-only native GUI with direct TCP authentication,
+  server-driven encrypted session streaming, selectable quality, GPU-native
+  MVS tile/DCT output, RGBA upload, live FPS/traffic metrics, and
   Metal/D3D12/Vulkan presentation
 
 Apple MVS (`1011`) is identified as a distinct codec and is never fed to a VNC
@@ -99,8 +123,9 @@ baseline, copy metadata, and 1–64999 DCT cache ring are decoded directly.
 
 The `0x21`, `0x12`, `1103`, type-30 computation, encrypted-record, and
 decrypted-payload dispatch layers are implemented and covered by focused
-tests, including an in-process client↔oracle session that decodes an MVS
-frame from encrypted records. A Rust client has also completed a private live
+tests, including in-process client↔oracle sessions that decode both adaptive
+MVS and full-quality persistent zlib frames from encrypted records. A Rust
+client has also completed a private live
 session against macOS `screensharingd` and decoded a fully covered framebuffer;
 the captured payload and pixels are deliberately not stored in this repository.
 See

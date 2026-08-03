@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::{
     ArdEncryptionControl, ArdMessageDispatcher, ArdServerMessage, ArdVerifiedRecordStream,
     ArdViewerInformation, Decoder, Framebuffer, PixelFormat, ProtocolVersion, SecurityType,
-    build_ard_encryption_activation, build_ard_set_encryption_level,
+    build_ard_auto_frame_update, build_ard_encryption_activation, build_ard_set_encryption_level,
     build_ard_type30_client_exchange, build_framebuffer_update_request, build_set_encodings,
     build_set_pixel_format, parse_ard_auth_challenge, parse_framebuffer_update,
     parse_security_types, parse_server_init, unwrap_ard_session_material,
@@ -18,11 +18,52 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CUT_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_SERVER_NAME_BYTES: usize = 1024 * 1024;
 
+/// ARD image-quality profiles, matching the encoding families exposed by
+/// Apple Screen Sharing and Remote Desktop Manager.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ArdVideoQuality {
+    Low,
+    Medium,
+    High,
+    #[default]
+    Adaptive,
+    Full,
+}
+
+impl ArdVideoQuality {
+    pub fn encodings(self) -> &'static [i32] {
+        match self {
+            Self::Low => &[1000, 6, 16, -223],
+            Self::Medium => &[1001, 6, 16, -223],
+            Self::High => &[1002, 6, 16, -223],
+            Self::Adaptive => &[1011, 1002, 6, 16, -223],
+            Self::Full => &[6, 16, -223],
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Low => "低画质",
+            Self::Medium => "中画质",
+            Self::High => "高画质",
+            Self::Adaptive => "自适应 MVS",
+            Self::Full => "全画质",
+        }
+    }
+}
+
 pub struct ArdClientConfig {
     pub address: String,
     pub username: Vec<u8>,
     pub password: Vec<u8>,
     pub timeout: Duration,
+    pub video_quality: ArdVideoQuality,
+    /// Use Apple's server-driven update stream instead of serial
+    /// request/response polling.
+    pub automatic_updates: bool,
+    /// Minimum interval between automatic updates. Zero is the native default
+    /// and permits the server's maximum supported rate.
+    pub frame_interval: Duration,
 }
 
 impl fmt::Debug for ArdClientConfig {
@@ -33,6 +74,9 @@ impl fmt::Debug for ArdClientConfig {
             .field("username_len", &self.username.len())
             .field("password", &"<redacted>")
             .field("timeout", &self.timeout)
+            .field("video_quality", &self.video_quality)
+            .field("automatic_updates", &self.automatic_updates)
+            .field("frame_interval", &self.frame_interval)
             .finish()
     }
 }
@@ -48,6 +92,9 @@ impl ArdClientConfig {
             username: username.into(),
             password: password.into(),
             timeout: Duration::from_secs(20),
+            video_quality: ArdVideoQuality::Adaptive,
+            automatic_updates: true,
+            frame_interval: Duration::ZERO,
         }
     }
 }
@@ -86,7 +133,11 @@ impl From<crate::Error> for ArdClientError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArdFrameInfo {
     pub index: u64,
+    pub framebuffer_updates: usize,
     pub rectangle_count: usize,
+    pub payload_bytes: usize,
+    /// Actual encrypted server-to-client bytes, including each record's
+    /// two-byte length prefix and block padding.
     pub wire_bytes: usize,
 }
 
@@ -104,6 +155,7 @@ pub struct ArdClient {
     framebuffer: Framebuffer,
     server_name: String,
     frame_index: u64,
+    automatic_updates: bool,
 }
 
 impl ArdClient {
@@ -224,15 +276,21 @@ impl ArdClient {
             ));
         }
 
-        let mut decoder = Decoder::new_gpu_mvs(PixelFormat::XRGB8888)?;
-        let mut framebuffer = Framebuffer::new_metadata(server_init.width, server_init.height)?;
+        let (mut decoder, mut framebuffer) = if config.video_quality == ArdVideoQuality::Adaptive {
+            (
+                Decoder::new_gpu_mvs(PixelFormat::XRGB8888)?,
+                Framebuffer::new_metadata(server_init.width, server_init.height)?,
+            )
+        } else {
+            (
+                Decoder::new(PixelFormat::XRGB8888)?,
+                Framebuffer::new(server_init.width, server_init.height)?,
+            )
+        };
         stream.write_all(&[10, 0, 0, 1])?;
         stream.write_all(&viewer_information())?;
         stream.write_all(&build_set_pixel_format(PixelFormat::XRGB8888)?)?;
-        // The viewer intentionally negotiates the native MVS path only. The
-        // library still supports the legacy encodings, but accepting one here
-        // would silently fall back to a CPU image framebuffer.
-        stream.write_all(&build_set_encodings(&[1011, -223])?)?;
+        stream.write_all(&build_set_encodings(config.video_quality.encodings())?)?;
         stream.write_all(&build_ard_set_encryption_level(1, &[1])?)?;
         // This request lets servers serialize the 1103 control as the update
         // satisfying the initial non-incremental request. Current macOS also
@@ -257,9 +315,28 @@ impl ArdClient {
             MAX_RECORD_BYTES,
             16,
         )?;
-        let request =
-            build_framebuffer_update_request(false, 0, 0, server_init.width, server_init.height);
-        stream.write_all(&encoder.encode_wire(&request)?)?;
+        if config.automatic_updates {
+            let interval_ms = u32::try_from(config.frame_interval.as_millis()).map_err(|_| {
+                ArdClientError::Message("automatic frame interval is too large".to_owned())
+            })?;
+            let request = build_ard_auto_frame_update(
+                interval_ms,
+                0,
+                0,
+                server_init.width,
+                server_init.height,
+            );
+            stream.write_all(&encoder.encode_wire(&request)?)?;
+        } else {
+            let request = build_framebuffer_update_request(
+                false,
+                0,
+                0,
+                server_init.width,
+                server_init.height,
+            );
+            stream.write_all(&encoder.encode_wire(&request)?)?;
+        }
         stream.flush()?;
         // Incremental RFB requests are allowed to remain pending while the
         // desktop is unchanged. Keep handshake operations bounded, then let
@@ -276,6 +353,7 @@ impl ArdClient {
             framebuffer,
             server_name: server_init.name,
             frame_index: 0,
+            automatic_updates: config.automatic_updates,
         })
     }
 
@@ -292,37 +370,53 @@ impl ArdClient {
     }
 
     pub fn next_frame(&mut self) -> Result<ArdFrameInfo, ArdClientError> {
+        let mut wire_bytes = 0_usize;
         loop {
             let wire = read_encrypted_record_wire(&mut self.stream)?;
+            wire_bytes = wire_bytes.saturating_add(wire.len());
+            let mut framebuffer_updates = 0_usize;
+            let mut rectangle_count = 0_usize;
+            let mut payload_bytes = 0_usize;
             for payload in self.verified.push(&wire)? {
                 let messages =
                     self.dispatcher
                         .push(&payload, &mut self.decoder, &mut self.framebuffer)?;
                 for message in messages {
                     if let ArdServerMessage::FramebufferUpdate {
-                        rectangle_count,
+                        rectangle_count: rectangles,
                         bytes,
                     } = message
                     {
-                        self.frame_index = self.frame_index.wrapping_add(1);
-                        let request = build_framebuffer_update_request(
-                            true,
-                            0,
-                            0,
-                            self.framebuffer.width(),
-                            self.framebuffer.height(),
-                        );
-                        self.stream
-                            .write_all(&self.encoder.encode_wire(&request)?)?;
-                        self.stream.flush()?;
-                        return Ok(ArdFrameInfo {
-                            index: self.frame_index,
-                            rectangle_count,
-                            wire_bytes: bytes,
-                        });
+                        framebuffer_updates = framebuffer_updates.saturating_add(1);
+                        rectangle_count = rectangle_count.saturating_add(rectangles);
+                        payload_bytes = payload_bytes.saturating_add(bytes);
                     }
                 }
             }
+            if framebuffer_updates == 0 {
+                continue;
+            }
+
+            self.frame_index = self.frame_index.wrapping_add(framebuffer_updates as u64);
+            if !self.automatic_updates {
+                let request = build_framebuffer_update_request(
+                    true,
+                    0,
+                    0,
+                    self.framebuffer.width(),
+                    self.framebuffer.height(),
+                );
+                self.stream
+                    .write_all(&self.encoder.encode_wire(&request)?)?;
+                self.stream.flush()?;
+            }
+            return Ok(ArdFrameInfo {
+                index: self.frame_index,
+                framebuffer_updates,
+                rectangle_count,
+                payload_bytes,
+                wire_bytes,
+            });
         }
     }
 }
