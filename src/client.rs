@@ -156,6 +156,8 @@ pub struct ArdClient {
     server_name: String,
     frame_index: u64,
     automatic_updates: bool,
+    automatic_frame_interval_ms: u32,
+    automatic_updates_started: bool,
 }
 
 impl ArdClient {
@@ -315,28 +317,19 @@ impl ArdClient {
             MAX_RECORD_BYTES,
             16,
         )?;
-        if config.automatic_updates {
-            let interval_ms = u32::try_from(config.frame_interval.as_millis()).map_err(|_| {
+        let automatic_frame_interval_ms = if config.automatic_updates {
+            u32::try_from(config.frame_interval.as_millis()).map_err(|_| {
                 ArdClientError::Message("automatic frame interval is too large".to_owned())
-            })?;
-            let request = build_ard_auto_frame_update(
-                interval_ms,
-                0,
-                0,
-                server_init.width,
-                server_init.height,
-            );
-            stream.write_all(&encoder.encode_wire(&request)?)?;
+            })?
         } else {
-            let request = build_framebuffer_update_request(
-                false,
-                0,
-                0,
-                server_init.width,
-                server_init.height,
-            );
-            stream.write_all(&encoder.encode_wire(&request)?)?;
-        }
+            0
+        };
+        // Apple's view startup always requests one non-incremental frame.
+        // That frame establishes MVS copy/cache state before type 9 enables
+        // the server-driven incremental stream.
+        let request =
+            build_framebuffer_update_request(false, 0, 0, server_init.width, server_init.height);
+        stream.write_all(&encoder.encode_wire(&request)?)?;
         stream.flush()?;
         // Incremental RFB requests are allowed to remain pending while the
         // desktop is unchanged. Keep handshake operations bounded, then let
@@ -354,6 +347,8 @@ impl ArdClient {
             server_name: server_init.name,
             frame_index: 0,
             automatic_updates: config.automatic_updates,
+            automatic_frame_interval_ms,
+            automatic_updates_started: false,
         })
     }
 
@@ -414,7 +409,19 @@ impl ArdClient {
             }
 
             self.frame_index = self.frame_index.wrapping_add(framebuffer_updates as u64);
-            if !self.automatic_updates {
+            if self.automatic_updates && !self.automatic_updates_started {
+                let request = build_ard_auto_frame_update(
+                    self.automatic_frame_interval_ms,
+                    0,
+                    0,
+                    self.framebuffer.width(),
+                    self.framebuffer.height(),
+                );
+                self.stream
+                    .write_all(&self.encoder.encode_wire(&request)?)?;
+                self.stream.flush()?;
+                self.automatic_updates_started = true;
+            } else if !self.automatic_updates {
                 let request = build_framebuffer_update_request(
                     true,
                     0,

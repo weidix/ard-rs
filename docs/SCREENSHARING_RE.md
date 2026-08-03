@@ -171,12 +171,20 @@ server's maximum supported update rate. `screensharingd` dispatches type `9`
 to `HandleAutoFrameBufferUpdateMessage`, which starts monitoring screen
 changes and pushes framebuffer updates.
 
-The previous Rust viewer instead sent one incremental type-`3`
-FramebufferUpdateRequest only after receiving and decoding the preceding
-update. Network latency plus decode time therefore serialized the entire frame
-pipeline and capped its refresh rate. `ArdClient` now sends the encrypted type
-`9` subscription immediately after transport activation; request-response
-polling remains available only as an explicit compatibility mode.
+Automatic updates do not replace initial framebuffer state establishment.
+`-[SSSessionView requestUpdates]` invokes `-[SSSession stRequestUpdates]` when
+display starts and retries up to five times on failure. The latter calls
+`RFBCheckForUpdateCore(session, 1, NULL)`, which emits a type-`3` request with
+`incremental=0`. The type-`9` interval method is a separate operation.
+
+The previous Rust viewer sent incremental type-`3` requests only after
+receiving and decoding the preceding update, serializing network latency and
+decode time. Replacing that loop with type `9` accidentally also removed the
+encrypted non-incremental startup request, so an MVS stream could begin with
+copy/cache references before the decoder had a baseline. `ArdClient` now
+requests and decodes one encrypted full baseline, then enables type `9` for
+subsequent server-driven updates. Request-response polling remains available
+as an explicit compatibility mode.
 
 ## MVS wire structure
 
@@ -515,18 +523,19 @@ drives the whole modern path against a client:
 4. a real 1103 control rectangle whose two blocks are AES-128-encrypted with
    the derived authentication value;
 5. validation of the client's eight-byte activation message;
-6. validation of the encrypted type-`9` automatic-update subscription;
+6. validation of the encrypted non-incremental type-`3` baseline request
+   followed by the type-`9` automatic-update subscription;
 7. AES-CBC records carrying either MVS white/solid rectangles or two updates
    from one persistent full-colour zlib stream, with the client direction
    decrypted and redacted.
 
 The in-process integration tests run a Rust client through the complete
 session: banner, type-30 exchange, extended ServerInit, `0x21`/`0x12`, 1103
-unwrap, activation, encrypted automatic-update subscription, and decoding of
-both adaptive MVS and full-quality zlib frames from decrypted records. They
-also verify that traffic accounting uses the encrypted record bytes rather
-than the smaller decrypted message size. This validates the full Rust stack
-end to end and prepares the exact
+unwrap, activation, encrypted full-baseline request, automatic-update
+subscription, and decoding of both adaptive MVS and full-quality zlib frames
+from decrypted records. They also verify that traffic accounting uses the
+encrypted record bytes rather than the smaller decrypted message size. This
+validates the full Rust stack end to end and prepares the exact
 artifact needed for the native-client run: build for
 `aarch64-unknown-linux-musl`, run it in a Linux container, and connect Screen
 Sharing to it. That native run still has to happen; until it does, the

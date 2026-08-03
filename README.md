@@ -31,12 +31,12 @@ ard-viewer --quality adaptive 192.168.1.20:5900 username
 ard-viewer --frame-interval-ms 16 192.168.1.20:5900 username
 ```
 
-After encrypted transport activation, the client sends Apple's automatic
-frame-update subscription with a zero interval by default. This lets
-`screensharingd` push changed frames without waiting for a decode/render cycle
-and removes the previous request-response refresh-rate limit. The window title
-reports decoded framebuffer updates per second and actual encrypted inbound
-Mbit/s.
+After encrypted transport activation, the client requests and decodes one
+non-incremental full-frame baseline, then sends Apple's automatic frame-update
+subscription with a zero interval by default. This preserves MVS copy/cache
+state while letting `screensharingd` push later changes without waiting for a
+decode/render cycle. The window title reports decoded framebuffer updates per
+second and actual encrypted inbound Mbit/s.
 
 In adaptive mode, the CPU performs MVS state and Rice/Huffman parsing and emits
 bounded 8x8 tile commands with native DCT coefficients. A wgpu compute pipeline

@@ -96,6 +96,8 @@ pub struct OracleReport {
     pub client_to_server_records: usize,
     /// First byte (message type) of each decrypted client record.
     pub client_message_types: Vec<u8>,
+    /// Incremental flag from every decrypted type-3 framebuffer request.
+    pub client_framebuffer_update_incremental: Vec<bool>,
     pub frames_sent: usize,
 }
 
@@ -112,6 +114,7 @@ impl EncryptedTransportOracle {
             server_to_client_records: 0,
             client_to_server_records: 0,
             client_message_types: Vec::new(),
+            client_framebuffer_update_incremental: Vec::new(),
             frames_sent: 0,
         };
 
@@ -257,6 +260,16 @@ impl EncryptedTransportOracle {
             report.client_to_server_records += 1;
             if let Some(&message_type) = payload.first() {
                 report.client_message_types.push(message_type);
+                if message_type == 3 {
+                    if payload.len() != 10 {
+                        return Err(io::Error::other(
+                            "invalid framebuffer-update request message",
+                        ));
+                    }
+                    report
+                        .client_framebuffer_update_incremental
+                        .push(payload[1] != 0);
+                }
                 if message_type == 9 && payload.len() != 16 {
                     return Err(io::Error::other(
                         "invalid automatic framebuffer-update message",

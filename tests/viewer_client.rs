@@ -54,8 +54,8 @@ fn receive_only_client_delivers_gpu_mvs_tiles_without_cpu_frame_expansion() {
     let report = server.join().unwrap();
     assert!(report.activation_received);
     assert_eq!(report.viewer_encodings, [1011, 1002, 6, 16, -223]);
-    assert!(report.client_message_types.contains(&9));
-    assert!(!report.client_message_types.contains(&3));
+    assert_eq!(report.client_message_types, [3, 9]);
+    assert_eq!(report.client_framebuffer_update_incremental, [false]);
     let viewer = report
         .viewer_information
         .expect("viewer information received");
@@ -100,6 +100,6 @@ fn full_quality_client_negotiates_lossless_zlib_and_updates_rgba() {
     drop(client);
     let report = server.join().unwrap();
     assert_eq!(report.viewer_encodings, [6, 16, -223]);
-    assert!(report.client_message_types.contains(&9));
-    assert!(!report.client_message_types.contains(&3));
+    assert_eq!(report.client_message_types, [3, 9]);
+    assert_eq!(report.client_framebuffer_update_incremental, [false]);
 }
