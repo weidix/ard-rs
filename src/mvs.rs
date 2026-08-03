@@ -4,6 +4,7 @@ use crate::wire::Cursor;
 use crate::{Error, Framebuffer, Rectangle, Result};
 
 pub(crate) const QUANTIZATION_UPDATE_LEN: usize = 129;
+const DCT_CACHE_LAST_INDEX: u16 = 64_999;
 
 const DEFAULT_LUMINANCE_QUANTIZATION: [u16; 64] = [
     0x10, 0x0b, 0x0b, 0x0e, 0x18, 0x16, 0x18, 0x21, 0x0b, 0x0c, 0x0b, 0x0b, 0x1a, 0x12, 0x13, 0x17,
@@ -141,7 +142,8 @@ pub(crate) struct MvsState {
     tiles: Vec<TileState>,
     generation: u32,
     cache: HashMap<u16, DctTile>,
-    last_cache_index: u16,
+    cache_write_index: u16,
+    last_cache_reference: u16,
     cache_insertions: u32,
 }
 
@@ -155,7 +157,8 @@ impl Default for MvsState {
             tiles: Vec::new(),
             generation: 0,
             cache: HashMap::new(),
-            last_cache_index: 0,
+            cache_write_index: 0,
+            last_cache_reference: 0,
             cache_insertions: 0,
         }
     }
@@ -183,18 +186,14 @@ impl MvsState {
     }
 
     fn insert_cache_tile(&mut self, tile: DctTile) {
-        let index = if self.last_cache_index == 64_999 {
-            1
-        } else {
-            self.last_cache_index + 1
-        };
-        self.last_cache_index = index;
+        let index = next_cache_index(self.cache_write_index);
+        self.cache_write_index = index;
         self.cache_insertions = self.cache_insertions.saturating_add(1);
         self.cache.insert(index, tile);
     }
 
     fn cached_tile(&mut self, index: u16) -> Result<DctTile> {
-        if index == 0 || index > 64_999 || u32::from(index) > self.cache_insertions {
+        if index == 0 || index > DCT_CACHE_LAST_INDEX || u32::from(index) > self.cache_insertions {
             return Err(Error::Invalid("invalid ARD MVS DCT cache index"));
         }
         let tile = self
@@ -202,7 +201,7 @@ impl MvsState {
             .get(&index)
             .copied()
             .ok_or(Error::Invalid("missing ARD MVS DCT cache entry"))?;
-        self.last_cache_index = index;
+        self.last_cache_reference = index;
         Ok(tile)
     }
 
@@ -375,10 +374,8 @@ impl MvsState {
                             let high = secondary.read(8)? as u16;
                             let low = secondary.read(8)? as u16;
                             (high << 8) | low
-                        } else if self.last_cache_index == 64_999 {
-                            1
                         } else {
-                            self.last_cache_index + 1
+                            next_cache_index(self.last_cache_reference)
                         };
                         let tile = self.cached_tile(cache_index)?;
                         MvsGpuTile::Dct(Box::new(tile.coefficients))
@@ -561,11 +558,7 @@ impl MvsState {
                 }
                 3 => {
                     let cache_index = if bits.read(1)? != 0 {
-                        if self.last_cache_index == 64_999 {
-                            1
-                        } else {
-                            self.last_cache_index + 1
-                        }
+                        next_cache_index(self.last_cache_reference)
                     } else {
                         let high = bits.read(8)? as u16;
                         let low = bits.read(8)? as u16;
@@ -601,6 +594,14 @@ impl MvsState {
             return Err(Error::Invalid("invalid ARD MVS full-update marker"));
         }
         Ok(updates)
+    }
+}
+
+fn next_cache_index(index: u16) -> u16 {
+    if index == DCT_CACHE_LAST_INDEX {
+        1
+    } else {
+        index + 1
     }
 }
 
