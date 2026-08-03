@@ -10,7 +10,8 @@
 - `real-macos-mvs-1920x1080.bin` contains 53,215 decrypted plaintext bytes from
   a real macOS 26.6 `screensharingd` session captured on 2026-08-03. It contains
   a zero-sized MVS quantization-table update followed by the complete 1920x1080
-  desktop update.
+  type-0 base update. Every framebuffer pixel is covered, but the lossy MVS
+  base frame is not a source-quality or lossless desktop reference.
 
 No fixture contains credentials, session keys, encrypted credential blocks,
 or clipboard data. The real macOS fixture does contain compressed desktop

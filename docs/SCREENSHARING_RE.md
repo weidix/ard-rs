@@ -524,7 +524,7 @@ Mac. The server returned 53,215 plaintext bytes in three authenticated
 encrypted records, containing two framebuffer updates. The decoder recovered
 all 2,073,600 pixels of the 1920x1080 desktop, matching the current display's
 native 1920x1080 mode. After all decoder fixes, the complete-frame PPM has
-SHA-256 `79083937e8c8075a51d9c188208c268029ddccce5e04e49fa9d73631314e83e8`;
+SHA-256 `cd8833a6d1c937cba2aa57fa47f7c5f88883eb9b3cfb44ad573d14d517d405c7`;
 the saved plaintext stream has SHA-256
 `5681ac38d2d73b56ae4c9fbf9b5c4b3b26bd47c2bd7fe8ffa8145aedc58044e7`.
 
@@ -550,6 +550,16 @@ Visual inspection of the complete replay confirms that both the magenta/purple
 corruption and the inverted black/gray blocks are gone. Generated PPM/PNG files
 remain under `target/`; only the single compressed plaintext input is committed
 as a fixture.
+
+The stored stream ends after the first fully covered type-0 MVS base frame. It
+is therefore not a lossless reference image or a final-quality source-screen
+capture: quantized luma softens fine detail, and Rice/DCT base tiles carry only
+chroma DC for each 8x8 tile, which can visibly bleed color across sharp edges.
+Apple's decoder applies the same codec structure. Decoder fidelity must be
+compared against Apple's rendering of the same MVS bytes, not against the
+uncompressed source desktop. Later type-1 differential updates, when present in
+a longer stream, refine from the preceding DCT state and must be applied in
+order.
 
 The fixture contains compressed real desktop pixels, but no password,
 authentication response, wrapped session block, session key, IV, encrypted

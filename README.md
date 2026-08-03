@@ -68,13 +68,17 @@ tests, including an in-process client↔oracle session that decodes an MVS
 frame from encrypted records. A Rust client running from an isolated Linux
 container has also completed a real encrypted session against macOS 26.6
 `screensharingd`, recovered 53,215 decrypted ARD bytes from three authenticated
-records, and decoded the MVS updates into the complete 1920x1080 framebuffer.
+records, and decoded the MVS updates into a fully covered 1920x1080 framebuffer.
 The canonical plaintext stream is stored once as
 `tests/fixtures/real-macos-mvs-1920x1080.bin` and replays offline to a stable
 pixel hash, so future decoder tests do not require a live Screen Sharing
 connection. See
 [`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md) for confirmed evidence
 and the exact remaining work.
+
+That fixture ends after one lossy type-0 MVS base frame. It covers every pixel,
+but it is not a lossless reference for source-screen sharpness; later type-1
+differential records can refine DCT state when a longer stream contains them.
 
 ## Pure Rust guarantee
 

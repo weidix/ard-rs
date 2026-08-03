@@ -619,6 +619,23 @@ fn decodes_mvs_full_differential_and_both_cache_selectors() {
         ]
     );
 
+    // A second refinement is relative to the coefficients produced by the
+    // first one, not the original partial-update baseline.
+    decoder
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &differential,
+            &mut framebuffer,
+        )
+        .unwrap();
+    assert_eq!(
+        framebuffer.rgba()[..32]
+            .chunks_exact(4)
+            .map(|pixel| pixel[0])
+            .collect::<Vec<_>>(),
+        [151, 148, 142, 133, 123, 114, 108, 105]
+    );
+
     let white = partial_mvs_packet(&[(0, 1), (0, 3), (0, 1), (0x6d, 8)]);
     decoder
         .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &white, &mut framebuffer)

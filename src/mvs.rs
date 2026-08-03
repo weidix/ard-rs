@@ -494,7 +494,7 @@ impl MvsState {
                             "ARD MVS differential tile has no Rice/DCT baseline",
                         ));
                     }
-                    let coefficients = decode_full_differential_tile(
+                    let (coefficients, luma_count) = decode_full_differential_tile(
                         &mut bits,
                         baseline,
                         luminance_limit,
@@ -511,6 +511,11 @@ impl MvsState {
                         &chrominance_quantization,
                     );
                     self.insert_cache_tile(DctTile { coefficients });
+                    let state = &mut self.tiles[global_tile];
+                    state.copy_source = None;
+                    state.dct = DctTile { coefficients };
+                    state.dct_valid = true;
+                    state.luma_count = luma_count;
                 }
                 2 => {
                     let state = self.tiles[global_tile];
@@ -581,7 +586,7 @@ fn decode_full_differential_tile(
     baseline: TileState,
     luminance_limit: u8,
     chrominance_limit: u8,
-) -> Result<[[i16; 64]; 3]> {
+) -> Result<([[i16; 64]; 3], u8)> {
     let old_count = usize::from(baseline.luma_count);
     if old_count > 64 {
         return Err(Error::Invalid("invalid ARD MVS luma baseline length"));
@@ -654,7 +659,7 @@ fn decode_full_differential_tile(
         baseline.dct.coefficients[1][0] as i8,
     )?);
     decode_jpeg_chrominance_ac(bits, &mut coefficients[1], chrominance_limit)?;
-    Ok(coefficients)
+    Ok((coefficients, new_count as u8))
 }
 
 fn signed_delta(old: i8, magnitude: u8) -> i8 {
@@ -1079,7 +1084,7 @@ fn inverse_dct(coefficients: &[i16; 64], quantization: &[u16; 64]) -> [i32; 64] 
                         * i64::from(vertical_basis[y]);
                 }
             }
-            output[y * 8 + x] = ((sum + (1_i64 << 29)) >> 30) as i32 + 128;
+            output[y * 8 + x] = (((sum + (1_i64 << 29)) >> 30) as i32 + 128).clamp(0, 255);
         }
     }
     output
@@ -1087,7 +1092,7 @@ fn inverse_dct(coefficients: &[i16; 64], quantization: &[u16; 64]) -> [i32; 64] 
 
 fn dc_sample(coefficient: i16, quantization: u16) -> i32 {
     let dequantized = i32::from(coefficient) * i32::from(quantization);
-    ((dequantized + 4) >> 3) + 128
+    (((dequantized + 4) >> 3) + 128).clamp(0, 255)
 }
 
 fn decode_dc_rice(bits: &mut BitReader<'_>) -> Result<i16> {
@@ -1217,7 +1222,7 @@ impl<'a> BitReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitReader, MvsState, predict_chroma_dc};
+    use super::{BitReader, MvsState, dc_sample, inverse_dct, predict_chroma_dc};
     use crate::Error;
 
     fn bits(bit_string: &str) -> Vec<u8> {
@@ -1284,6 +1289,28 @@ mod tests {
         assert_eq!(&chrominance[..8], &[19, 19, 24, 47, 76, 99, 99, 99]);
         assert_eq!(chrominance[32], 76);
         assert!(chrominance[33..].iter().all(|&value| value == 99));
+    }
+
+    #[test]
+    fn inverse_dct_clamps_component_samples_before_color_conversion() {
+        let quantization = [16; 64];
+        let mut coefficients = [0; 64];
+        coefficients[0] = 100;
+        assert!(
+            inverse_dct(&coefficients, &quantization)
+                .into_iter()
+                .all(|sample| sample == 255)
+        );
+
+        coefficients[0] = -100;
+        assert!(
+            inverse_dct(&coefficients, &quantization)
+                .into_iter()
+                .all(|sample| sample == 0)
+        );
+
+        assert_eq!(dc_sample(100, 16), 255);
+        assert_eq!(dc_sample(-100, 16), 0);
     }
 
     #[test]
