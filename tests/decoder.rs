@@ -311,6 +311,29 @@ fn parses_mvs_quantization_control_update() {
 }
 
 #[test]
+fn parses_zero_sized_mvs_quantization_control_update() {
+    let mut update = Vec::with_capacity(129);
+    update.push(2);
+    update.extend(0_u8..128);
+    let mut payload = (update.len() as u32).to_be_bytes().to_vec();
+    payload.extend_from_slice(&update);
+
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(1, 1).unwrap();
+    assert_eq!(
+        decoder
+            .decode_rectangle(rect(0, 0, Encoding::ArdMvs), &payload, &mut framebuffer)
+            .unwrap(),
+        payload.len()
+    );
+    let (luminance, chrominance) = decoder.mvs_quantization_tables();
+    assert_eq!(luminance[0], 0);
+    assert_eq!(luminance[63], 63);
+    assert_eq!(chrominance[0], 64);
+    assert_eq!(chrominance[63], 127);
+}
+
+#[test]
 fn decodes_mvs_partial_white_tile_and_markers() {
     // Initial state bit, update type 0, no repeats, then the primary marker.
     let packet = partial_mvs_packet(&[(0, 1), (0, 3), (0, 1), (0x6d, 8)]);

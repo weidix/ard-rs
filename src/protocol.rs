@@ -206,6 +206,136 @@ pub fn parse_ard_session_options(bytes: &[u8]) -> Result<(ArdSessionOptions, usi
     ))
 }
 
+/// Apple client message `0x12`, named `RFBSetEncryptionLevel` by the installed
+/// Screen Sharing framework.
+///
+/// Command 1 carries the requested encryption level and a list of supported
+/// big-endian 32-bit encryption-method identifiers. The installed client
+/// sends `12 00 00 01 00 01 00 01 00 00 00 01`: command 1, level 1, one
+/// method, method `1` (ComCryption). The screensharingd handler rejects
+/// counts of 101 or more and accepts method `1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArdSetEncryptionLevel {
+    pub command: u16,
+    pub level: u16,
+    pub methods: Vec<u32>,
+}
+
+impl ArdSetEncryptionLevel {
+    pub const MESSAGE_TYPE: u8 = 0x12;
+    pub const COMMAND_SET_METHODS: u16 = 1;
+    pub const COMMAND_ACTIVATE: u16 = 2;
+    pub const MAX_METHOD_COUNT: usize = 100;
+
+    pub fn activation() -> Self {
+        Self {
+            command: Self::COMMAND_ACTIVATE,
+            level: 1,
+            methods: Vec::new(),
+        }
+    }
+}
+
+/// Builds the 12-byte `RFBSetEncryptionLevel` proposal used by the installed
+/// client: type `0x12`, command 1, a big-endian level, a big-endian method
+/// count, then that many big-endian method identifiers.
+pub fn build_ard_set_encryption_level(level: u16, methods: &[u32]) -> Result<Vec<u8>> {
+    if level > 1 {
+        return Err(Error::Invalid("unsupported ARD encryption level"));
+    }
+    if methods.len() > ArdSetEncryptionLevel::MAX_METHOD_COUNT {
+        return Err(Error::LimitExceeded("ARD encryption method count"));
+    }
+    let capacity = 8_usize
+        .checked_add(
+            methods
+                .len()
+                .checked_mul(4)
+                .ok_or(Error::LimitExceeded("ARD encryption method count"))?,
+        )
+        .ok_or(Error::LimitExceeded("ARD encryption method count"))?;
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(&[ArdSetEncryptionLevel::MESSAGE_TYPE, 0]);
+    out.extend_from_slice(&ArdSetEncryptionLevel::COMMAND_SET_METHODS.to_be_bytes());
+    out.extend_from_slice(&level.to_be_bytes());
+    out.extend_from_slice(
+        &u16::try_from(methods.len())
+            .map_err(|_| Error::LimitExceeded("ARD encryption method count"))?
+            .to_be_bytes(),
+    );
+    for method in methods {
+        out.extend_from_slice(&method.to_be_bytes());
+    }
+    Ok(out)
+}
+
+/// Builds the 8-byte activation message the client sends after accepting the
+/// 1103 encryption-control rectangle: `12 00 00 02 00 01 00 00`. The
+/// screensharingd `HandleSetEncryptionMessage` treats this as the transition
+/// to decrypt everything received from the client.
+pub fn build_ard_encryption_activation() -> [u8; 8] {
+    [
+        ArdSetEncryptionLevel::MESSAGE_TYPE,
+        0,
+        0,
+        ArdSetEncryptionLevel::COMMAND_ACTIVATE as u8,
+        0,
+        1,
+        0,
+        0,
+    ]
+}
+
+/// Parses a client `0x12` message with the same bounded semantics as the
+/// installed `HandleSetEncryptionMessage` handler. Command 1 requires the
+/// declared method list to be present and bounded; command 2 is fixed at
+/// eight bytes.
+pub fn parse_ard_set_encryption_level(
+    bytes: &[u8],
+    max_methods: usize,
+) -> Result<(ArdSetEncryptionLevel, usize)> {
+    let mut cursor = Cursor::new(bytes);
+    if cursor.u8()? != ArdSetEncryptionLevel::MESSAGE_TYPE {
+        return Err(Error::Invalid("not an ARD set-encryption-level message"));
+    }
+    if cursor.u8()? != 0 {
+        return Err(Error::Invalid("invalid ARD set-encryption-level padding"));
+    }
+    let command = cursor.u16()?;
+    let level = cursor.u16()?;
+    let count = usize::from(cursor.u16()?);
+    if count > ArdSetEncryptionLevel::MAX_METHOD_COUNT {
+        return Err(Error::LimitExceeded("ARD encryption method count"));
+    }
+    if count > max_methods {
+        return Err(Error::LimitExceeded("ARD encryption method count"));
+    }
+    let mut methods = Vec::with_capacity(count);
+    match command {
+        ArdSetEncryptionLevel::COMMAND_SET_METHODS => {
+            for _ in 0..count {
+                methods.push(cursor.u32()?);
+            }
+        }
+        ArdSetEncryptionLevel::COMMAND_ACTIVATE => {
+            if count != 0 {
+                return Err(Error::Invalid(
+                    "ARD encryption activation has a nonzero method count",
+                ));
+            }
+        }
+        _ => return Err(Error::Invalid("unsupported ARD encryption command")),
+    }
+    Ok((
+        ArdSetEncryptionLevel {
+            command,
+            level,
+            methods,
+        },
+        cursor.position(),
+    ))
+}
+
 /// Apple client message `0x21`, named `RFBViewerInformation` by the installed
 /// Screen Sharing framework.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +420,16 @@ pub struct ArdEncryptionControl {
 impl ArdEncryptionControl {
     pub const ENABLE_COMMAND: u32 = 1;
     pub const WIRE_LEN: usize = 36;
+
+    pub fn new(command: u32, wrapped_session_blocks: [[u8; 16]; 2]) -> Result<Self> {
+        if command != Self::ENABLE_COMMAND {
+            return Err(Error::Invalid("unsupported ARD encryption command"));
+        }
+        Ok(Self {
+            command,
+            wrapped_session_blocks,
+        })
+    }
 
     pub fn wrapped_session_blocks(&self) -> &[[u8; 16]; 2] {
         &self.wrapped_session_blocks
@@ -412,11 +552,7 @@ impl PixelFormat {
             (self.green_max, self.green_shift),
             (self.blue_max, self.blue_shift),
         ] {
-            if max == 0
-                || u32::from(max)
-                    .checked_shl(u32::from(shift))
-                    .is_none_or(|value| value >= (1_u32 << self.bits_per_pixel))
-            {
+            if max == 0 || (u64::from(max) << shift) >= (1_u64 << self.bits_per_pixel) {
                 return Err(Error::Invalid("invalid true-colour channel"));
             }
         }
@@ -467,6 +603,29 @@ pub struct ServerInit {
     pub height: u16,
     pub pixel_format: PixelFormat,
     pub name: String,
+    /// Apple ARD ServerInit extension. Present when the server advertises
+    /// extended command support through the extra block that screensharingd's
+    /// `SendServerInitialiation` appends after the standard 24-byte header.
+    pub extension: Option<ArdServerInitExtension>,
+}
+
+/// The Apple extension appended to `ServerInit` when the server name field
+/// carries at least 22 bytes: a zero u16, a big-endian flags word, a 16-byte
+/// command-support bitfield, then the machine name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArdServerInitExtension {
+    pub flags: u32,
+    /// One support bit per command, MSB-first within each byte, matching the
+    /// client's `RFBServerCommandSupported` lookup.
+    pub command_support: [u8; 16],
+}
+
+impl ArdServerInitExtension {
+    pub fn supports_command(&self, command: u8) -> bool {
+        let byte = usize::from(command) / 8;
+        let bit = usize::from(command) % 8;
+        byte < 16 && self.command_support[byte] & (0x80 >> bit) != 0
+    }
 }
 
 pub fn parse_server_init(bytes: &[u8], max_name_len: usize) -> Result<(ServerInit, usize)> {
@@ -474,23 +633,86 @@ pub fn parse_server_init(bytes: &[u8], max_name_len: usize) -> Result<(ServerIni
     let width = cursor.u16()?;
     let height = cursor.u16()?;
     let pixel_format = PixelFormat::parse(cursor.take(16)?)?;
-    let name_len =
+    let payload_len =
         usize::try_from(cursor.u32()?).map_err(|_| Error::LimitExceeded("server name length"))?;
-    if name_len > max_name_len {
+    if payload_len > max_name_len {
         return Err(Error::LimitExceeded("server name length"));
     }
-    let name = core::str::from_utf8(cursor.take(name_len)?)
-        .map_err(|_| Error::Invalid("server name is not UTF-8"))?
-        .to_owned();
+    let payload = cursor.take(payload_len)?;
+    let (name, extension) = parse_server_init_payload(payload)?;
     Ok((
         ServerInit {
             width,
             height,
             pixel_format,
             name,
+            extension,
         },
         cursor.position(),
     ))
+}
+
+fn parse_server_init_payload(payload: &[u8]) -> Result<(String, Option<ArdServerInitExtension>)> {
+    if payload.len() >= 22 && payload[..2] == [0, 0] {
+        let flags = u32::from_be_bytes(
+            payload[2..6]
+                .try_into()
+                .expect("extension flags length checked"),
+        );
+        let command_support = payload[6..22]
+            .try_into()
+            .expect("extension bitfield length checked");
+        let name = core::str::from_utf8(&payload[22..])
+            .map_err(|_| Error::Invalid("server name is not UTF-8"))?
+            .to_owned();
+        Ok((
+            name,
+            Some(ArdServerInitExtension {
+                flags,
+                command_support,
+            }),
+        ))
+    } else {
+        let name = core::str::from_utf8(payload)
+            .map_err(|_| Error::Invalid("server name is not UTF-8"))?
+            .to_owned();
+        Ok((name, None))
+    }
+}
+
+/// Builds the Apple extended ServerInit used by `screensharingd`: the
+/// standard 24-byte header, then a payload of 22 extension bytes plus the
+/// machine name. The extension advertises the given command-support
+/// bitfield (MSB-first) so the native client enables `0x12` encryption.
+pub fn build_ard_server_init(
+    width: u16,
+    height: u16,
+    pixel_format: PixelFormat,
+    name: &[u8],
+    flags: u32,
+    command_support: [u8; 16],
+) -> Result<Vec<u8>> {
+    let payload_len = 22_usize
+        .checked_add(name.len())
+        .ok_or(Error::LimitExceeded("server name length"))?;
+    let mut out = Vec::with_capacity(
+        24_usize
+            .checked_add(payload_len)
+            .ok_or(Error::LimitExceeded("server name length"))?,
+    );
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&pixel_format.encode()?);
+    out.extend_from_slice(
+        &u32::try_from(payload_len)
+            .map_err(|_| Error::LimitExceeded("server name length"))?
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&command_support);
+    out.extend_from_slice(name);
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

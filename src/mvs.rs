@@ -932,8 +932,7 @@ fn decode_rice_dct_tile(
             for component in 1..=2 {
                 let predictor = previous[component][0];
                 let delta = decode_dc_rice(bits)?;
-                let half = (predictor - (predictor >> 15)) / 2;
-                current[component][0] = (half - delta).wrapping_mul(2);
+                current[component][0] = predict_chroma_dc(predictor, delta);
             }
         }
         current[0][0] = previous[0][0].wrapping_sub(decode_dc_rice(bits)?);
@@ -956,6 +955,15 @@ fn decode_rice_dct_tile(
     }
     *previous_coefficients = Some((coefficients, coefficient_limit));
     Ok((coefficients, coefficient_limit))
+}
+
+fn predict_chroma_dc(predictor: i16, delta: i16) -> i16 {
+    // ExpandBlockRice halves the signed predictor with truncation toward zero,
+    // applies the Rice delta, then doubles it again. Rust's signed division
+    // already has the required rounding. Applying an additional sign
+    // correction makes every negative even predictor drift by +2 on each new
+    // block, which accumulates into visible magenta 8x8 tiles.
+    (predictor / 2).wrapping_sub(delta).wrapping_mul(2)
 }
 
 fn decode_ac_rice(bits: &mut BitReader<'_>, coefficients: &mut [i16; 64], limit: u8) -> Result<()> {
@@ -1209,7 +1217,7 @@ impl<'a> BitReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitReader, MvsState};
+    use super::{BitReader, MvsState, predict_chroma_dc};
     use crate::Error;
 
     fn bits(bit_string: &str) -> Vec<u8> {
@@ -1276,5 +1284,15 @@ mod tests {
         assert_eq!(&chrominance[..8], &[19, 19, 24, 47, 76, 99, 99, 99]);
         assert_eq!(chrominance[32], 76);
         assert!(chrominance[33..].iter().all(|&value| value == 99));
+    }
+
+    #[test]
+    fn chroma_dc_prediction_matches_expand_block_rice_signed_rounding() {
+        assert_eq!(predict_chroma_dc(4, 0), 4);
+        assert_eq!(predict_chroma_dc(3, 0), 2);
+        assert_eq!(predict_chroma_dc(-4, 0), -4);
+        assert_eq!(predict_chroma_dc(-3, 0), -2);
+        assert_eq!(predict_chroma_dc(-4, 1), -6);
+        assert_eq!(predict_chroma_dc(-4, -1), -2);
     }
 }

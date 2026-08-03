@@ -345,6 +345,27 @@ For every experiment, preserve:
 - Rust RGBA output;
 - exact pixel differences.
 
+### Encrypted-transport oracle
+
+Once the MVS oracle path works, the modern encrypted transport can be
+validated the same way with `examples/encrypted_transport_oracle.rs`. It
+completes type-30 authentication, advertises command `0x12` through the
+extended ServerInit bitfield, sends a real 1103 control rectangle, waits for
+the client's eight-byte activation, and then exchanges AES-CBC records
+carrying MVS rectangles. Build it exactly like the MVS oracle:
+
+```sh
+cargo build --release \
+  --example encrypted_transport_oracle \
+  --target aarch64-unknown-linux-musl
+```
+
+The repository `.cargo/config.toml` selects the installed musl cross-linker
+so the playbook commands work without extra environment variables. Connect
+Screen Sharing to the published port and confirm from the printed report that
+the client sent `0x21`, the `0x12` proposal, and the activation, and that
+encrypted records flowed in both directions.
+
 ## 11. Avoid self-confirming tests
 
 Test vectors should come from independent sources:

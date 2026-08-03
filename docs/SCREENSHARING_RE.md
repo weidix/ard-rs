@@ -23,6 +23,10 @@ The framework is stored in the macOS dyld shared cache. `dyld_info` exposes its
 symbols, constants, strings, and disassembly without copying or linking it into
 this crate.
 
+The `0x12` transport findings below were re-verified on macOS 26.6 build
+25G72 (Screen Sharing `6.1`) on 2026-08-03; unslid addresses in this document
+apply to that build only.
+
 ## Confirmed encoding constants
 
 The framework data symbols contain:
@@ -91,6 +95,32 @@ That is five security types (`30, 33, 36, 2, 35`), four of which are in
 Apple's IANA allocation. A standard Screen Sharing connection to another Mac on
 the LAN was also established successfully, confirming that this is the active
 decoder path rather than dead compatibility code.
+
+### Authentication types offered by the tested Mac
+
+The active macOS 26.6 server configuration offered exactly the following
+authentication methods, in wire order:
+
+| Type | Meaning | Current crate support |
+| ---: | --- | --- |
+| `30` | Apple Remote Desktop Diffie-Hellman username/password authentication | implemented and validated against the real server |
+| `33` | Apple `RSA1` authentication negotiation; supports an RSA key request and RSA-protected plain-password or SRP submodes | recognized only |
+| `36` | Apple Secure Remote Password (SRP) authentication | recognized only |
+| `2` | standard RFB/VNC password authentication | recognized only |
+| `35` | Apple Kerberos authentication | recognized only |
+
+This list describes the methods advertised by this Mac under its current
+configuration; it is not the complete Apple allocation. IANA assigns the whole
+[`30` through `36` range to Apple](https://www.iana.org/assignments/rfb/rfb.xhtml),
+but does not publish names for the individual values. Types `31`, `32`, and
+`34` were not present in the captured offer.
+
+The private subtype names above were confirmed from the installed
+`screensharingd` authentication dispatcher. Type `33` enters
+`SendRSAResponse` and accepts packets marked `RSA1`, with key-request,
+plain-authentication, and SRP-authentication handlers. Type `35` enters
+`HandleKerberosAuthenticationMessage`, while type `36` enters
+`HandleSRPAuthenticationMessage` and `SendSRPChallenge`.
 
 For Apple security type `30`, the server message is a two-byte generator, a
 two-byte key length, then a prime modulus and server public key of that length.
@@ -227,6 +257,99 @@ The Rust parser now:
 - has normal, every-prefix truncation, over-limit, overlong, bad-padding, and
   unsupported-version tests.
 
+### Confirmed `RFBSetEncryptionLevel` messages (`0x12`)
+
+The installed Screen Sharing framework exports `_RFBSetEncryptionLevel`
+(image-relative `0x000EE920`, unslid `0x1C892F920` on macOS 26.6 build
+25G72). It validates the connection magic and an internal enabled flag, then
+writes and sends a fixed 12-byte message for level 1:
+
+```text
+12 00 00 01 00 01 00 01 00 00 00 01
+```
+
+| Offset | Size | Meaning |
+| ---: | ---: | --- |
+| 0 | 1 | client message type `0x12` |
+| 1 | 1 | zero padding |
+| 2 | 2 | big-endian command; `1` proposes encryption methods |
+| 4 | 2 | big-endian encryption level; `0` or `1` |
+| 6 | 2 | big-endian method count |
+| 8 | 4 × count | big-endian 32-bit method identifiers |
+
+The screensharingd `HandleSetEncryptionMessage` (ViewerMessages.c) reads an
+8-byte header, byte-swaps the two big-endian 16-bit fields inside the header,
+and for command 1 requires the method count to be at most 100, then accepts
+the message only if one of the big-endian method identifiers equals `1`
+(ComCryption). It records the level and clears its two 16-byte wrapped
+session-block slots before sending the 1103 rectangle.
+
+After the client accepts the 1103 control rectangle, `_HandleFramebufferUpdate`
+in the framework builds and sends a fixed 8-byte message (command 2):
+
+```text
+12 00 00 02 00 01 00 00
+```
+
+The server's command-2 path requires the level field to be `1` and then
+transitions to decrypting everything received (`**going to decrypt everything
+that is received`); any other value stops encryption. This is the "later
+eight-byte control message" from the previous unfinished-work list.
+
+The Rust library now:
+
+- builds both messages with the exact native byte layout
+  (`build_ard_set_encryption_level` and `build_ard_encryption_activation`);
+- bounds the level to `0..=1` and the method count to `0..=100`;
+- parses command 1 with its method list and command 2 as a fixed eight-byte
+  activation record with the same bounds as the native handler;
+- rejects unknown commands, nonzero activation counts, bad padding, and every
+  prefix truncation.
+
+Evidence level: confirmed/native for the client builder and server handler on
+macOS 26.6 build 25G72. The live exchange sequence (exact position of `0x12`
+relative to `0x21`, `SetEncodings`, and the 1103 rectangle) still needs
+confirmation from a new session driven by the Rust implementation.
+
+### Confirmed extended `ServerInit`
+
+The client only sends `0x12` after checking `RFBServerCommandSupported`,
+which reads a 16-byte command-support bitfield stored in the connection
+state. The bitfield is MSB-first per byte: command `c` lives in byte `c / 8`
+at bit position `7 - (c % 8)`. `screensharingd`'s `SendServerInitialiation`
+advertises this bitfield inside an Apple extension appended to the standard
+ServerInit header:
+
+| Offset | Size | Meaning |
+| ---: | ---: | --- |
+| 0 | 2 | width |
+| 2 | 2 | height |
+| 4 | 16 | pixel format |
+| 20 | 4 | big-endian payload length (`22 + name_len`) |
+| 24 | 2 | zero marker |
+| 26 | 4 | big-endian flags word |
+| 30 | 16 | command-support bitfield |
+| 46 | name_len | machine name |
+
+The client takes the extended path only when the payload length is at least
+22 and the two-byte marker is zero; otherwise it falls back to a plain server
+name and the default command set (which does not include `0x12`). This is why
+the earlier MVS oracle, which sent a standard ServerInit, never received a
+`0x12` proposal from Screen Sharing.
+
+The Rust library now:
+
+- parses the extension and exposes `flags`, the 16-byte `command_support`
+  bitfield, and `supports_command(c)`;
+- builds the extended ServerInit (`build_ard_server_init`) with a caller
+  supplied bitfield;
+- keeps parsing plain (non-extended) ServerInit messages unchanged.
+
+Evidence level: confirmed/native for both the client parse path and the
+screensharingd builder on macOS 26.6 build 25G72. Whether Apple's client
+accepts a test-server bitfield that differs from screensharingd's exact value
+still needs the native oracle run.
+
 ### Confirmed encryption control rectangle (`1103` / `0x044f`)
 
 The native framebuffer-update path recognizes a zero-sized rectangle and then
@@ -311,42 +434,142 @@ The Rust implementation now provides:
 
 The CBC helper is checked against the NIST SP 800-38A AES-128-CBC vector. The
 targeted transport suite currently contains 13 passing tests, the type-30
-suite contains 3 passing tests, and the library unit suite contains 5 passing
-tests. A complete all-target run is still required after the remaining work.
+suite contains 3 passing tests, the decoder suite contains 28 passing tests,
+the library unit suite contains 7 passing tests, the new `0x12` suite contains
+5 passing tests, the decrypted-payload dispatcher suite contains 6 passing
+tests, the extended ServerInit suite contains 4 passing tests, and the
+encrypted-session loop contains 1 passing test. A complete all-target run is
+still required after the remaining work.
+
+### Decrypted-payload dispatcher
+
+`_WaitForEncryptedMessage` appends each verified record payload to the same
+net buffer that ordinary server messages are read from, so the plaintext
+stream is the normal RFB/ARD server-message stream. The Rust library now
+provides a bounded incremental dispatcher (`ArdMessageDispatcher`) that:
+
+- accepts arbitrary record-payload fragments and parses complete messages;
+- routes FramebufferUpdate messages through the existing `Decoder`, including
+  encoding-1011 MVS rectangles into the persistent MVS state machine;
+- exposes zero-sized 1103 encryption-control rectangles as a distinct message;
+- handles Bell and bounded UTF-8 ServerCutText;
+- rejects unsupported message types instead of treating them as rectangles;
+- enforces total buffered-message and cut-text limits and does not consume a
+  malformed message from the buffered stream.
+
+This dispatcher has now consumed the real decrypted plaintext stream described
+below, including the native zero-sized quantization update and a real MVS
+desktop update.
+
+### Encrypted-transport oracle
+
+`EncryptedTransportOracle` (library module `oracle`, CLI wrapper
+`examples/encrypted_transport_oracle.rs`) is a one-shot pure-Rust server that
+drives the whole modern path against a client:
+
+1. type-30 challenge (RFC 3526 group 2, server exponent 1) and server-side
+   `MD5(client_public_key)` derivation;
+2. extended ServerInit advertising command `0x12`;
+3. parsing of `0x21` and the `0x12` proposal;
+4. a real 1103 control rectangle whose two blocks are AES-128-encrypted with
+   the derived authentication value;
+5. validation of the client's eight-byte activation message;
+6. AES-CBC records carrying MVS white and solid rectangles, with the client
+   direction decrypted and redacted (message types only).
+
+The in-process integration test `tests/encrypted_session_loop.rs` runs a Rust
+client through the complete session: banner, type-30 exchange, extended
+ServerInit, `0x21`/`0x12`, 1103 unwrap, activation, encrypted
+FramebufferUpdateRequests, and decoding of the white MVS frame from decrypted
+records. This validates the full Rust stack end to end and prepares the exact
+artifact needed for the native-client run: build for
+`aarch64-unknown-linux-musl`, run it in a Linux container, and connect Screen
+Sharing to it. That native run still has to happen; until it does, the
+extended ServerInit bitfield and the wrapped-block layout remain
+confirmed/native rather than confirmed/oracle.
+
+### Real encrypted desktop capture
+
+On 2026-08-03, `examples/capture_real_desktop.rs` was cross-compiled for
+`aarch64-unknown-linux-musl` and run from an isolated Linux container against
+the host's macOS 26.6 `screensharingd`. The Rust client completed type-30
+authentication, sent the live `0x21` and `0x12` messages, unwrapped the real
+1103 control, activated both encrypted directions, and requested the upper-left
+256x256 framebuffer region.
+
+The server returned two verified encrypted records whose payloads concatenate
+to 4,448 bytes of ordinary ARD server-message data:
+
+1. a 149-byte `FramebufferUpdate` carrying a zero-sized MVS type-2
+   quantization-table rectangle;
+2. a 4,299-byte `FramebufferUpdate` carrying a 272x272 MVS desktop rectangle.
+
+The first record exposed a real decoder defect: zero-sized rectangles were
+previously discarded before MVS type-2 control data could be consumed. The
+decoder now routes zero-sized MVS rectangles through the codec while rejecting
+zero-sized type-0/type-1 image updates. The combined plaintext is committed as
+`tests/fixtures/real-macos-mvs-256x256.hex`; offline replay reproduces the
+captured upper-left 256x256 PPM byte-for-byte and checks SHA-1
+`0af520149d7fc109fe76ba8c35aae84441ef0c19`.
+
+The first decoder pass showed magenta/purple 8x8 blocks in otherwise neutral
+UI regions. Comparing the type-5 chroma predictor with the installed
+`ExpandBlockRice` implementation found an extra sign correction before signed
+division. Rust already divides signed integers with truncation toward zero, so
+the correction made negative even Cb/Cr predictors drift by `+2` on every new
+block. Removing it restores neutral colors in the saved real frame; the hash
+above covers the corrected output and a focused unit test covers positive,
+negative, odd, even, and nonzero-delta predictor cases.
+
+A second live request captured the complete framebuffer reported by the same
+Mac. The server returned 53,215 plaintext bytes in three authenticated
+encrypted records, containing two framebuffer updates. The decoder recovered
+all 2,073,600 pixels of the 1920x1080 desktop. The complete-frame PPM has
+SHA-256 `bb93b27fcbf9e726301817d0d357b2075ba91f6e856e510b4d1654dbd5485125`;
+the saved plaintext stream has SHA-256
+`5681ac38d2d73b56ae4c9fbf9b5c4b3b26bd47c2bd7fe8ffa8145aedc58044e7`.
+
+The live artifacts are under `target/real-ard-full-frame/`. They can be replayed
+without a network connection or password:
+
+```sh
+cargo run --example decode_plaintext_capture -- \
+  target/real-ard-full-frame/real-ard-plaintext-stream.bin \
+  1920 1080 \
+  target/real-ard-full-frame/real-frame-full-offline.ppm
+```
+
+The offline result is byte-for-byte identical to the image produced during the
+live session. Visual inspection of the complete frame confirms that the
+magenta/purple 8x8 corruption is gone. These complete-frame artifacts remain
+under `target/` rather than committed fixtures because they contain real
+desktop pixels; the smaller redacted regression fixture remains suitable for
+automated tests.
+
+The fixture contains compressed real desktop pixels, but no password,
+authentication response, wrapped session block, session key, IV, encrypted
+record, or clipboard data.
 
 ## Work not yet completed
 
-The project is not yet a complete modern Screen Sharing client, and no real
-desktop decode claim is made.
+The project now demonstrates real encrypted-desktop decoding, but is not yet a
+complete modern Screen Sharing client.
 
-1. **Existing capture cannot yet be opened.** The saved type-30 capture contains
-   the public exchange and encrypted records but not the native client's
-   one-time internal random state. That state cannot be reconstructed from the
-   public exchange. A new live run driven by the Rust type-30 implementation,
-   or another explicitly authorized in-memory handoff for the same session, is
-   required.
-2. **Client-to-server activation is incomplete.** The exact fields and state
-   transitions of `RFBSetEncryptionLevel` (`0x12`) and the later eight-byte
-   control message still need to be mapped and implemented.
-3. **Directional state mapping needs live confirmation.** The server-to-client
-   1103 control path is established, but the outbound direction's setup and
-   transition point require the same level of evidence.
-4. **Decrypted payload dispatch is not integrated.** Verified record payloads
-   are returned as byte vectors. The code still needs a bounded incremental
-   dispatcher for the internal RFB/ARD message stream, including routing any
-   encoding-1011 rectangles into the existing MVS state machine.
-5. **No real framebuffer has been recovered from 1103.** There is no Rust
-   output PNG from the live 492,036,896-byte capture.
-6. **No native-reference comparison exists.** The required same-session native
+1. **The native-client encrypted oracle run remains.** The Rust client is now
+   live-confirmed against `screensharingd`, but Apple's client has not yet been
+   run against `EncryptedTransportOracle` to provide the reverse-direction
+   interoperability check.
+2. **No native-reference comparison exists.** The required same-session native
    screenshot, dimensions, exact-pixel ratio, maximum channel error, and mean
    absolute error have not been produced.
-7. **The committed structural vector is only partial.** The `0x21` fixture
+3. **The committed structural vector is only partial.** The `0x21` fixture
    reproduces the live public structure. The 1103 tests currently use synthetic
    wrapped blocks; a minimal redacted real structural fixture is still needed.
-8. **Final verification gates remain.** Full `fmt`, all-target tests, linting,
-   the four requested cross-platform targets, and a feature/dependency audit
-   must be rerun after end-to-end integration.
+4. **Final portability gates remain after live integration.** Full `fmt`,
+   all-target tests, and linting pass. The four requested cross-platform target
+   checks and a feature/dependency audit still need to be rerun after this live
+   integration.
 
-Until items 1–8 are resolved, the implementation should be described as a
-confirmed and tested 1103 transport layer, not as successful real-desktop
-decoding.
+Until the remaining items are resolved, the implementation should be described
+as a real-session-tested ARD decoder rather than a complete Screen Sharing
+client.

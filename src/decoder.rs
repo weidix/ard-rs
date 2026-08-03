@@ -78,6 +78,9 @@ impl Decoder {
         }
         framebuffer.validate_rect(&rect)?;
         if rect.width == 0 || rect.height == 0 {
+            if encoding == Encoding::ArdMvs {
+                return self.decode_mvs(rect, payload, framebuffer);
+            }
             return Ok(0);
         }
         match encoding {
@@ -124,13 +127,21 @@ impl Decoder {
         let mut next_mvs = self.mvs.clone();
         match update_type {
             2 => next_mvs.decode_control_update(update)?,
-            0 => next_mvs.decode_partial_update(
-                rect,
-                update,
-                framebuffer,
-                self.limits.max_decompressed_bytes,
-            )?,
+            0 => {
+                if rect.width == 0 || rect.height == 0 {
+                    return Err(Error::Invalid("zero-sized ARD MVS image update"));
+                }
+                next_mvs.decode_partial_update(
+                    rect,
+                    update,
+                    framebuffer,
+                    self.limits.max_decompressed_bytes,
+                )?
+            }
             1 => {
+                if rect.width == 0 || rect.height == 0 {
+                    return Err(Error::Invalid("zero-sized ARD MVS image update"));
+                }
                 let mut next_framebuffer = framebuffer.clone();
                 next_mvs.decode_full_update(
                     rect,

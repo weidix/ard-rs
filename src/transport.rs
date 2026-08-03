@@ -67,7 +67,7 @@ impl ArdEncryptedRecordFramer {
                     continue;
                 }
                 let length = usize::from(u16::from_be_bytes(self.prefix));
-                if length == 0 || length % 16 != 0 {
+                if length == 0 || !length.is_multiple_of(16) {
                     return Err(Error::Invalid(
                         "encrypted-record length is not an AES block multiple",
                     ));
@@ -119,6 +119,13 @@ impl core::fmt::Debug for ArdSessionMaterial {
 }
 
 impl ArdSessionMaterial {
+    pub fn new(session_value: [u8; 16], initial_chaining_value: [u8; 16]) -> Self {
+        Self {
+            session_value,
+            initial_chaining_value,
+        }
+    }
+
     pub fn record_decoder(&self, max_plaintext_bytes: usize) -> Result<ArdSessionRecordDecoder> {
         ArdSessionRecordDecoder::new_with_initial_chaining_value(
             self.session_value,
@@ -205,7 +212,7 @@ impl ArdSessionRecordDecoder {
         if self.exhausted {
             return Err(Error::Invalid("ARD session sequence exhausted"));
         }
-        if ciphertext.len() < 32 || ciphertext.len() % 16 != 0 {
+        if ciphertext.len() < 32 || !ciphertext.len().is_multiple_of(16) {
             return Err(Error::Invalid("invalid encrypted-record ciphertext length"));
         }
         let mut plaintext = ciphertext.to_vec();

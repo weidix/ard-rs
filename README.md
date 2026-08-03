@@ -23,12 +23,23 @@ on a VNC library or a native operating-system library.
   caller-supplied random input
 - Apple `ClientInit` flag-byte and client message-10 session-options parsing
 - bounded parsing of the 66-byte `RFBViewerInformation` (`0x21`) message
+- byte-exact construction and bounded parsing of the `RFBSetEncryptionLevel`
+  (`0x12`) proposal and its eight-byte activation record, matching the
+  installed client and screensharingd handler
 - explicit handling of the zero-sized encryption-control rectangle
   (`1103` / `0x044f`)
 - incremental, transactional encrypted-record framing across arbitrary TCP
   fragmentation, with persistent AES-128-CBC state, implicit sequence
   validation, and SHA-1 verification before plaintext is returned
+- a bounded incremental dispatcher that turns verified record payloads into
+  server messages, routing FramebufferUpdate (including MVS `1011`) rectangles
+  into the persistent decoder state and exposing `1103` controls
+- a pure-Rust encrypted-transport oracle server that completes the type-30
+  exchange, sends a real 1103 control rectangle, validates the client's
+  activation, and exchanges AES-CBC records carrying MVS frames
 - bounded parsing of security offers, `ServerInit`, and `FramebufferUpdate`
+- Apple's extended `ServerInit` command-support block, including the
+  `0x12`-advertising bitfield that gates the encrypted transport
 - client message generation for pixel format, encodings, and update requests
 - raw and full-colour zlib rectangles
 - ZRLE tiles (raw, solid, packed palette, plain RLE, and palette RLE)
@@ -51,10 +62,15 @@ baseline, copy metadata, and 1–64999 DCT cache ring are decoded directly.
 
 ## Current end-to-end boundary
 
-The `0x21`, `1103`, type-30 computation, and encrypted-record layers are
-implemented and covered by focused tests. The verified record payloads are not
-yet connected to the framebuffer-message dispatcher, and no real desktop PNG
-has yet been recovered from a modern encrypted session. See
+The `0x21`, `0x12`, `1103`, type-30 computation, encrypted-record, and
+decrypted-payload dispatch layers are implemented and covered by focused
+tests, including an in-process client↔oracle session that decodes an MVS
+frame from encrypted records. A Rust client running from an isolated Linux
+container has also completed a real encrypted session against macOS 26.6
+`screensharingd`, recovered 53,215 decrypted ARD bytes from three authenticated
+records, and decoded the MVS updates into the complete 1920x1080 framebuffer.
+The saved plaintext stream also replays offline to a byte-identical image, so
+future decoder tests do not require a live Screen Sharing connection. See
 [`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md) for confirmed evidence
 and the exact remaining work.
 
@@ -80,7 +96,10 @@ The test suite includes the exact ARD banner and security offer captured from
 the local macOS Screen Sharing server, Apple type-30 authentication framing,
 independent byte-level vectors for all three Apple zlib subencodings, a
 persistent-stream test, a complete FramebufferUpdate, and ZRLE compact-pixel
-decoding. A local isolated Rust server was also connected to macOS Screen
+decoding. The committed real-session fixture contains the native zero-sized
+MVS quantization update and desktop update and verifies the exact decoded pixel
+hash without opening a network connection. A local isolated Rust server was
+also connected to macOS Screen
 Sharing 6.1 (760.4): the native client advertised encoding `1011` and displayed
 the exact 15-byte MVS type-0/repeat packet as a stable 64x64 white framebuffer.
 A second dual-bitstream packet rendered one gray type-4 YCbCr tile followed by
