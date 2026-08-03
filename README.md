@@ -16,14 +16,15 @@ ARD_PASSWORD='screen-sharing-password' \
   192.168.1.20:5900 username
 ```
 
-The viewer defaults to RDM-compatible full quality (`[Zlib, ZRLE]`). It also
-supports the native low, medium, high, and adaptive profiles:
+The viewer defaults to Apple adaptive MVS (`1011`) with GPU tile/DCT decoding.
+It also supports the native low, medium, and high profiles plus RDM-compatible
+full quality (`[Zlib, ZRLE]`):
 
 ```sh
-# Maximum fidelity and bandwidth (the default)
+# Maximum fidelity and bandwidth
 ard-viewer --quality full 192.168.1.20:5900 username
 
-# Apple MVS adaptive streaming and GPU tile decoding
+# Apple MVS adaptive streaming and GPU tile decoding (the default)
 ard-viewer --quality adaptive 192.168.1.20:5900 username
 
 # Optional minimum server update interval; zero is native maximum rate

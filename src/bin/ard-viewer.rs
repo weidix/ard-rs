@@ -967,7 +967,7 @@ fn parse_cli_args(
 ) -> Result<(String, String, ArdVideoQuality, Duration), String> {
     let mut args = args.into_iter();
     let mut positional = Vec::with_capacity(2);
-    let mut quality = ArdVideoQuality::Full;
+    let mut quality = ArdVideoQuality::Adaptive;
     let mut frame_interval = Duration::ZERO;
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -1044,10 +1044,10 @@ mod tests {
     use ard_rs::{ArdVideoQuality, MvsGpuTile, MvsGpuTileUpdate};
 
     #[test]
-    fn viewer_defaults_to_full_quality_and_native_maximum_rate() {
+    fn viewer_defaults_to_adaptive_mvs_and_native_maximum_rate() {
         let (_, _, quality, interval) =
             parse_cli_args(["host:5900".to_owned(), "user".to_owned()]).unwrap();
-        assert_eq!(quality, ArdVideoQuality::Full);
+        assert_eq!(quality, ArdVideoQuality::Adaptive);
         assert_eq!(interval, Duration::ZERO);
     }
 
