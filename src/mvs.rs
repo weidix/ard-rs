@@ -1211,10 +1211,15 @@ impl<'a> BitReader<'a> {
         }
 
         let mut value = 0_u32;
-        for position in self.bit_position..end {
-            let byte = self.bytes[position / 8];
-            let bit = (byte >> (7 - (position % 8))) & 1;
-            value = (value << 1) | u32::from(bit);
+        let mut position = self.bit_position;
+        while position < end {
+            let bit_offset = position % 8;
+            let take = (8 - bit_offset).min(end - position);
+            let shift = 8 - bit_offset - take;
+            let mask = (1_u16 << take) - 1;
+            let chunk = (u16::from(self.bytes[position / 8]) >> shift) & mask;
+            value = (value << take) | u32::from(chunk);
+            position += take;
         }
         self.bit_position = end;
         Ok(value)

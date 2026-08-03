@@ -24,6 +24,7 @@ winit = { version = "0.30.13", optional = true }
 
 [dev-dependencies]
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+naga = { version = "30.0.0", features = ["wgsl-in"] }
 
 [[bin]]
 name = "ard-viewer"

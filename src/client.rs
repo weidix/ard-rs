@@ -418,5 +418,18 @@ fn viewer_information() -> [u8; ArdViewerInformation::WIRE_LEN] {
         let offset = 6 + index * 4;
         message[offset..offset + 4].copy_from_slice(&component.to_be_bytes());
     }
+    // Preserve the complete capability profile observed from the native
+    // Screen Sharing client. Sending only the four leading components left
+    // the server with an all-zero feature block and made its stream selection
+    // differ from the native path this viewer is intended to match.
+    for (index, component) in [26_u32, 5, 2].into_iter().enumerate() {
+        let offset = 22 + index * 4;
+        message[offset..offset + 4].copy_from_slice(&component.to_be_bytes());
+    }
+    message[34] = 0xb0;
+    message[36] = 0x0c;
+    message[37] = 0x03;
+    message[38] = 0x90;
+    message[44] = 0x40;
     message
 }

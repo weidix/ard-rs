@@ -801,6 +801,23 @@ pub fn parse_framebuffer_update(
     decoder: &mut Decoder,
     framebuffer: &mut Framebuffer,
 ) -> Result<usize> {
+    parse_framebuffer_update_impl(bytes, decoder, framebuffer, false)
+}
+
+pub(crate) fn parse_complete_framebuffer_update(
+    bytes: &[u8],
+    decoder: &mut Decoder,
+    framebuffer: &mut Framebuffer,
+) -> Result<usize> {
+    parse_framebuffer_update_impl(bytes, decoder, framebuffer, true)
+}
+
+fn parse_framebuffer_update_impl(
+    bytes: &[u8],
+    decoder: &mut Decoder,
+    framebuffer: &mut Framebuffer,
+    complete: bool,
+) -> Result<usize> {
     let mut cursor = Cursor::new(bytes);
     if cursor.u8()? != 0 {
         return Err(Error::Invalid("not a FramebufferUpdate message"));
@@ -818,8 +835,39 @@ pub fn parse_framebuffer_update(
             height: cursor.u16()?,
             encoding: cursor.i32()?,
         };
-        let consumed = decoder.decode_rectangle(rect, cursor.tail(), framebuffer)?;
+        let consumed = if complete {
+            decoder.decode_complete_rectangle(rect, cursor.tail(), framebuffer)?
+        } else {
+            decoder.decode_rectangle(rect, cursor.tail(), framebuffer)?
+        };
         cursor.take(consumed)?;
+    }
+    Ok(cursor.position())
+}
+
+/// Finds the exact boundary of a framebuffer update without running any
+/// stateful codec. The caller can therefore buffer fragmented records without
+/// repeatedly cloning the accumulated frame or the MVS decoder state.
+pub(crate) fn complete_framebuffer_update_len(bytes: &[u8], decoder: &Decoder) -> Result<usize> {
+    let mut cursor = Cursor::new(bytes);
+    if cursor.u8()? != 0 {
+        return Err(Error::Invalid("not a FramebufferUpdate message"));
+    }
+    cursor.u8()?;
+    let count = usize::from(cursor.u16()?);
+    if count > decoder.limits().max_rectangles {
+        return Err(Error::LimitExceeded("rectangle count"));
+    }
+    for _ in 0..count {
+        let rect = Rectangle {
+            x: cursor.u16()?,
+            y: cursor.u16()?,
+            width: cursor.u16()?,
+            height: cursor.u16()?,
+            encoding: cursor.i32()?,
+        };
+        let payload_len = decoder.complete_rectangle_payload_len(rect, cursor.tail())?;
+        cursor.take(payload_len)?;
     }
     Ok(cursor.position())
 }

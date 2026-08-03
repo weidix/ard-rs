@@ -2,6 +2,7 @@
 @group(0) @binding(1) var<storage, read> payload: array<i32>;
 @group(0) @binding(2) var<storage, read> quantization: array<u32>;
 @group(0) @binding(3) var output_image: texture_storage_2d<rgba8unorm, write>;
+var<workgroup> idct_horizontal: array<f32, 192>;
 
 const BASIS: array<f32, 64> = array<f32, 64>(
     11585.0, 11585.0, 11585.0, 11585.0, 11585.0, 11585.0, 11585.0, 11585.0,
@@ -31,18 +32,25 @@ fn unpack_rgba(packed: u32) -> vec4<f32> {
     ) / 255.0;
 }
 
-fn idct_sample(component: u32, pixel_x: u32, pixel_y: u32, data_offset: u32) -> f32 {
+fn horizontal_idct_sample(component: u32, pixel_x: u32, row: u32, data_offset: u32) -> f32 {
+    var sum = 0.0;
+    for (var u = 0u; u < 8u; u++) {
+        let coefficient_index = row * 8u + u;
+        let coefficient = f32(payload[data_offset + component * 64u + coefficient_index]);
+        let quantization_offset = select(64u, 0u, component == 0u);
+        let quant = f32(quantization[quantization_offset + coefficient_index]);
+        sum += coefficient * quant * (BASIS[u * 8u + pixel_x] / 16384.0);
+    }
+    return sum;
+}
+
+fn idct_sample(component: u32, pixel_x: u32, pixel_y: u32) -> f32 {
     var sum = 0.0;
     for (var v = 0u; v < 8u; v++) {
-        for (var u = 0u; u < 8u; u++) {
-            let coefficient_index = v * 8u + u;
-            let coefficient = f32(payload[data_offset + component * 64u + coefficient_index]);
-            let quantization_offset = select(64u, 0u, component == 0u);
-            let quant = f32(quantization[quantization_offset + coefficient_index]);
-            sum += coefficient * quant * BASIS[u * 8u + pixel_x] * BASIS[v * 8u + pixel_y];
-        }
+        sum += idct_horizontal[component * 64u + v * 8u + pixel_x]
+            * (BASIS[v * 8u + pixel_y] / 16384.0);
     }
-    return clamp(floor((sum + 536870912.0) / 1073741824.0) + 128.0, 0.0, 255.0);
+    return clamp(floor(sum * 0.25 + 0.5) + 128.0, 0.0, 255.0);
 }
 
 fn rice_chroma_sample(component: u32, data_offset: u32) -> f32 {
@@ -71,14 +79,24 @@ fn decode_tiles(
     let record = group.x * 8u;
     let width = records[record + 2u];
     let height = records[record + 3u];
-    if (local.x >= width || local.y >= height) {
-        return;
-    }
-    let destination = vec2<u32>(records[record] + local.x, records[record + 1u] + local.y);
+    let invocation_is_active = local.x < width && local.y < height;
     let kind = records[record + 4u];
     let data_offset = records[record + 5u];
     let packed_color = records[record + 6u];
     let pixel_index = local.y * 8u + local.x;
+    for (var component = 0u; component < 3u; component++) {
+        let needs_component = kind == 4u || (kind == 5u && component == 0u);
+        var horizontal = 0.0;
+        if (needs_component) {
+            horizontal = horizontal_idct_sample(component, local.x, local.y, data_offset);
+        }
+        idct_horizontal[component * 64u + pixel_index] = horizontal;
+    }
+    workgroupBarrier();
+    if (!invocation_is_active) {
+        return;
+    }
+    let destination = vec2<u32>(records[record] + local.x, records[record + 1u] + local.y);
     var color: vec4<f32>;
     switch kind {
         case 0u: {
@@ -95,14 +113,14 @@ fn decode_tiles(
         }
         case 4u: {
             color = ycbcr_to_rgb(vec3<f32>(
-                idct_sample(0u, local.x, local.y, data_offset),
-                idct_sample(1u, local.x, local.y, data_offset),
-                idct_sample(2u, local.x, local.y, data_offset)
+                idct_sample(0u, local.x, local.y),
+                idct_sample(1u, local.x, local.y),
+                idct_sample(2u, local.x, local.y)
             ));
         }
         default: {
             color = ycbcr_to_rgb(vec3<f32>(
-                idct_sample(0u, local.x, local.y, data_offset),
+                idct_sample(0u, local.x, local.y),
                 rice_chroma_sample(1u, data_offset),
                 rice_chroma_sample(2u, data_offset)
             ));
@@ -140,9 +158,47 @@ fn srgb_to_linear_component(value: f32) -> f32 {
     return pow((value + 0.055) / 1.055, 2.4);
 }
 
+fn cubic_weight(value: f32) -> f32 {
+    let x = abs(value);
+    if (x <= 1.0) {
+        return ((1.5 * x - 2.5) * x) * x + 1.0;
+    }
+    if (x < 2.0) {
+        return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+    }
+    return 0.0;
+}
+
+fn sample_sharp(uv: vec2<f32>) -> vec4<f32> {
+    let dimensions_u = textureDimensions(decoded_image);
+    let dimensions = vec2<f32>(dimensions_u);
+    let source = uv * dimensions - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(source));
+    let fraction = fract(source);
+    let maximum = vec2<i32>(dimensions_u) - vec2<i32>(1);
+    var color = vec4<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var row = -1; row <= 2; row++) {
+        let weight_y = cubic_weight(f32(row) - fraction.y);
+        for (var column = -1; column <= 2; column++) {
+            let weight = cubic_weight(f32(column) - fraction.x) * weight_y;
+            let location = clamp(base + vec2<i32>(column, row), vec2<i32>(0), maximum);
+            color += textureLoad(decoded_image, location, 0) * weight;
+            weight_sum += weight;
+        }
+    }
+    return clamp(color / weight_sum, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let encoded = textureSample(decoded_image, image_sampler, input.uv);
+    let source_footprint = vec2<f32>(textureDimensions(decoded_image)) * fwidth(input.uv);
+    var encoded: vec4<f32>;
+    if (max(source_footprint.x, source_footprint.y) > 1.0) {
+        encoded = textureSample(decoded_image, image_sampler, input.uv);
+    } else {
+        encoded = sample_sharp(input.uv);
+    }
     return vec4<f32>(
         srgb_to_linear_component(encoded.r),
         srgb_to_linear_component(encoded.g),

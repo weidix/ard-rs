@@ -78,6 +78,29 @@ impl Decoder {
         payload: &[u8],
         framebuffer: &mut Framebuffer,
     ) -> Result<usize> {
+        self.decode_rectangle_impl(rect, payload, framebuffer, true)
+    }
+
+    /// Decodes a rectangle whose complete wire payload has already been
+    /// framed by the message dispatcher. A malformed live stream terminates
+    /// the session, so this path can update the large persistent MVS state in
+    /// place instead of cloning every framebuffer tile and cache entry first.
+    pub(crate) fn decode_complete_rectangle(
+        &mut self,
+        rect: Rectangle,
+        payload: &[u8],
+        framebuffer: &mut Framebuffer,
+    ) -> Result<usize> {
+        self.decode_rectangle_impl(rect, payload, framebuffer, false)
+    }
+
+    fn decode_rectangle_impl(
+        &mut self,
+        rect: Rectangle,
+        payload: &[u8],
+        framebuffer: &mut Framebuffer,
+        transactional_mvs: bool,
+    ) -> Result<usize> {
         let encoding =
             Encoding::from_i32(rect.encoding).ok_or(Error::UnsupportedEncoding(rect.encoding))?;
         if encoding == Encoding::DesktopSize {
@@ -97,7 +120,7 @@ impl Decoder {
         framebuffer.validate_rect(&rect)?;
         if rect.width == 0 || rect.height == 0 {
             if encoding == Encoding::ArdMvs {
-                return self.decode_mvs(rect, payload, framebuffer);
+                return self.decode_mvs(rect, payload, framebuffer, transactional_mvs);
             }
             return Ok(0);
         }
@@ -109,9 +132,73 @@ impl Decoder {
             Encoding::ArdHalftone => self.decode_apple_zlib(rect, payload, framebuffer, 0),
             Encoding::ArdGrayscale => self.decode_apple_zlib(rect, payload, framebuffer, 1),
             Encoding::ArdThousands => self.decode_apple_zlib(rect, payload, framebuffer, 2),
-            Encoding::ArdMvs => self.decode_mvs(rect, payload, framebuffer),
+            Encoding::ArdMvs => self.decode_mvs(rect, payload, framebuffer, transactional_mvs),
             Encoding::DesktopSize | Encoding::ArdEncryption => {
                 unreachable!("handled before rectangle validation")
+            }
+        }
+    }
+
+    /// Returns the exact encoded payload length without mutating decoder
+    /// state. This lets the streaming dispatcher wait for a whole update
+    /// before entering the expensive stateful decoder.
+    pub(crate) fn complete_rectangle_payload_len(
+        &self,
+        rect: Rectangle,
+        payload: &[u8],
+    ) -> Result<usize> {
+        let encoding =
+            Encoding::from_i32(rect.encoding).ok_or(Error::UnsupportedEncoding(rect.encoding))?;
+        if (rect.width == 0 || rect.height == 0)
+            && !matches!(encoding, Encoding::ArdMvs | Encoding::ArdEncryption)
+        {
+            return Ok(0);
+        }
+        match encoding {
+            Encoding::DesktopSize => Ok(0),
+            Encoding::ArdEncryption => {
+                if payload.len() < ArdEncryptionControl::WIRE_LEN {
+                    Err(Error::NeedMore {
+                        needed: ArdEncryptionControl::WIRE_LEN,
+                        available: payload.len(),
+                    })
+                } else {
+                    Ok(ArdEncryptionControl::WIRE_LEN)
+                }
+            }
+            Encoding::CopyRect => fixed_payload_len(payload, 4),
+            Encoding::Raw => {
+                let len = pixel_count(rect)?
+                    .checked_mul(self.pixel_format.bytes_per_pixel()?)
+                    .ok_or(Error::LimitExceeded("raw rectangle"))?;
+                if len > self.limits.max_decompressed_bytes {
+                    return Err(Error::LimitExceeded("raw rectangle"));
+                }
+                fixed_payload_len(payload, len)
+            }
+            Encoding::Zlib
+            | Encoding::Zrle
+            | Encoding::ArdHalftone
+            | Encoding::ArdGrayscale
+            | Encoding::ArdThousands
+            | Encoding::ArdMvs => {
+                if payload.len() < 4 {
+                    return Err(Error::NeedMore {
+                        needed: 4,
+                        available: payload.len(),
+                    });
+                }
+                let encoded = usize::try_from(u32::from_be_bytes(
+                    payload[..4].try_into().expect("length prefix checked"),
+                ))
+                .map_err(|_| Error::LimitExceeded("compressed rectangle"))?;
+                if encoded > self.limits.max_compressed_bytes {
+                    return Err(Error::LimitExceeded("compressed rectangle"));
+                }
+                let len = encoded
+                    .checked_add(4)
+                    .ok_or(Error::LimitExceeded("compressed rectangle"))?;
+                fixed_payload_len(payload, len)
             }
         }
     }
@@ -131,6 +218,7 @@ impl Decoder {
         rect: Rectangle,
         payload: &[u8],
         framebuffer: &mut Framebuffer,
+        transactional: bool,
     ) -> Result<usize> {
         let mut cursor = Cursor::new(payload);
         let update_len =
@@ -139,31 +227,68 @@ impl Decoder {
             return Err(Error::LimitExceeded("ARD MVS update"));
         }
         let update = cursor.take(update_len)?;
+        if transactional {
+            let mut next_mvs = self.mvs.clone();
+            let frame = Self::decode_mvs_update(
+                &mut next_mvs,
+                rect,
+                update,
+                framebuffer,
+                self.limits.max_decompressed_bytes,
+                self.gpu_mvs_output,
+            )?;
+            self.mvs = next_mvs;
+            if let Some(frame) = frame {
+                self.pending_gpu_mvs_frames.push(frame);
+            }
+        } else {
+            let frame = Self::decode_mvs_update(
+                &mut self.mvs,
+                rect,
+                update,
+                framebuffer,
+                self.limits.max_decompressed_bytes,
+                self.gpu_mvs_output,
+            )?;
+            if let Some(frame) = frame {
+                self.pending_gpu_mvs_frames.push(frame);
+            }
+        }
+        Ok(cursor.position())
+    }
+
+    fn decode_mvs_update(
+        mvs: &mut MvsState,
+        rect: Rectangle,
+        update: &[u8],
+        framebuffer: &mut Framebuffer,
+        max_decompressed_bytes: usize,
+        gpu_mvs_output: bool,
+    ) -> Result<Option<crate::MvsGpuFrame>> {
         let update_type = *update
             .first()
             .ok_or(Error::Invalid("empty ARD MVS update"))?;
-        let mut next_mvs = self.mvs.clone();
         match update_type {
-            2 => next_mvs.decode_control_update(update)?,
+            2 => mvs.decode_control_update(update)?,
             0 => {
                 if rect.width == 0 || rect.height == 0 {
                     return Err(Error::Invalid("zero-sized ARD MVS image update"));
                 }
-                let tiles = next_mvs.decode_partial_update(
+                let tiles = mvs.decode_partial_update(
                     rect,
                     update,
                     framebuffer,
-                    self.limits.max_decompressed_bytes,
-                    !self.gpu_mvs_output,
+                    max_decompressed_bytes,
+                    !gpu_mvs_output,
                 )?;
-                if self.gpu_mvs_output {
-                    self.pending_gpu_mvs_frames.push(crate::MvsGpuFrame {
+                if gpu_mvs_output {
+                    return Ok(Some(crate::MvsGpuFrame {
                         framebuffer_width: framebuffer.width(),
                         framebuffer_height: framebuffer.height(),
-                        luminance_quantization: *next_mvs.quantization_tables().0,
-                        chrominance_quantization: *next_mvs.quantization_tables().1,
+                        luminance_quantization: *mvs.quantization_tables().0,
+                        chrominance_quantization: *mvs.quantization_tables().1,
                         tiles,
-                    });
+                    }));
                 }
             }
             1 => {
@@ -171,29 +296,28 @@ impl Decoder {
                     return Err(Error::Invalid("zero-sized ARD MVS image update"));
                 }
                 let mut next_framebuffer = framebuffer.clone();
-                let tiles = next_mvs.decode_full_update(
+                let tiles = mvs.decode_full_update(
                     rect,
                     update,
                     &mut next_framebuffer,
-                    self.limits.max_decompressed_bytes,
-                    !self.gpu_mvs_output,
+                    max_decompressed_bytes,
+                    !gpu_mvs_output,
                 )?;
-                if self.gpu_mvs_output {
-                    self.pending_gpu_mvs_frames.push(crate::MvsGpuFrame {
+                if gpu_mvs_output {
+                    return Ok(Some(crate::MvsGpuFrame {
                         framebuffer_width: framebuffer.width(),
                         framebuffer_height: framebuffer.height(),
-                        luminance_quantization: *next_mvs.quantization_tables().0,
-                        chrominance_quantization: *next_mvs.quantization_tables().1,
+                        luminance_quantization: *mvs.quantization_tables().0,
+                        chrominance_quantization: *mvs.quantization_tables().1,
                         tiles,
-                    });
+                    }));
                 } else {
                     *framebuffer = next_framebuffer;
                 }
             }
             _ => return Err(Error::Invalid("invalid ARD MVS update type")),
         }
-        self.mvs = next_mvs;
-        Ok(cursor.position())
+        Ok(None)
     }
 
     fn decode_copy_rect(
@@ -438,6 +562,17 @@ fn pixel_count(rect: Rectangle) -> Result<usize> {
     usize::from(rect.width)
         .checked_mul(usize::from(rect.height))
         .ok_or(Error::LimitExceeded("rectangle pixel count"))
+}
+
+fn fixed_payload_len(payload: &[u8], needed: usize) -> Result<usize> {
+    if payload.len() < needed {
+        Err(Error::NeedMore {
+            needed,
+            available: payload.len(),
+        })
+    } else {
+        Ok(needed)
+    }
 }
 
 fn decompress_exact(

@@ -1,5 +1,6 @@
+use crate::protocol::{complete_framebuffer_update_len, parse_complete_framebuffer_update};
 use crate::wire::Cursor;
-use crate::{ArdEncryptionControl, Decoder, Error, Framebuffer, Result, parse_framebuffer_update};
+use crate::{ArdEncryptionControl, Decoder, Error, Framebuffer, Result};
 
 /// One complete server message recovered from the decrypted record payload
 /// stream.
@@ -58,8 +59,22 @@ impl ArdMessageDispatcher {
         if input.len() > self.max_message_bytes.saturating_sub(self.buffer.len()) {
             return Err(Error::LimitExceeded("ARD buffered messages"));
         }
+        let previous_len = self.buffer.len();
+        self.buffer.extend_from_slice(input);
+        match self.first_message_len(decoder) {
+            Err(Error::NeedMore { .. }) => return Ok(Vec::new()),
+            Err(error) => {
+                self.buffer.truncate(previous_len);
+                return Err(error);
+            }
+            Ok(_) => {}
+        }
+
+        // Clone only once a complete message is present. Large framebuffer
+        // updates commonly span many encrypted records; cloning on every
+        // fragment made buffering quadratic in the frame size.
         let mut next = self.clone();
-        next.buffer.extend_from_slice(input);
+        self.buffer.truncate(previous_len);
         let messages = next.drain_available(decoder, framebuffer)?;
         *self = next;
         Ok(messages)
@@ -87,7 +102,8 @@ impl ArdMessageDispatcher {
                     let rectangle_count =
                         usize::from(u16::from_be_bytes([self.buffer[2], self.buffer[3]]));
                     let consumed =
-                        match parse_framebuffer_update(&self.buffer, decoder, framebuffer) {
+                        match parse_complete_framebuffer_update(&self.buffer, decoder, framebuffer)
+                        {
                             Ok(consumed) => consumed,
                             Err(Error::NeedMore { .. }) => return Ok(messages),
                             Err(error) => return Err(error),
@@ -116,6 +132,48 @@ impl ArdMessageDispatcher {
                 }
                 _ => return Err(Error::Invalid("unsupported ARD server message type")),
             }
+        }
+    }
+
+    fn first_message_len(&self, decoder: &Decoder) -> Result<usize> {
+        let Some(message_type) = self.buffer.first().copied() else {
+            return Err(Error::NeedMore {
+                needed: 1,
+                available: 0,
+            });
+        };
+        match message_type {
+            0 => complete_framebuffer_update_len(&self.buffer, decoder),
+            2 => Ok(1),
+            3 => {
+                if self.buffer.len() < 8 {
+                    return Err(Error::NeedMore {
+                        needed: 8,
+                        available: self.buffer.len(),
+                    });
+                }
+                let len = usize::try_from(u32::from_be_bytes(
+                    self.buffer[4..8]
+                        .try_into()
+                        .expect("cut text length checked"),
+                ))
+                .map_err(|_| Error::LimitExceeded("ARD cut-text length"))?;
+                if len > self.max_cut_text_bytes {
+                    return Err(Error::LimitExceeded("ARD cut-text length"));
+                }
+                let total = len
+                    .checked_add(8)
+                    .ok_or(Error::LimitExceeded("ARD cut-text length"))?;
+                if self.buffer.len() < total {
+                    Err(Error::NeedMore {
+                        needed: total,
+                        available: self.buffer.len(),
+                    })
+                } else {
+                    Ok(total)
+                }
+            }
+            _ => Err(Error::Invalid("unsupported ARD server message type")),
         }
     }
 

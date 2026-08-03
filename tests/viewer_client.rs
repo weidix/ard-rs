@@ -47,4 +47,12 @@ fn receive_only_client_delivers_gpu_mvs_tiles_without_cpu_frame_expansion() {
     let report = server.join().unwrap();
     assert!(report.activation_received);
     assert!(report.client_message_types.contains(&3));
+    let viewer = report
+        .viewer_information
+        .expect("viewer information received");
+    assert_eq!(viewer.viewer_components, [2, 6, 1, 0]);
+    assert_eq!(viewer.system_version, [26, 5, 2]);
+    assert_eq!(viewer.capabilities[0], 0xb0);
+    assert_eq!(viewer.capabilities[2..5], [0x0c, 0x03, 0x90]);
+    assert_eq!(viewer.capabilities[10], 0x40);
 }

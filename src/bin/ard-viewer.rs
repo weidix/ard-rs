@@ -1,13 +1,12 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ard_rs::{ArdClient, ArdClientConfig, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate};
-use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::WindowEvent;
@@ -30,7 +29,7 @@ struct FramePacket {
     wire_bytes: usize,
     luminance_quantization: [u16; 64],
     chrominance_quantization: [u16; 64],
-    tiles: BTreeMap<(u16, u16), MvsGpuTileUpdate>,
+    tiles: HashMap<(u16, u16), MvsGpuTileUpdate>,
 }
 
 impl FramePacket {
@@ -42,7 +41,7 @@ impl FramePacket {
             wire_bytes: 0,
             luminance_quantization: frame.luminance_quantization,
             chrominance_quantization: frame.chrominance_quantization,
-            tiles: BTreeMap::new(),
+            tiles: HashMap::new(),
         };
         packet.merge(frame, index, wire_bytes);
         packet
@@ -202,6 +201,11 @@ struct DecodedTexture {
     render_bind_group: wgpu::BindGroup,
 }
 
+struct UploadBuffer {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+}
+
 struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -213,6 +217,9 @@ struct Renderer {
     render_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     decoded: Option<DecodedTexture>,
+    records_buffer: Option<UploadBuffer>,
+    payload_buffer: Option<UploadBuffer>,
+    quantization_buffer: Option<UploadBuffer>,
 }
 
 impl Renderer {
@@ -240,14 +247,23 @@ impl Renderer {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| "GPU does not support this window surface".to_owned())?;
-        if let Some(srgb_format) = surface
-            .get_capabilities(&adapter)
+        let surface_capabilities = surface.get_capabilities(&adapter);
+        if let Some(srgb_format) = surface_capabilities
             .formats
-            .into_iter()
+            .iter()
+            .copied()
             .find(wgpu::TextureFormat::is_srgb)
         {
             config.format = srgb_format;
         }
+        config.present_mode = if surface_capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
         config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &config);
 
@@ -358,6 +374,9 @@ impl Renderer {
             render_layout,
             sampler,
             decoded: None,
+            records_buffer: None,
+            payload_buffer: None,
+            quantization_buffer: None,
         })
     }
 
@@ -429,18 +448,50 @@ impl Renderer {
                 .iter()
                 .map(|&value| u32::from(value)),
         );
-        let records_buffer = storage_buffer(&self.device, "MVS tile records", &records);
-        let payload_buffer = storage_buffer(&self.device, "MVS tile payload", &payload);
-        let quantization_buffer =
-            storage_buffer(&self.device, "MVS quantization tables", &quantization);
+        write_storage_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.records_buffer,
+            "MVS tile records",
+            &records,
+        );
+        write_storage_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.payload_buffer,
+            "MVS tile payload",
+            &payload,
+        );
+        write_storage_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.quantization_buffer,
+            "MVS quantization tables",
+            &quantization,
+        );
+        let records_buffer = &self
+            .records_buffer
+            .as_ref()
+            .expect("records uploaded")
+            .buffer;
+        let payload_buffer = &self
+            .payload_buffer
+            .as_ref()
+            .expect("payload uploaded")
+            .buffer;
+        let quantization_buffer = &self
+            .quantization_buffer
+            .as_ref()
+            .expect("quantization uploaded")
+            .buffer;
         let decoded = self.decoded.as_ref().expect("decoded texture created");
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MVS compute bind group"),
             layout: &self.compute_layout,
             entries: &[
-                buffer_entry(0, &records_buffer),
-                buffer_entry(1, &payload_buffer),
-                buffer_entry(2, &quantization_buffer),
+                buffer_entry(0, records_buffer),
+                buffer_entry(1, payload_buffer),
+                buffer_entry(2, quantization_buffer),
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&decoded.storage_view),
@@ -549,16 +600,34 @@ fn storage_buffer_layout(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn storage_buffer<T: bytemuck::NoUninit>(
+fn write_storage_buffer<T: bytemuck::NoUninit>(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    slot: &mut Option<UploadBuffer>,
     label: &str,
     values: &[T],
-) -> wgpu::Buffer {
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: bytemuck::cast_slice(values),
-        usage: wgpu::BufferUsages::STORAGE,
-    })
+) {
+    let bytes = bytemuck::cast_slice(values);
+    let needed = u64::try_from(bytes.len())
+        .expect("GPU upload length fits u64")
+        .max(4);
+    if slot.as_ref().is_none_or(|upload| upload.capacity < needed) {
+        let capacity = needed.next_power_of_two();
+        *slot = Some(UploadBuffer {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: capacity,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity,
+        });
+    }
+    queue.write_buffer(
+        &slot.as_ref().expect("upload buffer created").buffer,
+        0,
+        bytes,
+    );
 }
 
 fn buffer_entry<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEntry<'a> {
@@ -569,7 +638,9 @@ fn buffer_entry<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEn
 }
 
 fn pack_gpu_tiles<'a>(tiles: impl Iterator<Item = &'a MvsGpuTileUpdate>) -> (Vec<u32>, Vec<i32>) {
-    let mut records = Vec::new();
+    let tiles = tiles;
+    let (tile_count, _) = tiles.size_hint();
+    let mut records = Vec::with_capacity(tile_count.saturating_mul(8));
     let mut payload = Vec::new();
     for update in tiles {
         let data_offset = payload.len() as u32;
@@ -626,11 +697,14 @@ fn fitted_viewport(
 ) -> (f32, f32, f32, f32) {
     let scale = (surface_width as f32 / frame_width as f32)
         .min(surface_height as f32 / frame_height as f32);
-    let width = frame_width as f32 * scale;
-    let height = frame_height as f32 * scale;
+    // Keep the viewport on physical-pixel boundaries. Fractional origins and
+    // extents make even an otherwise sharp reconstruction sample between
+    // texels, which is especially visible on small glyph stems.
+    let width = (frame_width as f32 * scale).round().max(1.0);
+    let height = (frame_height as f32 * scale).round().max(1.0);
     (
-        (surface_width as f32 - width) * 0.5,
-        (surface_height as f32 - height) * 0.5,
+        ((surface_width as f32 - width) * 0.5).round(),
+        ((surface_height as f32 - height) * 0.5).round(),
         width,
         height,
     )
@@ -727,6 +801,18 @@ mod tests {
     use ard_rs::{MvsGpuTile, MvsGpuTileUpdate};
 
     #[test]
+    fn gpu_shader_is_valid_wgsl() {
+        let module = naga::front::wgsl::parse_str(include_str!("../viewer_mvs.wgsl"))
+            .expect("viewer shader parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("viewer shader validates");
+    }
+
+    #[test]
     fn gpu_tile_packing_keeps_dct_coefficients_native() {
         let mut coefficients = Box::new([[0_i16; 64]; 3]);
         coefficients[0][0] = -12;
@@ -748,7 +834,7 @@ mod tests {
     #[test]
     fn viewport_preserves_aspect_ratio() {
         let actual = fitted_viewport(1000, 1000, 1920, 1080);
-        let expected = (0.0, 218.75, 1000.0, 562.5);
+        let expected = (0.0, 219.0, 1000.0, 563.0);
         for (actual, expected) in [actual.0, actual.1, actual.2, actual.3]
             .into_iter()
             .zip([expected.0, expected.1, expected.2, expected.3])
