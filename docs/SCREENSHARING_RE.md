@@ -488,82 +488,16 @@ Sharing to it. That native run still has to happen; until it does, the
 extended ServerInit bitfield and the wrapped-block layout remain
 confirmed/native rather than confirmed/oracle.
 
-### Real encrypted desktop capture
+### Private live validation and public synthetic fixture
 
-On 2026-08-03, `examples/capture_real_desktop.rs` was cross-compiled for
-`aarch64-unknown-linux-musl` and run from an isolated Linux container against
-the host's macOS 26.6 `screensharingd`. The Rust client completed type-30
-authentication, sent the live `0x21` and `0x12` messages, unwrapped the real
-1103 control, activated both encrypted directions, and requested the upper-left
-256x256 framebuffer region.
+The Rust client completed a private live encrypted session against macOS
+`screensharingd`, including type-30 authentication, `0x21`/`0x12`, the 1103
+control rectangle, encrypted records, and a complete framebuffer update. That
+validation exposed zero-sized MVS control routing, signed chroma prediction,
+and type-4 two-color selection defects. Each defect is retained as a focused
+synthetic regression test.
 
-The server returned two verified encrypted records whose payloads concatenate
-to 4,448 bytes of ordinary ARD server-message data:
-
-1. a 149-byte `FramebufferUpdate` carrying a zero-sized MVS type-2
-   quantization-table rectangle;
-2. a 4,299-byte `FramebufferUpdate` carrying a 272x272 MVS desktop rectangle.
-
-The first record exposed a real decoder defect: zero-sized rectangles were
-previously discarded before MVS type-2 control data could be consumed. The
-decoder now routes zero-sized MVS rectangles through the codec while rejecting
-zero-sized type-0/type-1 image updates. This partial capture was superseded by
-the complete-frame fixture described below and is no longer stored separately.
-
-The first decoder pass showed magenta/purple 8x8 blocks in otherwise neutral
-UI regions. Comparing the type-5 chroma predictor with the installed
-`ExpandBlockRice` implementation found an extra sign correction before signed
-division. Rust already divides signed integers with truncation toward zero, so
-the correction made negative even Cb/Cr predictors drift by `+2` on every new
-block. Removing it restores neutral colors in the saved real frame; the hash
-above covers the corrected output and a focused unit test covers positive,
-negative, odd, even, and nonzero-delta predictor cases.
-
-A second live request captured the complete framebuffer reported by the same
-Mac. The server returned 53,215 plaintext bytes in three authenticated
-encrypted records, containing two framebuffer updates. The decoder recovered
-all 2,073,600 pixels of the 1920x1080 desktop, matching the current display's
-native 1920x1080 mode. After all decoder fixes, the complete-frame PPM has
-SHA-256 `cd8833a6d1c937cba2aa57fa47f7c5f88883eb9b3cfb44ad573d14d517d405c7`;
-the saved plaintext stream has SHA-256
-`5681ac38d2d73b56ae4c9fbf9b5c4b3b26bd47c2bd7fe8ffa8145aedc58044e7`.
-
-Full-frame inspection also exposed inverted black/gray 8x8 regions in text.
-Every affected tile was an MVS type-4 two-color tile. The native
-`DecodeMVSUpdate` branch selects the second remembered color for a zero bit and
-the first color for a one bit; the Rust call supplied those choices in the
-opposite order. Correcting the order removes all detected anomalous dark 8x8
-tiles, and a focused two-color bit-mask test preserves the native semantics.
-
-The canonical live plaintext is stored only at
-`tests/fixtures/real-macos-mvs-1920x1080.bin`. It can be replayed without a
-network connection or password:
-
-```sh
-cargo run --example decode_plaintext_capture -- \
-  tests/fixtures/real-macos-mvs-1920x1080.bin \
-  1920 1080 \
-  target/real-frame-full.ppm
-```
-
-Visual inspection of the complete replay confirms that both the magenta/purple
-corruption and the inverted black/gray blocks are gone. Generated PPM/PNG files
-remain under `target/`; only the single compressed plaintext input is committed
-as a fixture.
-
-The stored stream ends after the first fully covered type-0 MVS base frame. It
-is therefore not a lossless reference image or a final-quality source-screen
-capture: quantized luma softens fine detail, and Rice/DCT base tiles carry only
-chroma DC for each 8x8 tile, which can visibly bleed color across sharp edges.
-Apple's decoder applies the same codec structure. Decoder fidelity must be
-compared against Apple's rendering of the same MVS bytes, not against the
-uncompressed source desktop. Later type-1 differential updates, when present in
-a longer stream, refine from the preceding DCT state and must be applied in
-order.
-
-The fixture contains compressed real desktop pixels, but no password,
-authentication response, wrapped session block, session key, IV, encrypted
-record, or clipboard data.
+No live payload or captured desktop pixels are stored in this repository.
 
 ## Work not yet completed
 

@@ -100,20 +100,12 @@ baseline, copy metadata, and 1–64999 DCT cache ring are decoded directly.
 The `0x21`, `0x12`, `1103`, type-30 computation, encrypted-record, and
 decrypted-payload dispatch layers are implemented and covered by focused
 tests, including an in-process client↔oracle session that decodes an MVS
-frame from encrypted records. A Rust client running from an isolated Linux
-container has also completed a real encrypted session against macOS 26.6
-`screensharingd`, recovered 53,215 decrypted ARD bytes from three authenticated
-records, and decoded the MVS updates into a fully covered 1920x1080 framebuffer.
-The canonical plaintext stream is stored once as
-`tests/fixtures/real-macos-mvs-1920x1080.bin` and replays offline to a stable
-pixel hash, so future decoder tests do not require a live Screen Sharing
-connection. See
+frame from encrypted records. A Rust client has also completed a private live
+session against macOS `screensharingd` and decoded a fully covered framebuffer;
+the captured payload and pixels are deliberately not stored in this repository.
+See
 [`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md) for confirmed evidence
 and the exact remaining work.
-
-That fixture ends after one lossy type-0 MVS base frame. It covers every pixel,
-but it is not a lossless reference for source-screen sharpness; later type-1
-differential records can refine DCT state when a longer stream contains them.
 
 ## Pure Rust guarantee
 
@@ -142,9 +134,7 @@ The test suite includes the exact ARD banner and security offer captured from
 the local macOS Screen Sharing server, Apple type-30 authentication framing,
 independent byte-level vectors for all three Apple zlib subencodings, a
 persistent-stream test, a complete FramebufferUpdate, and ZRLE compact-pixel
-decoding. The committed real-session fixture contains the native zero-sized
-MVS quantization update and desktop update and verifies the exact decoded pixel
-hash without opening a network connection. A local isolated Rust server was
+decoding. A local isolated Rust server was
 also connected to macOS Screen
 Sharing 6.1 (760.4): the native client advertised encoding `1011` and displayed
 the exact 15-byte MVS type-0/repeat packet as a stable 64x64 white framebuffer.

@@ -2,7 +2,6 @@ use ard_rs::{
     ArdMessageDispatcher, ArdServerMessage, Decoder, Framebuffer, PixelFormat, ProtocolVersion,
     SecurityType, parse_security_types,
 };
-use sha1::{Digest, Sha1};
 
 #[test]
 fn replays_live_macos_ard_handshake_offline() {
@@ -25,31 +24,6 @@ fn replays_live_macos_ard_handshake_offline() {
             SecurityType::Apple(35),
         ]
     );
-}
-
-#[test]
-fn gpu_mvs_path_keeps_real_frame_as_tile_commands_and_coefficients() {
-    let capture = include_bytes!("fixtures/real-macos-mvs-1920x1080.bin");
-    let mut dispatcher = ArdMessageDispatcher::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
-    let mut decoder = Decoder::new_gpu_mvs(PixelFormat::XRGB8888).unwrap();
-    let mut framebuffer = Framebuffer::new(1920, 1080).unwrap();
-    for fragment in capture.chunks(257) {
-        dispatcher
-            .push(fragment, &mut decoder, &mut framebuffer)
-            .unwrap();
-    }
-
-    // No CPU RGB/YUV framebuffer is expanded on the GPU-native path.
-    assert!(framebuffer.rgba().iter().all(|&byte| byte == 0));
-    let frames = decoder.take_gpu_mvs_frames();
-    assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].tiles.len(), 240 * 135);
-    assert!(frames[0].tiles.iter().any(|tile| {
-        matches!(
-            tile.tile,
-            ard_rs::MvsGpuTile::RiceDct(_) | ard_rs::MvsGpuTile::Dct(_)
-        )
-    }));
 }
 
 #[test]
@@ -84,57 +58,5 @@ fn decodes_saved_native_oracle_mvs_frame_without_a_connection() {
             .rgba()
             .chunks_exact(4)
             .all(|pixel| pixel == [255, 255, 255, 255])
-    );
-}
-
-#[test]
-fn decodes_complete_real_macos_mvs_frame_without_a_connection() {
-    let capture = include_bytes!("fixtures/real-macos-mvs-1920x1080.bin");
-    assert_eq!(capture.len(), 53_215);
-
-    let mut dispatcher = ArdMessageDispatcher::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
-    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
-    let mut framebuffer = Framebuffer::new(1920, 1080).unwrap();
-    let mut messages = Vec::new();
-    for fragment in capture.chunks(257) {
-        messages.extend(
-            dispatcher
-                .push(fragment, &mut decoder, &mut framebuffer)
-                .unwrap(),
-        );
-    }
-
-    assert_eq!(dispatcher.buffered_bytes(), 0);
-    assert_eq!(
-        messages,
-        [
-            ArdServerMessage::FramebufferUpdate {
-                rectangle_count: 1,
-                bytes: 149,
-            },
-            ArdServerMessage::FramebufferUpdate {
-                rectangle_count: 1,
-                bytes: 53_066,
-            },
-        ]
-    );
-    assert!(
-        framebuffer
-            .rgba()
-            .chunks_exact(4)
-            .all(|pixel| pixel[3] == 255)
-    );
-
-    let mut ppm = b"P6\n1920 1080\n255\n".to_vec();
-    for pixel in framebuffer.rgba().chunks_exact(4) {
-        ppm.extend_from_slice(&pixel[..3]);
-    }
-    let digest: [u8; 20] = Sha1::digest(&ppm).into();
-    assert_eq!(
-        digest,
-        [
-            0x0b, 0xdd, 0xdf, 0x76, 0x2a, 0xe6, 0xbd, 0xbe, 0x52, 0x08, 0xe5, 0xa3, 0x7d, 0x75,
-            0xee, 0x15, 0xd1, 0x3c, 0x16, 0x38,
-        ]
     );
 }
