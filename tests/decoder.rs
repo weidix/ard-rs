@@ -865,6 +865,80 @@ fn replays_a_partial_copy_tile_in_a_full_mvs_update() {
 }
 
 #[test]
+fn full_differential_preserves_partial_copy_source() {
+    let mut baseline = partial_mvs_packet_with_secondary(
+        &[
+            (0, 1),
+            (5, 3), // establish a DCT baseline for the first tile
+            (0, 1),
+            (5, 3), // reuse it for the second tile
+            (0, 1),
+            (0x6d, 8),
+        ],
+        &[
+            (0, 1), // new coefficient block
+            (3, 2), // retain zero chroma predictors
+            (0, 1),
+            (0, 1), // zero DC
+            (0, 1),
+            (2, 2), // positive AC coefficient
+            (0, 1),
+            (1, 2),
+            (0, 1), // end block
+            (1, 1), // reuse the block for the second tile
+        ],
+    );
+    baseline[5] = 2;
+    baseline[6] = 2;
+    let partial_copy = partial_mvs_packet(&[
+        (0, 1),
+        (0, 3), // first tile becomes white
+        (0, 1),
+        (1, 3), // second tile remembers a left-copy source
+        (0, 1),
+        (0x6d, 8),
+    ]);
+    let differential = full_mvs_packet(
+        [64, 64],
+        &[
+            (0, 2), // first tile is unchanged
+            (1, 2), // refine the second tile without replacing its copy source
+            (1, 6), // two luma coefficients
+            (1, 3), // increase the signed AC coefficient by one
+            (0, 1), // unchanged Cr DC
+            (0, 2), // Cr end-of-block
+            (0, 1), // unchanged Cb DC
+            (0, 2), // Cb end-of-block
+        ],
+    );
+    let replay = full_mvs_packet(
+        [0, 0],
+        &[
+            (0, 2), // source tile remains unchanged
+            (2, 2), // replay the remembered left-copy operation
+        ],
+    );
+
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(16, 8).unwrap();
+    for packet in [&baseline, &partial_copy, &differential] {
+        decoder
+            .decode_rectangle(rect(16, 8, Encoding::ArdMvs), packet, &mut framebuffer)
+            .unwrap();
+    }
+    decoder
+        .decode_rectangle(rect(16, 8, Encoding::ArdMvs), &replay, &mut framebuffer)
+        .unwrap();
+
+    assert!(
+        framebuffer
+            .rgba()
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 255, 255, 255])
+    );
+}
+
+#[test]
 fn decodes_mvs_partial_solid_ycbcr_tile() {
     // Type 4, no repeats, solid/new-color flags, neutral-chroma red-ish Y.
     let packet = partial_mvs_packet_with_secondary(

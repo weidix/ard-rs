@@ -532,7 +532,6 @@ impl MvsState {
                     }
                     self.insert_cache_tile(DctTile { coefficients });
                     let state = &mut self.tiles[global_tile];
-                    state.copy_source = None;
                     state.dct = DctTile { coefficients };
                     state.dct_valid = true;
                     state.luma_count = luma_count;
