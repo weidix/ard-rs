@@ -619,8 +619,8 @@ fn decodes_mvs_full_differential_and_both_cache_selectors() {
         ]
     );
 
-    // A second refinement is relative to the coefficients produced by the
-    // first one, not the original partial-update baseline.
+    // Full refinements remain relative to the original partial-update
+    // Rice-DCT baseline.
     decoder
         .decode_rectangle(
             rect(8, 8, Encoding::ArdMvs),
@@ -633,7 +633,7 @@ fn decodes_mvs_full_differential_and_both_cache_selectors() {
             .chunks_exact(4)
             .map(|pixel| pixel[0])
             .collect::<Vec<_>>(),
-        [151, 148, 142, 133, 123, 114, 108, 105]
+        expected_row
     );
 
     let white = partial_mvs_packet(&[(0, 1), (0, 3), (0, 1), (0x6d, 8)]);
@@ -679,6 +679,64 @@ fn decodes_mvs_full_differential_and_both_cache_selectors() {
             .collect::<Vec<_>>(),
         expected_row
     );
+}
+
+#[test]
+fn consecutive_full_differentials_keep_the_partial_rice_baseline() {
+    let mut baseline = partial_mvs_packet_with_secondary(
+        &[(0, 1), (5, 3), (0, 1), (0x6d, 8)],
+        &[
+            (0, 1), // new coefficient block
+            (3, 2), // retain zero chroma predictors
+            (0, 1),
+            (0, 1), // zero DC
+            (0, 1),
+            (2, 2), // positive AC coefficient
+            (0, 1),
+            (1, 2),
+            (0, 1), // end block
+        ],
+    );
+    baseline[5] = 2;
+    baseline[6] = 2;
+    let differential = full_mvs_packet(
+        [64, 64],
+        &[
+            (1, 2), // differential DCT selector
+            (2, 6), // three luma coefficients
+            (1, 3), // refine the existing AC coefficient
+            (1, 1),
+            (0, 1),
+            (0, 2), // append Rice-coded coefficient +2
+            (0, 1), // unchanged Cr DC
+            (0, 2), // Cr end-of-block
+            (0, 1), // unchanged Cb DC
+            (0, 2), // Cb end-of-block
+        ],
+    );
+
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    decoder
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &baseline, &mut framebuffer)
+        .unwrap();
+    decoder
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &differential,
+            &mut framebuffer,
+        )
+        .unwrap();
+    let first = framebuffer.rgba().to_vec();
+
+    decoder
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &differential,
+            &mut framebuffer,
+        )
+        .unwrap();
+    assert_eq!(framebuffer.rgba(), first);
 }
 
 #[test]

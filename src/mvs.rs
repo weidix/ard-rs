@@ -512,7 +512,7 @@ impl MvsState {
                             "ARD MVS differential tile has no Rice/DCT baseline",
                         ));
                     }
-                    let (coefficients, luma_count) = decode_full_differential_tile(
+                    let (coefficients, _luma_count) = decode_full_differential_tile(
                         &mut bits,
                         baseline,
                         luminance_limit,
@@ -532,9 +532,10 @@ impl MvsState {
                     }
                     self.insert_cache_tile(DctTile { coefficients });
                     let state = &mut self.tiles[global_tile];
-                    state.dct = DctTile { coefficients };
-                    state.dct_valid = true;
-                    state.luma_count = luma_count;
+                    // A full update is a refinement of the most recent
+                    // partial/Rice-DCT baseline. Screen Sharing caches the
+                    // refined result, but deliberately leaves that baseline
+                    // untouched for later full updates.
                     state.gpu_tile = MvsGpuTile::Dct(Box::new(coefficients));
                     updates.push(MvsGpuTileUpdate {
                         x: x as u16,
