@@ -115,7 +115,6 @@ struct TileState {
     generation: u32,
     copy_source: Option<usize>,
     dct: DctTile,
-    dct_valid: bool,
     luma_count: u8,
     gpu_tile: MvsGpuTile,
 }
@@ -126,8 +125,10 @@ impl Default for TileState {
             generation: 0,
             copy_source: None,
             dct: DctTile::default(),
-            dct_valid: false,
-            luma_count: 1,
+            // DecodeMVSUpdate allocates the native 0x54-byte tile-state
+            // array with calloc. A tile can therefore be used as a
+            // differential baseline before any Rice/DCT block is received.
+            luma_count: 0,
             gpu_tile: MvsGpuTile::SolidRgba([0, 0, 0, 255]),
         }
     }
@@ -408,7 +409,6 @@ impl MvsState {
                 state.gpu_tile = gpu_tile.clone();
                 if let Some((coefficients, luma_count)) = decoded_dct {
                     state.dct = DctTile { coefficients };
-                    state.dct_valid = true;
                     state.luma_count = luma_count;
                 }
                 if emit_update {
@@ -499,11 +499,6 @@ impl MvsState {
                 0 => {}
                 1 => {
                     let baseline = self.tiles[global_tile].clone();
-                    if !baseline.dct_valid {
-                        return Err(Error::Invalid(
-                            "ARD MVS differential tile has no Rice/DCT baseline",
-                        ));
-                    }
                     let (coefficients, _luma_count) = decode_full_differential_tile(
                         &mut bits,
                         baseline,

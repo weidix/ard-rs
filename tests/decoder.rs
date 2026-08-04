@@ -944,6 +944,35 @@ fn decodes_zero_limit_mvs_differential_baseline() {
 }
 
 #[test]
+fn decodes_mvs_differential_from_native_zero_baseline() {
+    let differential = full_mvs_packet(
+        [0, 0],
+        &[
+            (1, 2), // differential DCT selector
+            (0, 6), // one luma coefficient
+            (0, 2), // zero-valued Rice-coded luma DC
+            (0, 1), // unchanged Cr DC
+            (0, 1), // unchanged Cb DC
+        ],
+    );
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    decoder
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &differential,
+            &mut framebuffer,
+        )
+        .unwrap();
+    assert!(
+        framebuffer
+            .rgba()
+            .chunks_exact(4)
+            .all(|pixel| pixel == [128, 128, 128, 255])
+    );
+}
+
+#[test]
 fn replays_a_partial_copy_tile_in_a_full_mvs_update() {
     let initial = partial_mvs_packet_with_secondary(
         &[
