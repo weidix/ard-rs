@@ -571,15 +571,15 @@ fn decodes_mvs_full_differential_and_both_cache_selectors() {
     let differential = full_mvs_packet(
         [64, 64],
         &[
-            (1, 2), // differential DCT selector
-            (1, 6), // two luma coefficients
-            (1, 3), // increase the signed AC coefficient by one
-            (0, 1), // unchanged Cr DC
-            (1, 2), // JPEG symbol 0x01
-            (1, 1), // positive Cr AC coefficient
-            (0, 2), // JPEG chrominance AC end-of-block
-            (0, 1), // unchanged Cb DC
-            (0, 2), // JPEG chrominance AC end-of-block
+            (1, 2),      // differential DCT selector
+            (1, 6),      // two luma coefficients
+            (1, 3),      // increase the signed AC coefficient by one
+            (0, 1),      // unchanged Cr DC
+            (0, 2),      // JPEG luminance AC symbol 0x01 (00)
+            (1, 1),      // positive Cr AC coefficient
+            (0b1010, 4), // JPEG luminance AC end-of-block
+            (0, 1),      // unchanged Cb DC
+            (0b1010, 4), // JPEG luminance AC end-of-block
         ],
     );
     let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
@@ -707,11 +707,11 @@ fn consecutive_full_differentials_keep_the_partial_rice_baseline() {
             (1, 3), // refine the existing AC coefficient
             (1, 1),
             (0, 1),
-            (0, 2), // append Rice-coded coefficient +2
-            (0, 1), // unchanged Cr DC
-            (0, 2), // Cr end-of-block
-            (0, 1), // unchanged Cb DC
-            (0, 2), // Cb end-of-block
+            (0, 2),      // append Rice-coded coefficient +2
+            (0, 1),      // unchanged Cr DC
+            (0b1010, 4), // Cr end-of-block in the native luminance AC table
+            (0, 1),      // unchanged Cb DC
+            (0b1010, 4), // Cb end-of-block in the native luminance AC table
         ],
     );
 
@@ -760,13 +760,13 @@ fn mvs_sequential_cache_recall_is_independent_of_insertion_cursor() {
     let differential = full_mvs_packet(
         [64, 64],
         &[
-            (1, 2), // differential DCT selector; inserts cache entry 1
-            (1, 6), // two luma coefficients
-            (1, 3), // increase the signed AC coefficient by one
-            (0, 1), // unchanged Cr DC
-            (0, 2), // JPEG chrominance AC end-of-block
-            (0, 1), // unchanged Cb DC
-            (0, 2), // JPEG chrominance AC end-of-block
+            (1, 2),      // differential DCT selector; inserts cache entry 1
+            (1, 6),      // two luma coefficients
+            (1, 3),      // increase the signed AC coefficient by one
+            (0, 1),      // unchanged Cr DC
+            (0b1010, 4), // JPEG luminance AC end-of-block
+            (0, 1),      // unchanged Cb DC
+            (0b1010, 4), // JPEG luminance AC end-of-block
         ],
     );
     let sequential_cache =
@@ -848,13 +848,13 @@ fn missing_mvs_cache_recall_is_a_native_noop() {
     let differential = full_mvs_packet(
         [64, 64],
         &[
-            (1, 2), // differential DCT selector; inserts cache entry 1
-            (1, 6), // two luma coefficients
-            (1, 3), // increase the signed AC coefficient by one
-            (0, 1), // unchanged Cr DC
-            (0, 2), // JPEG chrominance AC end-of-block
-            (0, 1), // unchanged Cb DC
-            (0, 2), // JPEG chrominance AC end-of-block
+            (1, 2),      // differential DCT selector; inserts cache entry 1
+            (1, 6),      // two luma coefficients
+            (1, 3),      // increase the signed AC coefficient by one
+            (0, 1),      // unchanged Cr DC
+            (0b1010, 4), // JPEG luminance AC end-of-block
+            (0, 1),      // unchanged Cb DC
+            (0b1010, 4), // JPEG luminance AC end-of-block
         ],
     );
     let explicit_cache =
@@ -939,6 +939,29 @@ fn decodes_zero_limit_mvs_differential_baseline() {
             .rgba()
             .chunks_exact(4)
             .all(|pixel| pixel == [128, 128, 128, 255])
+    );
+}
+
+#[test]
+fn decodes_mvs_full_ac_at_limit_one() {
+    let packet = full_mvs_packet(
+        [1, 1],
+        &[
+            (1, 2),      // differential DCT selector
+            (0, 6),      // one luma coefficient: the DC value only
+            (0, 1),      // unchanged Cr DC baseline
+            (0b1010, 4), // native luminance AC end-of-block
+            (0, 1),      // unchanged Cb DC baseline
+            (0b1010, 4), // native luminance AC end-of-block
+        ],
+    );
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    assert_eq!(
+        decoder
+            .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &packet, &mut framebuffer)
+            .unwrap(),
+        packet.len()
     );
 }
 
@@ -1056,14 +1079,14 @@ fn full_differential_preserves_partial_copy_source() {
     let differential = full_mvs_packet(
         [64, 64],
         &[
-            (0, 2), // first tile is unchanged
-            (1, 2), // refine the second tile without replacing its copy source
-            (1, 6), // two luma coefficients
-            (1, 3), // increase the signed AC coefficient by one
-            (0, 1), // unchanged Cr DC
-            (0, 2), // Cr end-of-block
-            (0, 1), // unchanged Cb DC
-            (0, 2), // Cb end-of-block
+            (0, 2),      // first tile is unchanged
+            (1, 2),      // refine the second tile without replacing its copy source
+            (1, 6),      // two luma coefficients
+            (1, 3),      // increase the signed AC coefficient by one
+            (0, 1),      // unchanged Cr DC
+            (0b1010, 4), // Cr end-of-block in the native luminance AC table
+            (0, 1),      // unchanged Cb DC
+            (0b1010, 4), // Cb end-of-block in the native luminance AC table
         ],
     );
     let replay = full_mvs_packet(
@@ -1323,12 +1346,12 @@ fn decodes_mvs_full_differential_from_zero_initialized_baseline() {
     let packet = full_mvs_packet(
         [64, 64],
         &[
-            (1, 2), // differential DCT selector
-            (0, 6), // one luma coefficient: the DC value only
-            (0, 1), // unchanged Cr DC baseline
-            (0, 2), // Cr AC end-of-block
-            (0, 1), // unchanged Cb DC baseline
-            (0, 2), // Cb AC end-of-block
+            (1, 2),      // differential DCT selector
+            (0, 6),      // one luma coefficient: the DC value only
+            (0, 1),      // unchanged Cr DC baseline
+            (0b1010, 4), // Cr AC end-of-block in the native luminance AC table
+            (0, 1),      // unchanged Cb DC baseline
+            (0b1010, 4), // Cb AC end-of-block in the native luminance AC table
         ],
     );
     let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
