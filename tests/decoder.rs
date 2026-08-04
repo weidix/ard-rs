@@ -1067,6 +1067,111 @@ fn decodes_mvs_partial_repeat_and_left_copy_modes() {
 }
 
 #[test]
+fn mvs_partial_copy_uses_global_source_at_rectangle_edge() {
+    let first_tile = partial_mvs_packet(&[(0, 1), (0, 3), (0, 1), (0x6d, 8)]);
+    let second_tile = partial_mvs_packet(&[(0, 1), (1, 3), (0, 1), (0x6d, 8)]);
+    let below_tile = partial_mvs_packet(&[(0, 1), (2, 3), (0, 1), (0x6d, 8)]);
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(16, 8).unwrap();
+
+    decoder
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &first_tile, &mut framebuffer)
+        .unwrap();
+    decoder
+        .decode_rectangle(
+            Rectangle {
+                x: 8,
+                ..rect(8, 8, Encoding::ArdMvs)
+            },
+            &second_tile,
+            &mut framebuffer,
+        )
+        .unwrap();
+
+    assert!(
+        framebuffer
+            .rgba()
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 255, 255, 255])
+    );
+
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 16).unwrap();
+    decoder
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &first_tile, &mut framebuffer)
+        .unwrap();
+    decoder
+        .decode_rectangle(
+            Rectangle {
+                y: 8,
+                ..rect(8, 8, Encoding::ArdMvs)
+            },
+            &below_tile,
+            &mut framebuffer,
+        )
+        .unwrap();
+    assert!(
+        framebuffer
+            .rgba()
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 255, 255, 255])
+    );
+}
+
+#[test]
+fn mvs_full_copy_without_source_is_a_native_noop() {
+    let packet = full_mvs_packet([0, 0], &[(2, 2)]);
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    framebuffer.rgba_mut().fill(0x5a);
+
+    assert_eq!(
+        decoder
+            .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &packet, &mut framebuffer)
+            .unwrap(),
+        packet.len()
+    );
+    assert!(framebuffer.rgba().iter().all(|&byte| byte == 0x5a));
+
+    let mut gpu_decoder = Decoder::new_gpu_mvs(PixelFormat::XRGB8888).unwrap();
+    let mut gpu_framebuffer = Framebuffer::new(8, 8).unwrap();
+    gpu_decoder
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &packet, &mut gpu_framebuffer)
+        .unwrap();
+    assert!(gpu_decoder.take_gpu_mvs_frames().is_empty());
+}
+
+#[test]
+fn mvs_full_copy_with_stale_source_is_a_native_noop() {
+    let initial = partial_mvs_packet(&[(0, 1), (0, 3), (0, 1), (1, 3), (0, 1), (0x6d, 8)]);
+    let source_refresh = partial_mvs_packet(&[(0, 1), (0, 3), (0, 1), (0x6d, 8)]);
+    let replay = full_mvs_packet([0, 0], &[(0, 2), (2, 2)]);
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(16, 8).unwrap();
+
+    decoder
+        .decode_rectangle(rect(16, 8, Encoding::ArdMvs), &initial, &mut framebuffer)
+        .unwrap();
+    decoder
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &source_refresh,
+            &mut framebuffer,
+        )
+        .unwrap();
+    decoder
+        .decode_rectangle(rect(16, 8, Encoding::ArdMvs), &replay, &mut framebuffer)
+        .unwrap();
+
+    assert!(
+        framebuffer
+            .rgba()
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 255, 255, 255])
+    );
+}
+
+#[test]
 fn invalid_mvs_dct_reuse_is_transactional() {
     let packet = partial_mvs_packet_with_secondary(
         &[

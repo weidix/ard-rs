@@ -336,25 +336,40 @@ impl MvsState {
                 }
                 let mut decoded_dct = None;
                 let mut copy_source = None;
+                let mut emit_update = true;
                 let gpu_tile = match update_type {
                     0 => MvsGpuTile::SolidRgba([255, 255, 255, 255]),
                     1 => {
-                        if tile_x < 8 {
-                            return Err(Error::Invalid("ARD MVS left-copy at rectangle edge"));
-                        }
+                        // Apple indexes copy sources against the complete
+                        // framebuffer, not against this rectangle. A
+                        // rectangle can therefore begin at the second tile
+                        // of a row and copy from the tile immediately to its
+                        // left.
                         copy_source = global_tile.checked_sub(1);
-                        self.tiles[copy_source.expect("left source checked")]
-                            .gpu_tile
-                            .clone()
+                        match copy_source.and_then(|source| self.tiles.get(source)) {
+                            Some(source_state) => source_state.gpu_tile.clone(),
+                            None => {
+                                // The native decoder records an invalid
+                                // source and leaves the destination as-is.
+                                // It does not reject the whole framebuffer
+                                // update.
+                                emit_update = false;
+                                self.tiles[global_tile].gpu_tile.clone()
+                            }
+                        }
                     }
                     2 => {
-                        if tile_y < 8 {
-                            return Err(Error::Invalid("ARD MVS above-copy at rectangle edge"));
-                        }
+                        // As with left-copy, this is a global framebuffer
+                        // lookup. The first local row may copy from the
+                        // preceding global row.
                         copy_source = global_tile.checked_sub(self.tiles_wide);
-                        self.tiles[copy_source.expect("above source checked")]
-                            .gpu_tile
-                            .clone()
+                        match copy_source.and_then(|source| self.tiles.get(source)) {
+                            Some(source_state) => source_state.gpu_tile.clone(),
+                            None => {
+                                emit_update = false;
+                                self.tiles[global_tile].gpu_tile.clone()
+                            }
+                        }
                     }
                     3 => decode_bilevel_gpu_tile(
                         &mut secondary,
@@ -421,13 +436,15 @@ impl MvsState {
                     state.dct_valid = true;
                     state.luma_count = luma_count;
                 }
-                updates.push(MvsGpuTileUpdate {
-                    x: rect.x + tile_x as u16,
-                    y: rect.y + tile_y as u16,
-                    width: tile_width as u8,
-                    height: tile_height as u8,
-                    tile: gpu_tile,
-                });
+                if emit_update {
+                    updates.push(MvsGpuTileUpdate {
+                        x: rect.x + tile_x as u16,
+                        y: rect.y + tile_y as u16,
+                        width: tile_width as u8,
+                        height: tile_height as u8,
+                        tile: gpu_tile,
+                    });
+                }
                 tile_index += 1;
             }
         }
@@ -547,15 +564,19 @@ impl MvsState {
                 }
                 2 => {
                     let state = self.tiles[global_tile].clone();
-                    let source = state
-                        .copy_source
-                        .ok_or(Error::Invalid("ARD MVS copy tile has no source"))?;
-                    let source_state = self
-                        .tiles
-                        .get(source)
-                        .ok_or(Error::Invalid("ARD MVS copy source is outside framebuffer"))?;
+                    // DecodeMVSUpdate treats an absent or stale copy source
+                    // as a no-op. This is common when an automatic update
+                    // contains a full selector for a tile whose partial
+                    // copy metadata was not established in the current
+                    // MVS generation; it is not a malformed wire packet.
+                    let Some(source) = state.copy_source else {
+                        continue;
+                    };
+                    let Some(source_state) = self.tiles.get(source) else {
+                        continue;
+                    };
                     if source_state.generation != state.generation {
-                        return Err(Error::Invalid("stale ARD MVS copy-tile source"));
+                        continue;
                     }
                     let source_x = (source % self.tiles_wide) * 8;
                     let source_y = (source / self.tiles_wide) * 8;

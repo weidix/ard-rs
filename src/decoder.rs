@@ -284,6 +284,9 @@ impl Decoder {
                     !gpu_mvs_output,
                 )?;
                 if gpu_mvs_output {
+                    if tiles.is_empty() {
+                        return Ok(None);
+                    }
                     return Ok(Some(crate::MvsGpuFrame {
                         framebuffer_width: framebuffer.width(),
                         framebuffer_height: framebuffer.height(),
@@ -306,6 +309,9 @@ impl Decoder {
                     !gpu_mvs_output,
                 )?;
                 if gpu_mvs_output {
+                    if tiles.is_empty() {
+                        return Ok(None);
+                    }
                     return Ok(Some(crate::MvsGpuFrame {
                         framebuffer_width: framebuffer.width(),
                         framebuffer_height: framebuffer.height(),
