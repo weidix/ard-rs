@@ -918,7 +918,6 @@ fn decodes_zero_limit_mvs_differential_baseline() {
         &[
             (1, 2),
             (0, 6), // new compact length one
-            (0, 4), // retain the old scan-one value as the new DC
             (0, 1), // unchanged Cr DC
             (0, 1), // unchanged Cb DC
         ],
@@ -939,7 +938,7 @@ fn decodes_zero_limit_mvs_differential_baseline() {
         framebuffer
             .rgba()
             .chunks_exact(4)
-            .all(|pixel| pixel == [160, 160, 160, 255])
+            .all(|pixel| pixel == [128, 128, 128, 255])
     );
 }
 
@@ -950,7 +949,6 @@ fn decodes_mvs_differential_from_native_zero_baseline() {
         &[
             (1, 2), // differential DCT selector
             (0, 6), // one luma coefficient
-            (0, 2), // zero-valued Rice-coded luma DC
             (0, 1), // unchanged Cr DC
             (0, 1), // unchanged Cb DC
         ],
@@ -1318,6 +1316,29 @@ fn decodes_mvs_full_update_skip_tiles_and_markers() {
         packet.len()
     );
     assert!(framebuffer.rgba().iter().all(|&byte| byte == 0x5a));
+}
+
+#[test]
+fn decodes_mvs_full_differential_from_zero_initialized_baseline() {
+    let packet = full_mvs_packet(
+        [64, 64],
+        &[
+            (1, 2), // differential DCT selector
+            (0, 6), // one luma coefficient: the DC value only
+            (0, 1), // unchanged Cr DC baseline
+            (0, 2), // Cr AC end-of-block
+            (0, 1), // unchanged Cb DC baseline
+            (0, 2), // Cb AC end-of-block
+        ],
+    );
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    assert_eq!(
+        decoder
+            .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &packet, &mut framebuffer)
+            .unwrap(),
+        packet.len()
+    );
 }
 
 #[test]

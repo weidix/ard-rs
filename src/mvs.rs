@@ -660,7 +660,10 @@ fn decode_full_differential_tile(
                 signed_delta(old, bits.read(3)? as u8)
             };
         }
-        for scan in old_count..new_count {
+        // Scan 0 is the luma DC value copied above. The native decoder's
+        // coefficient expansion starts its differential AC loop at scan 1,
+        // even when the previous luma block has zero active coefficients.
+        for scan in old_count.max(1)..new_count {
             let old = old_scan_values[scan.max(1)];
             scan_values[scan] = if old == 0 {
                 decode_dc_rice(bits)? as i8
