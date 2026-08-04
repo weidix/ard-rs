@@ -9,6 +9,7 @@ pub enum Error {
         available: usize,
     },
     Invalid(&'static str),
+    UnsupportedServerMessage(u8),
     InvalidMvsDctCacheIndex {
         index: u16,
         reference: &'static str,
@@ -30,6 +31,12 @@ impl fmt::Display for Error {
                 write!(f, "need {needed} bytes, only {available} available")
             }
             Self::Invalid(message) => f.write_str(message),
+            Self::UnsupportedServerMessage(message_type) => {
+                write!(
+                    f,
+                    "unsupported ARD server message type 0x{message_type:02x}"
+                )
+            }
             Self::InvalidMvsDctCacheIndex {
                 index,
                 reference,

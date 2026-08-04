@@ -130,7 +130,7 @@ impl ArdMessageDispatcher {
                     self.buffer.drain(..consumed);
                     messages.push(ArdServerMessage::ServerCutText(text));
                 }
-                _ => return Err(Error::Invalid("unsupported ARD server message type")),
+                other => return Err(Error::UnsupportedServerMessage(other)),
             }
         }
     }
@@ -173,7 +173,7 @@ impl ArdMessageDispatcher {
                     Ok(total)
                 }
             }
-            _ => Err(Error::Invalid("unsupported ARD server message type")),
+            other => Err(Error::UnsupportedServerMessage(other)),
         }
     }
 

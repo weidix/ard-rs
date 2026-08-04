@@ -387,9 +387,15 @@ impl ArdClient {
                     .dispatcher
                     .push(&payload, &mut self.decoder, &mut self.framebuffer)
                     .map_err(|error| {
+                        let payload_prefix = payload
+                            .iter()
+                            .take(32)
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         ArdClientError::Message(format!(
-                            "解析或解码服务端记录 #{record_sequence} 失败（已缓冲 {} 字节）：{error}",
-                            self.dispatcher.buffered_bytes()
+                            "解析或解码服务端记录 #{record_sequence} 失败（已缓冲 {} 字节，负载前缀 {payload_prefix}）：{error}",
+                            self.dispatcher.buffered_bytes(),
                         ))
                     })?;
                 for message in messages {

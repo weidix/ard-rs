@@ -215,7 +215,7 @@ fn dispatcher_rejects_unsupported_message_types_transactionally() {
         dispatcher
             .push(&stream, &mut decoder, &mut framebuffer)
             .unwrap_err(),
-        Error::Invalid("unsupported ARD server message type")
+        Error::UnsupportedServerMessage(0x7f)
     );
     // The failed batch was not consumed; the valid Bell alone still parses.
     assert_eq!(dispatcher.buffered_bytes(), 0);

@@ -28,10 +28,7 @@ enum ViewerEvent {
 struct FramePacket {
     width: u16,
     height: u16,
-    index: u64,
     quality: ArdVideoQuality,
-    frames_per_second: f64,
-    megabits_per_second: f64,
     luminance_quantization: [u16; 64],
     chrominance_quantization: [u16; 64],
     tiles: HashMap<(u16, u16), MvsGpuTileUpdate>,
@@ -39,43 +36,25 @@ struct FramePacket {
 }
 
 impl FramePacket {
-    fn from_mvs(
-        frame: MvsGpuFrame,
-        index: u64,
-        quality: ArdVideoQuality,
-        rates: StreamRates,
-    ) -> Self {
+    fn from_mvs(frame: MvsGpuFrame, quality: ArdVideoQuality) -> Self {
         let mut packet = Self {
             width: frame.framebuffer_width,
             height: frame.framebuffer_height,
-            index,
             quality,
-            frames_per_second: rates.frames_per_second,
-            megabits_per_second: rates.megabits_per_second,
             luminance_quantization: frame.luminance_quantization,
             chrominance_quantization: frame.chrominance_quantization,
-            tiles: HashMap::new(),
+            tiles: HashMap::with_capacity(frame.tiles.len()),
             rgba: None,
         };
-        packet.merge_mvs(frame, index, rates);
+        packet.merge_mvs(frame);
         packet
     }
 
-    fn from_rgba(
-        width: u16,
-        height: u16,
-        rgba: Vec<u8>,
-        index: u64,
-        quality: ArdVideoQuality,
-        rates: StreamRates,
-    ) -> Self {
+    fn from_rgba(width: u16, height: u16, rgba: Vec<u8>, quality: ArdVideoQuality) -> Self {
         Self {
             width,
             height,
-            index,
             quality,
-            frames_per_second: rates.frames_per_second,
-            megabits_per_second: rates.megabits_per_second,
             luminance_quantization: [0; 64],
             chrominance_quantization: [0; 64],
             tiles: HashMap::new(),
@@ -83,23 +62,21 @@ impl FramePacket {
         }
     }
 
-    fn merge_mvs(&mut self, frame: MvsGpuFrame, index: u64, rates: StreamRates) {
+    fn merge_mvs(&mut self, frame: MvsGpuFrame) {
         self.width = frame.framebuffer_width;
         self.height = frame.framebuffer_height;
-        self.index = index;
-        self.frames_per_second = rates.frames_per_second;
-        self.megabits_per_second = rates.megabits_per_second;
         self.luminance_quantization = frame.luminance_quantization;
         self.chrominance_quantization = frame.chrominance_quantization;
+        self.tiles.reserve(frame.tiles.len());
         for tile in frame.tiles {
             self.tiles.insert((tile.x, tile.y), tile);
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct StreamRates {
-    frames_per_second: f64,
+    updates_per_second: f64,
     megabits_per_second: f64,
 }
 
@@ -107,7 +84,6 @@ struct RateMeter {
     window_started: Instant,
     framebuffer_updates: usize,
     wire_bytes: usize,
-    current: StreamRates,
 }
 
 impl RateMeter {
@@ -116,31 +92,31 @@ impl RateMeter {
             window_started: Instant::now(),
             framebuffer_updates: 0,
             wire_bytes: 0,
-            current: StreamRates::default(),
         }
     }
 
-    fn record(&mut self, framebuffer_updates: usize, wire_bytes: usize) -> StreamRates {
+    fn record(&mut self, framebuffer_updates: usize, wire_bytes: usize) -> Option<StreamRates> {
         self.framebuffer_updates = self.framebuffer_updates.saturating_add(framebuffer_updates);
         self.wire_bytes = self.wire_bytes.saturating_add(wire_bytes);
         let elapsed = self.window_started.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let seconds = elapsed.as_secs_f64();
-            self.current = StreamRates {
-                frames_per_second: self.framebuffer_updates as f64 / seconds,
+            let current = StreamRates {
+                updates_per_second: self.framebuffer_updates as f64 / seconds,
                 megabits_per_second: self.wire_bytes as f64 * 8.0 / seconds / 1_000_000.0,
             };
             self.window_started = Instant::now();
             self.framebuffer_updates = 0;
             self.wire_bytes = 0;
+            return Some(current);
         }
-        self.current
+        None
     }
 }
 
 #[derive(Default)]
 struct FrameMailbox {
-    frames: Vec<FramePacket>,
+    latest: Option<FramePacket>,
     rgba_pool: Vec<Vec<u8>>,
 }
 
@@ -151,8 +127,35 @@ struct ViewerApp {
     renderer: Option<Renderer>,
     mailbox: SharedFrameMailbox,
     frame_event_pending: Arc<AtomicBool>,
+    presentation_meter: PresentationMeter,
+    redraw_pending: bool,
     status: String,
     server_name: Option<String>,
+}
+
+struct PresentationMeter {
+    window_started: Instant,
+    presented_frames: usize,
+}
+
+impl PresentationMeter {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            presented_frames: 0,
+        }
+    }
+
+    fn record(&mut self) {
+        self.presented_frames = self.presented_frames.saturating_add(1);
+        let elapsed = self.window_started.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let frames_per_second = self.presented_frames as f64 / elapsed.as_secs_f64();
+            eprintln!("ARD display: {frames_per_second:.1} presents/s");
+            self.window_started = Instant::now();
+            self.presented_frames = 0;
+        }
+    }
 }
 
 impl ViewerApp {
@@ -162,6 +165,8 @@ impl ViewerApp {
             renderer: None,
             mailbox,
             frame_event_pending,
+            presentation_meter: PresentationMeter::new(),
+            redraw_pending: false,
             status: "正在连接…".to_owned(),
             server_name: None,
         }
@@ -176,14 +181,15 @@ impl ViewerApp {
             } else {
                 "GPU MVS"
             };
+            // Do not put changing frame counters or rates in the title. The
+            // title is part of the captured desktop when the viewer connects
+            // to the local ARD server, and changing it per frame creates a
+            // self-sustaining screen-update feedback loop.
             format!(
-                "{server} — {}×{} — {} — {:.1} FPS — ↓{:.2} Mbit/s — 帧 {} — {decoder}",
+                "{server} — {}×{} — {} — {decoder}",
                 frame.width,
                 frame.height,
-                frame.quality.label(),
-                frame.frames_per_second,
-                frame.megabits_per_second,
-                frame.index
+                frame.quality.label()
             )
         } else {
             format!("{WINDOW_TITLE} — {}", self.status)
@@ -213,9 +219,12 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
                 self.window = Some(window);
+                self.process_latest_frame();
             }
             Err(error) => {
                 eprintln!("GPU 初始化失败：{error}");
+                self.status = format!("GPU 初始化失败：{error}");
+                self.update_title(None);
                 event_loop.exit();
             }
         }
@@ -224,32 +233,7 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ViewerEvent) {
         match event {
             ViewerEvent::FrameReady => {
-                let mut frames = {
-                    let mut mailbox = self.mailbox.lock().expect("frame mailbox poisoned");
-                    let frames = core::mem::take(&mut mailbox.frames);
-                    self.frame_event_pending.store(false, Ordering::Release);
-                    frames
-                };
-                for frame in &frames {
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.upload(frame);
-                    }
-                }
-                if let Some(frame) = frames.last() {
-                    self.status = "正在查看".to_owned();
-                    self.update_title(Some(frame));
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
-                let mut mailbox = self.mailbox.lock().expect("frame mailbox poisoned");
-                for frame in &mut frames {
-                    if let Some(buffer) = frame.rgba.take()
-                        && mailbox.rgba_pool.len() < 3
-                    {
-                        mailbox.rgba_pool.push(buffer);
-                    }
-                }
+                self.process_latest_frame();
             }
             ViewerEvent::Status(status) => {
                 self.status = status;
@@ -283,11 +267,61 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.redraw_pending = false;
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.render();
+                    match renderer.render() {
+                        RenderResult::Presented => self.presentation_meter.record(),
+                        RenderResult::Retry => {
+                            self.redraw_pending = true;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                        RenderResult::Skipped => {}
+                    }
+                }
+                if !self.redraw_pending {
+                    self.process_latest_frame();
                 }
             }
             _ => {}
+        }
+    }
+}
+
+impl ViewerApp {
+    fn process_latest_frame(&mut self) {
+        // A user event can be delivered before `resumed` has initialized the
+        // renderer. Leave the mailbox flag set so `resumed` can consume the
+        // frame after GPU initialization instead of dropping the first frame.
+        if self.renderer.is_none() || self.redraw_pending {
+            return;
+        }
+        let frame = {
+            let mut mailbox = self.mailbox.lock().expect("frame mailbox poisoned");
+            let frame = mailbox.latest.take();
+            if frame.is_some() {
+                self.frame_event_pending.store(false, Ordering::Release);
+            }
+            frame
+        };
+        let Some(frame) = frame else { return };
+        if let Some(renderer) = &mut self.renderer {
+            renderer.upload(&frame);
+        }
+        if self.status != "正在查看" {
+            self.status = "正在查看".to_owned();
+            self.update_title(Some(&frame));
+        }
+        if let Some(window) = &self.window {
+            self.redraw_pending = true;
+            window.request_redraw();
+        }
+        let mut mailbox = self.mailbox.lock().expect("frame mailbox poisoned");
+        if let Some(buffer) = frame.rgba
+            && mailbox.rgba_pool.len() < 3
+        {
+            mailbox.rgba_pool.push(buffer);
         }
     }
 }
@@ -321,6 +355,13 @@ struct Renderer {
     quantization_buffer: Option<UploadBuffer>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderResult {
+    Presented,
+    Retry,
+    Skipped,
+}
+
 impl Renderer {
     async fn new(window: Arc<Window>) -> Result<Self, String> {
         let instance = wgpu::Instance::default();
@@ -342,6 +383,12 @@ impl Renderer {
             })
             .await
             .map_err(|error| error.to_string())?;
+        device.on_uncaptured_error(Arc::new(|error| {
+            eprintln!("wgpu uncaptured error: {error}");
+        }));
+        device.set_device_lost_callback(|reason, message| {
+            eprintln!("wgpu device lost ({reason:?}): {message}");
+        });
         let size = window.inner_size();
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -355,14 +402,12 @@ impl Renderer {
         {
             config.format = srgb_format;
         }
-        config.present_mode = if surface_capabilities
-            .present_modes
-            .contains(&wgpu::PresentMode::Mailbox)
-        {
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::AutoNoVsync
-        };
+        // A remote framebuffer is a presentation stream, not an uncapped
+        // compute benchmark. Vsync bounds the number of in-flight surface
+        // textures and prevents a fast ARD update stream from building an
+        // unbounded Metal command backlog while the window can only display
+        // one image per refresh.
+        config.present_mode = wgpu::PresentMode::AutoVsync;
         config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &config);
 
@@ -674,16 +719,17 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self) {
+    fn render(&mut self) -> RenderResult {
         let (output, reconfigure_after_present) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output) => (output, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(output) => (output, true),
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Timeout => return RenderResult::Retry,
+            wgpu::CurrentSurfaceTexture::Occluded => return RenderResult::Skipped,
             wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Lost
             | wgpu::CurrentSurfaceTexture::Validation => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return RenderResult::Retry;
             }
         };
         let view = output
@@ -734,6 +780,7 @@ impl Renderer {
         if reconfigure_after_present {
             self.surface.configure(&self.device, &self.config);
         }
+        RenderResult::Presented
     }
 }
 
@@ -889,20 +936,18 @@ fn start_receiver(
                 }
             };
             let rates = rate_meter.record(info.framebuffer_updates, info.wire_bytes);
+            if let Some(rates) = rates {
+                eprintln!(
+                    "ARD stream: {:.1} updates/s, ↓{:.2} Mbit/s",
+                    rates.updates_per_second, rates.megabits_per_second
+                );
+            }
             let frames = client.take_gpu_mvs_frames();
             let mut queued = mailbox.lock().expect("frame mailbox poisoned");
             if frames.is_empty() {
                 let framebuffer = client.framebuffer();
                 if framebuffer.rgba().is_empty() {
                     continue;
-                }
-                let old_frames = core::mem::take(&mut queued.frames);
-                for mut frame in old_frames {
-                    if let Some(buffer) = frame.rgba.take()
-                        && queued.rgba_pool.len() < 3
-                    {
-                        queued.rgba_pool.push(buffer);
-                    }
                 }
                 let mut rgba = queued.rgba_pool.pop().unwrap_or_default();
                 rgba.clear();
@@ -911,16 +956,17 @@ fn start_receiver(
                     framebuffer.width(),
                     framebuffer.height(),
                     rgba,
-                    info.index,
                     quality,
-                    rates,
                 );
-                // RGBA packets are complete snapshots, so retaining only the
-                // newest one bounds latency and memory when rendering lags.
-                queued.frames.push(packet);
+                if let Some(old) = queued.latest.replace(packet)
+                    && let Some(buffer) = old.rgba
+                    && queued.rgba_pool.len() < 3
+                {
+                    queued.rgba_pool.push(buffer);
+                }
             } else {
                 for frame in frames {
-                    let can_merge = queued.frames.last().is_some_and(|packet| {
+                    let can_merge = queued.latest.as_ref().is_some_and(|packet| {
                         packet.rgba.is_none()
                             && packet.width == frame.framebuffer_width
                             && packet.height == frame.framebuffer_height
@@ -929,14 +975,18 @@ fn start_receiver(
                     });
                     if can_merge {
                         queued
-                            .frames
-                            .last_mut()
+                            .latest
+                            .as_mut()
                             .expect("merge target checked")
-                            .merge_mvs(frame, info.index, rates);
+                            .merge_mvs(frame);
                     } else {
-                        queued
-                            .frames
-                            .push(FramePacket::from_mvs(frame, info.index, quality, rates));
+                        let packet = FramePacket::from_mvs(frame, quality);
+                        if let Some(old) = queued.latest.replace(packet)
+                            && let Some(buffer) = old.rgba
+                            && queued.rgba_pool.len() < 3
+                        {
+                            queued.rgba_pool.push(buffer);
+                        }
                     }
                 }
             }
