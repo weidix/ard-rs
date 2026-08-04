@@ -461,11 +461,6 @@ struct UploadBuffer {
     capacity: u64,
 }
 
-struct PendingMvsDecode {
-    bind_group: wgpu::BindGroup,
-    workgroups: u32,
-}
-
 struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -480,7 +475,11 @@ struct Renderer {
     records_buffer: Option<UploadBuffer>,
     payload_buffer: Option<UploadBuffer>,
     quantization_buffer: Option<UploadBuffer>,
-    pending_mvs_decode: Option<PendingMvsDecode>,
+    records_scratch: Vec<u32>,
+    payload_scratch: Vec<i32>,
+    quantization_scratch: Vec<u32>,
+    mvs_bind_group: Option<wgpu::BindGroup>,
+    pending_mvs_decode: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -649,6 +648,10 @@ impl Renderer {
             records_buffer: None,
             payload_buffer: None,
             quantization_buffer: None,
+            records_scratch: Vec::new(),
+            payload_scratch: Vec::new(),
+            quantization_scratch: Vec::with_capacity(128),
+            mvs_bind_group: None,
             pending_mvs_decode: None,
         })
     }
@@ -695,6 +698,7 @@ impl Renderer {
                 },
             ],
         });
+        self.mvs_bind_group = None;
         self.decoded = Some(DecodedTexture {
             width,
             height,
@@ -759,74 +763,82 @@ impl Renderer {
             return;
         }
         self.ensure_decoded_texture(u32::from(frame.width), u32::from(frame.height));
-        let (records, payload) = pack_gpu_tiles(frame.tiles.iter());
-        let mut quantization = Vec::with_capacity(128);
-        quantization.extend(
+        pack_gpu_tiles(
+            frame.tiles.iter(),
+            &mut self.records_scratch,
+            &mut self.payload_scratch,
+        );
+        self.quantization_scratch.clear();
+        self.quantization_scratch.extend(
             frame
                 .luminance_quantization
                 .iter()
                 .map(|&value| u32::from(value)),
         );
-        quantization.extend(
+        self.quantization_scratch.extend(
             frame
                 .chrominance_quantization
                 .iter()
                 .map(|&value| u32::from(value)),
         );
-        write_storage_buffer(
+        let records_recreated = write_storage_buffer(
             &self.device,
             &self.queue,
             &mut self.records_buffer,
             "MVS tile records",
-            &records,
+            &self.records_scratch,
         );
-        write_storage_buffer(
+        let payload_recreated = write_storage_buffer(
             &self.device,
             &self.queue,
             &mut self.payload_buffer,
             "MVS tile payload",
-            &payload,
+            &self.payload_scratch,
         );
-        write_storage_buffer(
+        let quantization_recreated = write_storage_buffer(
             &self.device,
             &self.queue,
             &mut self.quantization_buffer,
             "MVS quantization tables",
-            &quantization,
+            &self.quantization_scratch,
         );
-        let records_buffer = &self
-            .records_buffer
-            .as_ref()
-            .expect("records uploaded")
-            .buffer;
-        let payload_buffer = &self
-            .payload_buffer
-            .as_ref()
-            .expect("payload uploaded")
-            .buffer;
-        let quantization_buffer = &self
-            .quantization_buffer
-            .as_ref()
-            .expect("quantization uploaded")
-            .buffer;
-        let decoded = self.decoded.as_ref().expect("decoded texture created");
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MVS compute bind group"),
-            layout: &self.compute_layout,
-            entries: &[
-                buffer_entry(0, records_buffer),
-                buffer_entry(1, payload_buffer),
-                buffer_entry(2, quantization_buffer),
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&decoded.storage_view),
-                },
-            ],
-        });
-        self.pending_mvs_decode = Some(PendingMvsDecode {
-            bind_group,
-            workgroups: u32::try_from(frame.tiles.len()).expect("MVS tile count fits u32"),
-        });
+        if records_recreated
+            || payload_recreated
+            || quantization_recreated
+            || self.mvs_bind_group.is_none()
+        {
+            let records_buffer = &self
+                .records_buffer
+                .as_ref()
+                .expect("records uploaded")
+                .buffer;
+            let payload_buffer = &self
+                .payload_buffer
+                .as_ref()
+                .expect("payload uploaded")
+                .buffer;
+            let quantization_buffer = &self
+                .quantization_buffer
+                .as_ref()
+                .expect("quantization uploaded")
+                .buffer;
+            let decoded = self.decoded.as_ref().expect("decoded texture created");
+            self.mvs_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("MVS compute bind group"),
+                layout: &self.compute_layout,
+                entries: &[
+                    buffer_entry(0, records_buffer),
+                    buffer_entry(1, payload_buffer),
+                    buffer_entry(2, quantization_buffer),
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&decoded.storage_view),
+                    },
+                ],
+            }));
+        }
+        self.pending_mvs_decode =
+            Some(u32::try_from(frame.tiles.len()).expect("MVS tile count fits u32"));
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -859,14 +871,20 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("MVS presentation commands"),
             });
-        if let Some(decode) = self.pending_mvs_decode.take() {
+        if let Some(workgroups) = self.pending_mvs_decode.take() {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("GPU MVS tile decode"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.compute_pipeline);
-            pass.set_bind_group(0, &decode.bind_group, &[]);
-            pass.dispatch_workgroups(decode.workgroups, 1, 1);
+            pass.set_bind_group(
+                0,
+                self.mvs_bind_group
+                    .as_ref()
+                    .expect("MVS bind group created"),
+                &[],
+            );
+            pass.dispatch_workgroups(workgroups, 1, 1);
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -931,13 +949,19 @@ fn write_storage_buffer<T: bytemuck::NoUninit>(
     slot: &mut Option<UploadBuffer>,
     label: &str,
     values: &[T],
-) {
+) -> bool {
     let bytes = bytemuck::cast_slice(values);
     let needed = u64::try_from(bytes.len())
         .expect("GPU upload length fits u64")
         .max(4);
-    if slot.as_ref().is_none_or(|upload| upload.capacity < needed) {
-        let capacity = needed.next_power_of_two();
+    let recreated = slot.as_ref().is_none_or(|upload| upload.capacity < needed);
+    if recreated {
+        // Keep a small growth margin for changing tile counts without
+        // reserving nearly twice the live upload size as power-of-two growth
+        // would do for a frame just over a bucket boundary.
+        let capacity = slot.as_ref().map_or(needed, |upload| {
+            needed.max(upload.capacity.saturating_add(upload.capacity / 4))
+        });
         *slot = Some(UploadBuffer {
             buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -953,6 +977,7 @@ fn write_storage_buffer<T: bytemuck::NoUninit>(
         0,
         bytes,
     );
+    recreated
 }
 
 fn buffer_entry<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEntry<'a> {
@@ -962,11 +987,16 @@ fn buffer_entry<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEn
     }
 }
 
-fn pack_gpu_tiles<'a>(tiles: impl Iterator<Item = &'a MvsGpuTileUpdate>) -> (Vec<u32>, Vec<i32>) {
+fn pack_gpu_tiles<'a>(
+    tiles: impl Iterator<Item = &'a MvsGpuTileUpdate>,
+    records: &mut Vec<u32>,
+    payload: &mut Vec<i32>,
+) {
     let tiles = tiles;
     let (tile_count, _) = tiles.size_hint();
-    let mut records = Vec::with_capacity(tile_count.saturating_mul(8));
-    let mut payload = Vec::new();
+    records.clear();
+    payload.clear();
+    records.reserve(tile_count.saturating_mul(8));
     for update in tiles {
         let data_offset = payload.len() as u32;
         let (kind, color) = match &update.tile {
@@ -1007,7 +1037,6 @@ fn pack_gpu_tiles<'a>(tiles: impl Iterator<Item = &'a MvsGpuTileUpdate>) -> (Vec
     if payload.is_empty() {
         payload.push(0);
     }
-    (records, payload)
 }
 
 fn pack_bytes(rgb: [u8; 3], alpha: u8) -> u32 {
@@ -1269,7 +1298,9 @@ mod tests {
             height: 8,
             tile: MvsGpuTile::Dct(coefficients),
         };
-        let (records, payload) = pack_gpu_tiles([&tile].into_iter());
+        let mut records = Vec::new();
+        let mut payload = Vec::new();
+        pack_gpu_tiles([&tile].into_iter(), &mut records, &mut payload);
         assert_eq!(&records[..7], &[8, 16, 8, 8, 4, 0, 0]);
         assert_eq!(payload.len(), 192);
         assert_eq!(payload[0], -12);

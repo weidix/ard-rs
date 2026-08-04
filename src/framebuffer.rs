@@ -104,24 +104,37 @@ impl Framebuffer {
         self.validate_rect(rect)?;
         self.validate_rect(&source)?;
         self.ensure_pixels();
-        let len = usize::from(rect.width)
-            .checked_mul(usize::from(rect.height))
-            .and_then(|pixels| pixels.checked_mul(4))
+        let row_len = usize::from(rect.width)
+            .checked_mul(4)
             .ok_or(Error::LimitExceeded("CopyRect size"))?;
-        let mut copy = Vec::with_capacity(len);
-        for row in 0..rect.height {
-            let start =
-                (usize::from(src_y + row) * usize::from(self.width) + usize::from(src_x)) * 4;
-            let row_len = usize::from(rect.width) * 4;
-            copy.extend_from_slice(&self.rgba[start..start + row_len]);
-        }
-        for row in 0..rect.height {
-            let source_start = usize::from(row) * usize::from(rect.width) * 4;
-            let destination_start =
-                (usize::from(rect.y + row) * usize::from(self.width) + usize::from(rect.x)) * 4;
-            let row_len = usize::from(rect.width) * 4;
-            self.rgba[destination_start..destination_start + row_len]
-                .copy_from_slice(&copy[source_start..source_start + row_len]);
+        let _len = row_len
+            .checked_mul(usize::from(rect.height))
+            .ok_or(Error::LimitExceeded("CopyRect size"))?;
+
+        // `copy_within` is memmove-like, so each row remains overlap-safe
+        // without allocating a second rectangle-sized pixel buffer. Copy
+        // rows in the direction that keeps vertically overlapping rows from
+        // overwriting source data that has not been read yet.
+        let source_y = usize::from(src_y);
+        let destination_y = usize::from(rect.y);
+        let source_x = usize::from(src_x) * 4;
+        let destination_x = usize::from(rect.x) * 4;
+        let framebuffer_row_len = usize::from(self.width) * 4;
+        let rows = usize::from(rect.height);
+        let mut copy_row = |row: usize| {
+            let source_start = (source_y + row) * framebuffer_row_len + source_x;
+            let destination_start = (destination_y + row) * framebuffer_row_len + destination_x;
+            self.rgba
+                .copy_within(source_start..source_start + row_len, destination_start);
+        };
+        if destination_y > source_y {
+            for row in (0..rows).rev() {
+                copy_row(row);
+            }
+        } else {
+            for row in 0..rows {
+                copy_row(row);
+            }
         }
         Ok(())
     }

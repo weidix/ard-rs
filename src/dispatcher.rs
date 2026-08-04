@@ -64,22 +64,18 @@ impl ArdMessageDispatcher {
         }
         let previous_len = self.buffer.len();
         self.buffer.extend_from_slice(input);
-        match self.first_message_len(decoder) {
-            Err(Error::NeedMore { .. }) => return Ok(Vec::new()),
+        let (consumed, messages) = match self.drain_available(decoder, framebuffer) {
+            Ok(result) => result,
             Err(error) => {
+                // `drain_available` parses against an offset and does not
+                // mutate the buffer until the whole batch succeeds. Keeping
+                // the input in place lets this rollback restore the exact
+                // pre-push bytes without cloning a large framebuffer update.
                 self.buffer.truncate(previous_len);
                 return Err(error);
             }
-            Ok(_) => {}
-        }
-
-        // Clone only once a complete message is present. Large framebuffer
-        // updates commonly span many encrypted records; cloning on every
-        // fragment made buffering quadratic in the frame size.
-        let mut next = self.clone();
-        self.buffer.truncate(previous_len);
-        let messages = next.drain_available(decoder, framebuffer)?;
-        *self = next;
+        };
+        self.buffer.drain(..consumed);
         Ok(messages)
     }
 
@@ -91,50 +87,57 @@ impl ArdMessageDispatcher {
         &mut self,
         decoder: &mut Decoder,
         framebuffer: &mut Framebuffer,
-    ) -> Result<Vec<ArdServerMessage>> {
+    ) -> Result<(usize, Vec<ArdServerMessage>)> {
         let mut messages = Vec::new();
+        let mut consumed = 0_usize;
         loop {
-            let Some(message_type) = self.buffer.first().copied() else {
-                return Ok(messages);
+            let buffer = &self.buffer[consumed..];
+            let Some(message_type) = buffer.first().copied() else {
+                return Ok((consumed, messages));
+            };
+            match self.first_message_len(buffer, decoder) {
+                Err(Error::NeedMore { .. }) => return Ok((consumed, messages)),
+                Err(error) => return Err(error),
+                Ok(_) => {}
             };
             match message_type {
                 0 => {
-                    if self.buffer.len() < 4 {
-                        return Ok(messages);
-                    }
-                    let rectangle_count =
-                        usize::from(u16::from_be_bytes([self.buffer[2], self.buffer[3]]));
-                    let consumed =
-                        match parse_complete_framebuffer_update(&self.buffer, decoder, framebuffer)
-                        {
+                    let rectangle_count = usize::from(u16::from_be_bytes([buffer[2], buffer[3]]));
+                    let message_len =
+                        match parse_complete_framebuffer_update(buffer, decoder, framebuffer) {
                             Ok(consumed) => consumed,
-                            Err(Error::NeedMore { .. }) => return Ok(messages),
+                            Err(Error::NeedMore { .. }) => return Ok((consumed, messages)),
                             Err(error) => return Err(error),
                         };
-                    self.buffer.drain(..consumed);
+                    consumed = consumed
+                        .checked_add(message_len)
+                        .ok_or(Error::LimitExceeded("ARD buffered messages"))?;
                     messages.push(ArdServerMessage::FramebufferUpdate {
                         rectangle_count,
-                        bytes: consumed,
+                        bytes: message_len,
                     });
                     if let Some(control) = decoder.take_ard_encryption_control() {
                         messages.push(ArdServerMessage::EncryptionControl(control));
                     }
                 }
                 2 => {
-                    self.buffer.remove(0);
+                    consumed += 1;
                     messages.push(ArdServerMessage::Bell);
                 }
                 3 => {
-                    let (consumed, text) = match self.read_cut_text() {
-                        Ok(message) => message,
-                        Err(Error::NeedMore { .. }) => return Ok(messages),
-                        Err(error) => return Err(error),
-                    };
-                    self.buffer.drain(..consumed);
+                    let (message_len, text) =
+                        match Self::read_cut_text(buffer, self.max_cut_text_bytes) {
+                            Ok(message) => message,
+                            Err(Error::NeedMore { .. }) => return Ok((consumed, messages)),
+                            Err(error) => return Err(error),
+                        };
+                    consumed = consumed
+                        .checked_add(message_len)
+                        .ok_or(Error::LimitExceeded("ARD buffered messages"))?;
                     messages.push(ArdServerMessage::ServerCutText(text));
                 }
                 0x14 => {
-                    self.buffer.drain(..8);
+                    consumed += 8;
                     messages.push(ArdServerMessage::StateChange);
                 }
                 other => return Err(Error::UnsupportedServerMessage(other)),
@@ -142,27 +145,25 @@ impl ArdMessageDispatcher {
         }
     }
 
-    fn first_message_len(&self, decoder: &Decoder) -> Result<usize> {
-        let Some(message_type) = self.buffer.first().copied() else {
+    fn first_message_len(&self, buffer: &[u8], decoder: &Decoder) -> Result<usize> {
+        let Some(message_type) = buffer.first().copied() else {
             return Err(Error::NeedMore {
                 needed: 1,
                 available: 0,
             });
         };
         match message_type {
-            0 => complete_framebuffer_update_len(&self.buffer, decoder),
+            0 => complete_framebuffer_update_len(buffer, decoder),
             2 => Ok(1),
             3 => {
-                if self.buffer.len() < 8 {
+                if buffer.len() < 8 {
                     return Err(Error::NeedMore {
                         needed: 8,
-                        available: self.buffer.len(),
+                        available: buffer.len(),
                     });
                 }
                 let len = usize::try_from(u32::from_be_bytes(
-                    self.buffer[4..8]
-                        .try_into()
-                        .expect("cut text length checked"),
+                    buffer[4..8].try_into().expect("cut text length checked"),
                 ))
                 .map_err(|_| Error::LimitExceeded("ARD cut-text length"))?;
                 if len > self.max_cut_text_bytes {
@@ -171,20 +172,20 @@ impl ArdMessageDispatcher {
                 let total = len
                     .checked_add(8)
                     .ok_or(Error::LimitExceeded("ARD cut-text length"))?;
-                if self.buffer.len() < total {
+                if buffer.len() < total {
                     Err(Error::NeedMore {
                         needed: total,
-                        available: self.buffer.len(),
+                        available: buffer.len(),
                     })
                 } else {
                     Ok(total)
                 }
             }
             0x14 => {
-                if self.buffer.len() < 8 {
+                if buffer.len() < 8 {
                     Err(Error::NeedMore {
                         needed: 8,
-                        available: self.buffer.len(),
+                        available: buffer.len(),
                     })
                 } else {
                     Ok(8)
@@ -194,13 +195,13 @@ impl ArdMessageDispatcher {
         }
     }
 
-    fn read_cut_text(&self) -> Result<(usize, String)> {
-        let mut cursor = Cursor::new(&self.buffer);
+    fn read_cut_text(buffer: &[u8], max_cut_text_bytes: usize) -> Result<(usize, String)> {
+        let mut cursor = Cursor::new(buffer);
         cursor.u8()?;
         cursor.take(3)?;
         let len = usize::try_from(cursor.u32()?)
             .map_err(|_| Error::LimitExceeded("ARD cut-text length"))?;
-        if len > self.max_cut_text_bytes {
+        if len > max_cut_text_bytes {
             return Err(Error::LimitExceeded("ARD cut-text length"));
         }
         let text = core::str::from_utf8(cursor.take(len)?)

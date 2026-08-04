@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::wire::Cursor;
@@ -149,7 +148,11 @@ pub(crate) struct MvsState {
     tiles_wide: usize,
     tiles: Vec<TileState>,
     generation: u32,
-    cache: HashMap<u16, DctTile>,
+    // MVS cache indexes are a bounded dense ring. Keeping the slots directly
+    // avoids hash metadata and makes every cache recall a single indexed
+    // lookup. The vector stays empty until the first DCT tile is cached, so
+    // streams that never use the cache pay no allocation cost.
+    cache: Vec<Option<DctTile>>,
     cache_write_index: u16,
     last_cache_reference: u16,
     cache_insertions: u32,
@@ -164,7 +167,7 @@ impl Default for MvsState {
             tiles_wide: 0,
             tiles: Vec::new(),
             generation: 0,
-            cache: HashMap::new(),
+            cache: Vec::new(),
             cache_write_index: 0,
             last_cache_reference: 0,
             cache_insertions: 0,
@@ -184,7 +187,13 @@ impl MvsState {
             .ok_or(Error::LimitExceeded("ARD MVS framebuffer tile count"))?;
         self.framebuffer_size = size;
         self.tiles_wide = tiles_wide;
-        self.tiles.clear();
+        if self.tiles.capacity() > tile_count {
+            // A DesktopSize reduction should release the old large tile
+            // state instead of retaining its peak allocation indefinitely.
+            self.tiles = Vec::new();
+        } else {
+            self.tiles.clear();
+        }
         self.tiles
             .try_reserve_exact(tile_count)
             .map_err(|_| Error::LimitExceeded("ARD MVS framebuffer tile count"))?;
@@ -197,14 +206,18 @@ impl MvsState {
         let index = next_cache_index(self.cache_write_index);
         self.cache_write_index = index;
         self.cache_insertions = self.cache_insertions.saturating_add(1);
-        self.cache.insert(index, tile);
+        let slot = usize::from(index);
+        if self.cache.len() <= slot {
+            self.cache.resize_with(slot + 1, || None);
+        }
+        self.cache[slot] = Some(tile);
     }
 
     fn cached_tile(&mut self, index: u16) -> Option<DctTile> {
         if index == 0 || index > DCT_CACHE_LAST_INDEX || u32::from(index) > self.cache_insertions {
             return None;
         }
-        let tile = self.cache.get(&index).cloned()?;
+        let tile = self.cache.get(usize::from(index))?.as_ref()?.clone();
         self.last_cache_reference = index;
         Some(tile)
     }
@@ -281,7 +294,7 @@ impl MvsState {
         let mut solid_color = MvsPixel::Rgba([0, 0, 0, 255]);
         // ExpandBlockRice's previous-block pointer is initialized to null for
         // each partial update and advances only within this rectangle.
-        let mut previous_coefficients = None;
+        let mut previous_coefficients: Option<(Arc<[[i16; 64]; 3]>, u8)> = None;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let luminance_quantization = self.luminance_quantization;
@@ -385,7 +398,6 @@ impl MvsState {
                             payload[1],
                             payload[2],
                         )?;
-                        let coefficients = Arc::new(coefficients);
                         decoded_dct = Some((Arc::clone(&coefficients), luma_count));
                         MvsGpuTile::RiceDct(coefficients)
                     }
@@ -506,7 +518,7 @@ impl MvsState {
             match bits.read(2)? {
                 0 => {}
                 1 => {
-                    let baseline = self.tiles[global_tile].clone();
+                    let baseline = &self.tiles[global_tile];
                     let (coefficients, _luma_count) = decode_full_differential_tile(
                         &mut bits,
                         baseline,
@@ -544,19 +556,18 @@ impl MvsState {
                     });
                 }
                 2 => {
-                    let state = self.tiles[global_tile].clone();
                     // DecodeMVSUpdate treats an absent or stale copy source
                     // as a no-op. This is common when an automatic update
                     // contains a full selector for a tile whose partial
                     // copy metadata was not established in the current
                     // MVS generation; it is not a malformed wire packet.
-                    let Some(source) = state.copy_source else {
+                    let Some(source) = self.tiles[global_tile].copy_source else {
                         continue;
                     };
                     let Some(source_state) = self.tiles.get(source) else {
                         continue;
                     };
-                    if source_state.generation != state.generation {
+                    if source_state.generation != self.tiles[global_tile].generation {
                         continue;
                     }
                     let source_x = (source % self.tiles_wide) * 8;
@@ -644,7 +655,7 @@ fn next_cache_index(index: u16) -> u16 {
 
 fn decode_full_differential_tile(
     bits: &mut BitReader<'_>,
-    baseline: TileState,
+    baseline: &TileState,
     luminance_limit: u8,
     chrominance_limit: u8,
 ) -> Result<([[i16; 64]; 3], u8)> {
@@ -892,41 +903,48 @@ fn read_ycbcr20(bits: &mut BitReader<'_>) -> Result<MvsPixel> {
 
 fn decode_rice_dct_coefficients(
     bits: &mut BitReader<'_>,
-    previous_coefficients: &mut Option<([[i16; 64]; 3], u8)>,
+    previous_coefficients: &mut Option<(Arc<[[i16; 64]; 3]>, u8)>,
     luminance_limit: u8,
     chrominance_limit: u8,
-) -> Result<([[i16; 64]; 3], u8)> {
+) -> Result<(Arc<[[i16; 64]; 3]>, u8)> {
     let (coefficients, coefficient_limit) = if bits.read(1)? != 0 {
-        (*previous_coefficients).ok_or(Error::Invalid(
-            "ARD MVS Rice/DCT reuse has no previous block",
-        ))?
+        let Some((coefficients, coefficient_limit)) = previous_coefficients.as_ref() else {
+            return Err(Error::Invalid(
+                "ARD MVS Rice/DCT reuse has no previous block",
+            ));
+        };
+        (Arc::clone(coefficients), *coefficient_limit)
     } else {
-        let previous = (*previous_coefficients)
-            .map(|(coefficients, _)| coefficients)
-            .unwrap_or([[0; 64]; 3]);
         let mut current = [[0_i16; 64]; 3];
         let predictor_mode = bits.read(2)?;
+        let (previous_luma_dc, previous_cb_dc, previous_cr_dc) = previous_coefficients
+            .as_ref()
+            .map_or((0, 0, 0), |(coefficients, _)| {
+                (coefficients[0][0], coefficients[1][0], coefficients[2][0])
+            });
         if predictor_mode & 2 != 0 {
-            current[1][0] = previous[1][0];
-            current[2][0] = previous[2][0];
+            current[1][0] = previous_cb_dc;
+            current[2][0] = previous_cr_dc;
         } else {
-            for component in 1..=2 {
-                let predictor = previous[component][0];
+            for (slot, predictor) in current[1..=2]
+                .iter_mut()
+                .zip([previous_cb_dc, previous_cr_dc])
+            {
                 let delta = decode_dc_rice(bits)?;
-                current[component][0] = predict_chroma_dc(predictor, delta);
+                slot[0] = predict_chroma_dc(predictor, delta);
             }
         }
-        current[0][0] = previous[0][0].wrapping_sub(decode_dc_rice(bits)?);
+        current[0][0] = previous_luma_dc.wrapping_sub(decode_dc_rice(bits)?);
         let coefficient_limit = if predictor_mode & 1 != 0 {
             chrominance_limit
         } else {
             luminance_limit
         };
         decode_ac_rice(bits, &mut current[0], coefficient_limit)?;
-        (current, coefficient_limit)
+        (Arc::new(current), coefficient_limit)
     };
 
-    *previous_coefficients = Some((coefficients, coefficient_limit));
+    *previous_coefficients = Some((Arc::clone(&coefficients), coefficient_limit));
     Ok((coefficients, coefficient_limit))
 }
 
@@ -1150,18 +1168,30 @@ fn coefficient_shift(scan: usize, limit: u8) -> u32 {
 }
 
 fn inverse_dct(coefficients: &[i16; 64], quantization: &[u16; 64]) -> [i32; 64] {
+    // The transform is separable. Keeping the intermediate values in the
+    // same exact integer domain as the original two-dimensional sum reduces
+    // the arithmetic from 64 products per output sample to 16, without
+    // changing the final rounding or clamping.
+    let mut horizontal = [0_i64; 64];
+    for v in 0..8 {
+        for x in 0..8 {
+            let mut sum = 0_i64;
+            for (u, basis_row) in IDCT_BASIS.iter().enumerate() {
+                let index = v * 8 + u;
+                sum += i64::from(coefficients[index])
+                    * i64::from(quantization[index])
+                    * i64::from(basis_row[x]);
+            }
+            horizontal[v * 8 + x] = sum;
+        }
+    }
+
     let mut output = [0_i32; 64];
     for y in 0..8 {
         for x in 0..8 {
             let mut sum = 0_i64;
-            for (v, vertical_basis) in IDCT_BASIS.iter().enumerate() {
-                for (u, horizontal_basis) in IDCT_BASIS.iter().enumerate() {
-                    let index = v * 8 + u;
-                    sum += i64::from(coefficients[index])
-                        * i64::from(quantization[index])
-                        * i64::from(horizontal_basis[x])
-                        * i64::from(vertical_basis[y]);
-                }
+            for v in 0..8 {
+                sum += horizontal[v * 8 + x] * i64::from(IDCT_BASIS[v][y]);
             }
             output[y * 8 + x] = (((sum + (1_i64 << 29)) >> 30) as i32 + 128).clamp(0, 255);
         }
@@ -1234,6 +1264,7 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn read(&mut self, count: u8) -> Result<u32> {
         if count > 32 {
             return Err(Error::Invalid("ARD MVS bit read exceeds 32 bits"));
@@ -1255,16 +1286,33 @@ impl<'a> BitReader<'a> {
             });
         }
 
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let byte_index = self.bit_position / 8;
+        let bit_offset = self.bit_position % 8;
+        if bit_offset + count <= 8 {
+            let shift = 8 - bit_offset - count;
+            let mask = (1_u16 << count) - 1;
+            let value = (u16::from(self.bytes[byte_index]) >> shift) & mask;
+            self.bit_position = end;
+            return Ok(u32::from(value));
+        }
+
         let mut value = 0_u32;
-        let mut position = self.bit_position;
-        while position < end {
-            let bit_offset = position % 8;
-            let take = (8 - bit_offset).min(end - position);
-            let shift = 8 - bit_offset - take;
+        let mut remaining = count;
+        let mut index = byte_index;
+        let mut offset = bit_offset;
+        while remaining != 0 {
+            let take = (8 - offset).min(remaining);
+            let shift = 8 - offset - take;
             let mask = (1_u16 << take) - 1;
-            let chunk = (u16::from(self.bytes[position / 8]) >> shift) & mask;
+            let chunk = (u16::from(self.bytes[index]) >> shift) & mask;
             value = (value << take) | u32::from(chunk);
-            position += take;
+            remaining -= take;
+            index += 1;
+            offset = 0;
         }
         self.bit_position = end;
         Ok(value)
@@ -1302,7 +1350,7 @@ impl<'a> BitReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitReader, MvsState, dc_sample, inverse_dct, predict_chroma_dc};
+    use super::{BitReader, IDCT_BASIS, MvsState, dc_sample, inverse_dct, predict_chroma_dc};
     use crate::Error;
 
     fn bits(bit_string: &str) -> Vec<u8> {
@@ -1391,6 +1439,29 @@ mod tests {
 
         assert_eq!(dc_sample(100, 16), 255);
         assert_eq!(dc_sample(-100, 16), 0);
+    }
+
+    #[test]
+    fn separable_inverse_dct_matches_direct_integer_reference() {
+        let coefficients = core::array::from_fn(|index| ((index * 37 % 65) as i16) - 32);
+        let quantization = core::array::from_fn(|index| (index * 19 % 99 + 1) as u16);
+        let mut expected = [0_i32; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                let mut sum = 0_i64;
+                for (v, vertical_basis) in IDCT_BASIS.iter().enumerate() {
+                    for (u, horizontal_basis) in IDCT_BASIS.iter().enumerate() {
+                        let index = v * 8 + u;
+                        sum += i64::from(coefficients[index])
+                            * i64::from(quantization[index])
+                            * i64::from(horizontal_basis[x])
+                            * i64::from(vertical_basis[y]);
+                    }
+                }
+                expected[y * 8 + x] = (((sum + (1_i64 << 29)) >> 30) as i32 + 128).clamp(0, 255);
+            }
+        }
+        assert_eq!(inverse_dct(&coefficients, &quantization), expected);
     }
 
     #[test]

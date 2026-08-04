@@ -7,6 +7,8 @@ use crate::{
     parse_ard_encryption_control,
 };
 
+const MAX_REUSABLE_ZRLE_SCRATCH: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeLimits {
     pub max_rectangles: usize,
@@ -28,7 +30,7 @@ pub struct Decoder {
     pixel_format: PixelFormat,
     limits: DecodeLimits,
     streams: [Decompress; 5],
-    zlib_scratch: [Vec<u8>; 4],
+    zlib_scratch: [Vec<u8>; 5],
     mvs: MvsState,
     pending_encryption_control: Option<ArdEncryptionControl>,
     gpu_mvs_output: bool,
@@ -238,6 +240,7 @@ impl Decoder {
                 framebuffer,
                 self.limits.max_decompressed_bytes,
                 self.gpu_mvs_output,
+                transactional,
             )?;
             self.mvs = next_mvs;
             if let Some(frame) = frame {
@@ -251,6 +254,7 @@ impl Decoder {
                 framebuffer,
                 self.limits.max_decompressed_bytes,
                 self.gpu_mvs_output,
+                transactional,
             )?;
             if let Some(frame) = frame {
                 self.pending_gpu_mvs_frames.push(frame);
@@ -266,6 +270,7 @@ impl Decoder {
         framebuffer: &mut Framebuffer,
         max_decompressed_bytes: usize,
         gpu_mvs_output: bool,
+        transactional: bool,
     ) -> Result<Option<crate::MvsGpuFrame>> {
         let update_type = *update
             .first()
@@ -300,14 +305,32 @@ impl Decoder {
                 if rect.width == 0 || rect.height == 0 {
                     return Err(Error::Invalid("zero-sized ARD MVS image update"));
                 }
-                let mut next_framebuffer = framebuffer.clone();
-                let tiles = mvs.decode_full_update(
-                    rect,
-                    update,
-                    &mut next_framebuffer,
-                    max_decompressed_bytes,
-                    !gpu_mvs_output,
-                )?;
+                let tiles = if transactional && !gpu_mvs_output {
+                    let mut next_framebuffer = framebuffer.clone();
+                    let tiles = mvs.decode_full_update(
+                        rect,
+                        update,
+                        &mut next_framebuffer,
+                        max_decompressed_bytes,
+                        true,
+                    )?;
+                    *framebuffer = next_framebuffer;
+                    tiles
+                } else {
+                    // Complete live messages are already fully framed. The
+                    // non-transactional path can decode directly into the
+                    // framebuffer; a failed live decode terminates the
+                    // session, so retaining a full-frame rollback copy only
+                    // wastes CPU and memory. GPU MVS also has no CPU pixels
+                    // to clone in the first place.
+                    mvs.decode_full_update(
+                        rect,
+                        update,
+                        framebuffer,
+                        max_decompressed_bytes,
+                        !gpu_mvs_output,
+                    )?
+                };
                 if gpu_mvs_output {
                     if tiles.is_empty() {
                         return Ok(None);
@@ -319,8 +342,6 @@ impl Decoder {
                         chrominance_quantization: *mvs.quantization_tables().1,
                         tiles,
                     }));
-                } else {
-                    *framebuffer = next_framebuffer;
                 }
             }
             _ => return Err(Error::Invalid("invalid ARD MVS update type")),
@@ -435,23 +456,33 @@ impl Decoder {
             return Err(Error::LimitExceeded("ZRLE compressed data"));
         }
         let compressed = cursor.take(compressed_len)?;
+        let pixel_format = self.pixel_format;
         let decoded = decompress_available(
             &mut self.streams[4],
             compressed,
             self.limits.max_decompressed_bytes,
+            &mut self.zlib_scratch[4],
         )?;
-        self.blit_zrle_tiles(rect, &decoded, framebuffer)?;
+        let result = Self::blit_zrle_tiles(pixel_format, rect, decoded, framebuffer);
+        if self.zlib_scratch[4].capacity() > MAX_REUSABLE_ZRLE_SCRATCH {
+            // Very large one-off frames should not permanently pin a full
+            // decompressed framebuffer-sized buffer in the decoder.
+            self.zlib_scratch[4] = Vec::new();
+        }
+        result?;
         Ok(cursor.position())
     }
 
     fn blit_zrle_tiles(
-        &self,
+        pixel_format: PixelFormat,
         rect: Rectangle,
         bytes: &[u8],
         framebuffer: &mut Framebuffer,
     ) -> Result<()> {
         let mut cursor = Cursor::new(bytes);
-        let cpixel = compact_pixel_bytes(self.pixel_format)?;
+        let cpixel = compact_pixel_bytes(pixel_format)?;
+        let mut palette = Vec::with_capacity(127);
+        let mut pixels = Vec::with_capacity(64 * 64);
         for tile_y in (0..rect.height).step_by(64) {
             let tile_height = (rect.height - tile_y).min(64);
             for tile_x in (0..rect.width).step_by(64) {
@@ -463,15 +494,15 @@ impl Decoder {
                 if palette_size > 127 {
                     return Err(Error::Invalid("invalid ZRLE palette size"));
                 }
-                let mut palette = Vec::with_capacity(palette_size);
+                palette.clear();
                 for _ in 0..palette_size {
-                    palette.push(self.decode_compact_pixel(cursor.take(cpixel)?)?);
+                    palette.push(decode_compact_pixel(pixel_format, cursor.take(cpixel)?)?);
                 }
-                let mut pixels = Vec::with_capacity(count);
+                pixels.clear();
                 match (rle, palette_size) {
                     (false, 0) => {
                         for _ in 0..count {
-                            pixels.push(self.decode_compact_pixel(cursor.take(cpixel)?)?);
+                            pixels.push(decode_compact_pixel(pixel_format, cursor.take(cpixel)?)?);
                         }
                     }
                     (false, 1) => pixels.resize(count, palette[0]),
@@ -494,7 +525,7 @@ impl Decoder {
                     }
                     (true, 0) => {
                         while pixels.len() < count {
-                            let pixel = self.decode_compact_pixel(cursor.take(cpixel)?)?;
+                            let pixel = decode_compact_pixel(pixel_format, cursor.take(cpixel)?)?;
                             let run = read_run_length(&mut cursor)?;
                             append_run(&mut pixels, pixel, run, count)?;
                         }
@@ -517,7 +548,7 @@ impl Decoder {
                     }
                     _ => return Err(Error::Invalid("unknown ZRLE subencoding")),
                 }
-                for (index, pixel) in pixels.into_iter().enumerate() {
+                for (index, &pixel) in pixels.iter().enumerate() {
                     let x = index % usize::from(tile_width);
                     let y = index / usize::from(tile_width);
                     framebuffer.set_pixel(
@@ -533,28 +564,28 @@ impl Decoder {
         }
         Ok(())
     }
+}
 
-    fn decode_compact_pixel(&self, bytes: &[u8]) -> Result<[u8; 4]> {
-        let bpp = self.pixel_format.bytes_per_pixel()?;
-        if bpp != 4 || compact_pixel_bytes(self.pixel_format)? == 4 {
-            return self.pixel_format.decode_pixel(bytes);
-        }
-        let omitted_numeric_lane = compact_omitted_lane(self.pixel_format)?;
-        let mut expanded = [0; 4];
-        let mut compact_index = 0;
-        for (wire_index, slot) in expanded.iter_mut().enumerate() {
-            let numeric_lane = if self.pixel_format.big_endian {
-                3 - wire_index
-            } else {
-                wire_index
-            };
-            if numeric_lane != omitted_numeric_lane {
-                *slot = bytes[compact_index];
-                compact_index += 1;
-            }
-        }
-        self.pixel_format.decode_pixel(&expanded)
+fn decode_compact_pixel(pixel_format: PixelFormat, bytes: &[u8]) -> Result<[u8; 4]> {
+    let bpp = pixel_format.bytes_per_pixel()?;
+    if bpp != 4 || compact_pixel_bytes(pixel_format)? == 4 {
+        return pixel_format.decode_pixel(bytes);
     }
+    let omitted_numeric_lane = compact_omitted_lane(pixel_format)?;
+    let mut expanded = [0; 4];
+    let mut compact_index = 0;
+    for (wire_index, slot) in expanded.iter_mut().enumerate() {
+        let numeric_lane = if pixel_format.big_endian {
+            3 - wire_index
+        } else {
+            wire_index
+        };
+        if numeric_lane != omitted_numeric_lane {
+            *slot = bytes[compact_index];
+            compact_index += 1;
+        }
+    }
+    pixel_format.decode_pixel(&expanded)
 }
 
 fn pixel_count(rect: Rectangle) -> Result<usize> {
@@ -604,8 +635,13 @@ fn decompress_exact<'a>(
     Ok(output.as_slice())
 }
 
-fn decompress_available(stream: &mut Decompress, input: &[u8], max: usize) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
+fn decompress_available<'a>(
+    stream: &mut Decompress,
+    input: &[u8],
+    max: usize,
+    output: &'a mut Vec<u8>,
+) -> Result<&'a [u8]> {
+    output.clear();
     let mut consumed = 0;
     while consumed < input.len() {
         if output.len() == max {
@@ -639,7 +675,7 @@ fn decompress_available(stream: &mut Decompress, input: &[u8], max: usize) -> Re
     if consumed != input.len() {
         return Err(Error::Decompression);
     }
-    Ok(output)
+    Ok(output.as_slice())
 }
 
 fn blit_pixels(
@@ -665,7 +701,10 @@ fn blit_pixels(
                 .chunks_exact(4)
                 .zip(destination_row.chunks_exact_mut(4))
             {
-                target.copy_from_slice(&[source[2], source[1], source[0], 255]);
+                target[0] = source[2];
+                target[1] = source[1];
+                target[2] = source[0];
+                target[3] = 255;
             }
         }
         return Ok(());

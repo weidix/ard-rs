@@ -84,13 +84,37 @@ fn decode_tiles(
     let data_offset = records[record + 5u];
     let packed_color = records[record + 6u];
     let pixel_index = local.y * 8u + local.x;
-    for (var component = 0u; component < 3u; component++) {
-        let needs_component = kind == 4u || (kind == 5u && component == 0u);
-        var horizontal = 0.0;
-        if (needs_component) {
-            horizontal = horizontal_idct_sample(component, local.x, local.y, data_offset);
+
+    // Solid and literal-pixel tiles do not need the shared IDCT workspace or
+    // a workgroup barrier. They are common in ARD's adaptive stream, so keep
+    // their fast path entirely in registers.
+    if (kind < 4u) {
+        if (!invocation_is_active) {
+            return;
         }
-        idct_horizontal[component * 64u + pixel_index] = horizontal;
+        var color: vec4<f32>;
+        switch kind {
+            case 0u: {
+                color = ycbcr_to_rgb(unpack_ycbcr(packed_color));
+            }
+            case 1u: {
+                color = unpack_rgba(packed_color);
+            }
+            case 2u: {
+                color = ycbcr_to_rgb(unpack_ycbcr(u32(payload[data_offset + pixel_index])));
+            }
+            default: {
+                color = unpack_rgba(u32(payload[data_offset + pixel_index]));
+            }
+        }
+        textureStore(output_image, vec2<u32>(records[record] + local.x, records[record + 1u] + local.y), color);
+        return;
+    }
+
+    idct_horizontal[pixel_index] = horizontal_idct_sample(0u, local.x, local.y, data_offset);
+    if (kind == 4u) {
+        idct_horizontal[64u + pixel_index] = horizontal_idct_sample(1u, local.x, local.y, data_offset);
+        idct_horizontal[128u + pixel_index] = horizontal_idct_sample(2u, local.x, local.y, data_offset);
     }
     workgroupBarrier();
     if (!invocation_is_active) {

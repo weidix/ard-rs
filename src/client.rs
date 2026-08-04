@@ -457,15 +457,17 @@ fn read_exact_vector(stream: &mut TcpStream, len: usize) -> io::Result<Vec<u8>> 
 }
 
 fn read_encrypted_record_wire(stream: &mut TcpStream) -> Result<Vec<u8>, ArdClientError> {
-    let length = read_exact_vector(stream, 2)?;
-    let ciphertext_len = usize::from(u16::from_be_bytes([length[0], length[1]]));
+    let mut length = [0_u8; 2];
+    stream.read_exact(&mut length)?;
+    let ciphertext_len = usize::from(u16::from_be_bytes(length));
     if ciphertext_len == 0 || !ciphertext_len.is_multiple_of(16) {
         return Err(ArdClientError::Message(
             "invalid encrypted-record length".to_owned(),
         ));
     }
-    let mut wire = length;
-    wire.extend_from_slice(&read_exact_vector(stream, ciphertext_len)?);
+    let mut wire = vec![0_u8; 2 + ciphertext_len];
+    wire[..2].copy_from_slice(&length);
+    stream.read_exact(&mut wire[2..])?;
     Ok(wire)
 }
 

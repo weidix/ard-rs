@@ -236,14 +236,18 @@ impl ArdSessionRecordDecoder {
             return Err(Error::Invalid("invalid encrypted-record payload length"));
         }
 
-        let payload = plaintext[2..payload_end].to_vec();
+        // The checksum has already been verified. Compact the payload in the
+        // decrypted record buffer instead of allocating a second Vec and
+        // copying the payload into it.
+        plaintext.copy_within(2..payload_end, 0);
+        plaintext.truncate(payload_len);
         self.chaining_value = next_chaining_value;
         if self.sequence == u32::MAX {
             self.exhausted = true;
         } else {
             self.sequence += 1;
         }
-        Ok(payload)
+        Ok(plaintext)
     }
 }
 
@@ -315,21 +319,20 @@ impl ArdSessionRecordEncoder {
         let checksum_offset = ciphertext_len - 20;
         let payload_len = u16::try_from(payload.len())
             .map_err(|_| Error::LimitExceeded("encrypted-record plaintext"))?;
-        let mut ciphertext = vec![0; ciphertext_len];
+        let mut wire = vec![0; 2 + ciphertext_len];
+        wire[..2].copy_from_slice(&wire_len.to_be_bytes());
+        let ciphertext = &mut wire[2..];
         ciphertext[..2].copy_from_slice(&payload_len.to_be_bytes());
         ciphertext[2..2 + payload.len()].copy_from_slice(payload);
         let checksum = record_checksum(self.sequence, &ciphertext[..checksum_offset]);
         ciphertext[checksum_offset..].copy_from_slice(&checksum);
 
-        self.chaining_value = cbc_encrypt(&self.cipher, self.chaining_value, &mut ciphertext);
+        self.chaining_value = cbc_encrypt(&self.cipher, self.chaining_value, ciphertext);
         if self.sequence == u32::MAX {
             self.exhausted = true;
         } else {
             self.sequence += 1;
         }
-        let mut wire = Vec::with_capacity(2 + ciphertext_len);
-        wire.extend_from_slice(&wire_len.to_be_bytes());
-        wire.extend_from_slice(&ciphertext);
         Ok(wire)
     }
 }
