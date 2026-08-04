@@ -34,6 +34,7 @@ pub enum ArdServerMessage {
 #[derive(Debug, Clone)]
 pub struct ArdMessageDispatcher {
     buffer: Vec<u8>,
+    read_offset: usize,
     max_message_bytes: usize,
     max_cut_text_bytes: usize,
 }
@@ -45,6 +46,7 @@ impl ArdMessageDispatcher {
         }
         Ok(Self {
             buffer: Vec::new(),
+            read_offset: 0,
             max_message_bytes,
             max_cut_text_bytes,
         })
@@ -59,7 +61,7 @@ impl ArdMessageDispatcher {
         decoder: &mut Decoder,
         framebuffer: &mut Framebuffer,
     ) -> Result<Vec<ArdServerMessage>> {
-        if input.len() > self.max_message_bytes.saturating_sub(self.buffer.len()) {
+        if input.len() > self.max_message_bytes.saturating_sub(self.buffered_bytes()) {
             return Err(Error::LimitExceeded("ARD buffered messages"));
         }
         let previous_len = self.buffer.len();
@@ -75,12 +77,31 @@ impl ArdMessageDispatcher {
                 return Err(error);
             }
         };
-        self.buffer.drain(..consumed);
+        self.read_offset = self.read_offset.saturating_add(consumed);
+        self.compact_consumed();
         Ok(messages)
     }
 
     pub fn buffered_bytes(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len().saturating_sub(self.read_offset)
+    }
+
+    fn compact_consumed(&mut self) {
+        if self.read_offset == 0 {
+            return;
+        }
+        if self.read_offset == self.buffer.len() {
+            self.buffer.clear();
+            self.read_offset = 0;
+            return;
+        }
+        if self.read_offset < 4096 || self.read_offset < self.buffer.len() / 2 {
+            return;
+        }
+        let remaining = self.buffer.len() - self.read_offset;
+        self.buffer.copy_within(self.read_offset.., 0);
+        self.buffer.truncate(remaining);
+        self.read_offset = 0;
     }
 
     fn drain_available(
@@ -91,7 +112,8 @@ impl ArdMessageDispatcher {
         let mut messages = Vec::new();
         let mut consumed = 0_usize;
         loop {
-            let buffer = &self.buffer[consumed..];
+            let buffer_start = self.read_offset.saturating_add(consumed);
+            let buffer = &self.buffer[buffer_start..];
             let Some(message_type) = buffer.first().copied() else {
                 return Ok((consumed, messages));
             };

@@ -30,3 +30,8 @@ naga = { version = "30.0.0", features = ["wgsl-in"] }
 name = "ard-viewer"
 path = "src/bin/ard-viewer.rs"
 required-features = ["viewer"]
+
+[[example]]
+name = "live_metrics"
+path = "examples/live_metrics.rs"
+required-features = ["viewer"]

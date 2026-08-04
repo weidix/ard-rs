@@ -209,14 +209,26 @@ impl ArdSessionRecordDecoder {
     }
 
     pub fn decode(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let mut plaintext = ciphertext.to_vec();
+        self.decode_in_place(&mut plaintext)?;
+        Ok(plaintext)
+    }
+
+    /// Decodes one complete record in the caller-owned buffer.
+    ///
+    /// The live client reads exactly one record at a time and terminates the
+    /// session on a framing or checksum error. Reusing that buffer avoids a
+    /// second allocation and copy for every encrypted record while retaining
+    /// the transactional state update: the CBC chain and sequence advance
+    /// only after all validation succeeds.
+    pub(crate) fn decode_in_place(&mut self, plaintext: &mut Vec<u8>) -> Result<()> {
         if self.exhausted {
             return Err(Error::Invalid("ARD session sequence exhausted"));
         }
-        if ciphertext.len() < 32 || !ciphertext.len().is_multiple_of(16) {
+        if plaintext.len() < 32 || !plaintext.len().is_multiple_of(16) {
             return Err(Error::Invalid("invalid encrypted-record ciphertext length"));
         }
-        let mut plaintext = ciphertext.to_vec();
-        let next_chaining_value = cbc_decrypt(&self.cipher, self.chaining_value, &mut plaintext);
+        let next_chaining_value = cbc_decrypt(&self.cipher, self.chaining_value, plaintext);
         let checksum_offset = plaintext
             .len()
             .checked_sub(20)
@@ -247,7 +259,7 @@ impl ArdSessionRecordDecoder {
         } else {
             self.sequence += 1;
         }
-        Ok(plaintext)
+        Ok(())
     }
 }
 
@@ -378,6 +390,15 @@ impl ArdVerifiedRecordStream {
         Ok(plaintexts)
     }
 
+    /// Decodes one already-framed server record without cloning the stream
+    /// state or allocating a plaintext buffer. This is intentionally kept
+    /// separate from [`Self::push`], whose public API remains transactional
+    /// for arbitrary fragmented input.
+    #[cfg(feature = "viewer")]
+    pub(crate) fn decode_record_in_place(&mut self, ciphertext: &mut Vec<u8>) -> Result<()> {
+        self.decoder.decode_in_place(ciphertext)
+    }
+
     pub fn sequence(&self) -> u32 {
         self.decoder.sequence()
     }
@@ -419,7 +440,7 @@ fn cbc_encrypt(cipher: &Aes128, mut previous: [u8; 16], bytes: &mut [u8]) -> [u8
 
 #[cfg(test)]
 mod tests {
-    use super::{cbc_decrypt, cbc_encrypt};
+    use super::{ArdSessionRecordDecoder, ArdSessionRecordEncoder, cbc_decrypt, cbc_encrypt};
     use aes::Aes128;
     use aes::cipher::{KeyInit, generic_array::GenericArray};
 
@@ -455,5 +476,38 @@ mod tests {
             expected[16..]
         );
         assert_eq!(encrypted, plaintext);
+    }
+
+    #[test]
+    fn in_place_record_decode_matches_allocating_decode() {
+        let session_value = [0x2b; 16];
+        let initial_chaining_value = [0x07; 16];
+        let mut encoder = ArdSessionRecordEncoder::new_with_initial_chaining_value(
+            session_value,
+            initial_chaining_value,
+            u16::MAX as usize,
+        )
+        .unwrap();
+        let wire = encoder.encode_wire(b"reused record buffer").unwrap();
+
+        let mut allocating = ArdSessionRecordDecoder::new_with_initial_chaining_value(
+            session_value,
+            initial_chaining_value,
+            u16::MAX as usize,
+        )
+        .unwrap();
+        let expected = allocating.decode(&wire[2..]).unwrap();
+
+        let mut in_place = ArdSessionRecordDecoder::new_with_initial_chaining_value(
+            session_value,
+            initial_chaining_value,
+            u16::MAX as usize,
+        )
+        .unwrap();
+        let mut buffer = wire[2..].to_vec();
+        in_place.decode_in_place(&mut buffer).unwrap();
+
+        assert_eq!(buffer, expected);
+        assert_eq!(in_place.sequence(), allocating.sequence());
     }
 }

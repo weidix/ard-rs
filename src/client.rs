@@ -153,6 +153,7 @@ pub struct ArdClient {
     dispatcher: ArdMessageDispatcher,
     decoder: Decoder,
     framebuffer: Framebuffer,
+    record_scratch: Vec<u8>,
     server_name: String,
     frame_index: u64,
     automatic_updates: bool,
@@ -344,6 +345,7 @@ impl ArdClient {
             dispatcher: ArdMessageDispatcher::new(MAX_MESSAGE_BYTES, MAX_CUT_TEXT_BYTES)?,
             decoder,
             framebuffer,
+            record_scratch: Vec::new(),
             server_name: server_init.name,
             frame_index: 0,
             automatic_updates: config.automatic_updates,
@@ -364,50 +366,58 @@ impl ArdClient {
         self.decoder.take_gpu_mvs_frames()
     }
 
+    pub fn drain_gpu_mvs_frames(&mut self, visit: impl FnMut(crate::MvsGpuFrame)) {
+        self.decoder.drain_gpu_mvs_frames(visit);
+    }
+
     pub fn next_frame(&mut self) -> Result<ArdFrameInfo, ArdClientError> {
         let mut wire_bytes = 0_usize;
         loop {
             let record_sequence = self.verified.sequence();
-            let wire = read_encrypted_record_wire(&mut self.stream).map_err(|error| {
-                ArdClientError::Message(format!(
-                    "读取服务端加密记录 #{record_sequence} 失败：{error}"
-                ))
-            })?;
-            wire_bytes = wire_bytes.saturating_add(wire.len());
+            let wire_bytes_for_record =
+                read_encrypted_record(&mut self.stream, &mut self.record_scratch).map_err(
+                    |error| {
+                        ArdClientError::Message(format!(
+                            "读取服务端加密记录 #{record_sequence} 失败：{error}"
+                        ))
+                    },
+                )?;
+            wire_bytes = wire_bytes.saturating_add(wire_bytes_for_record);
             let mut framebuffer_updates = 0_usize;
             let mut rectangle_count = 0_usize;
             let mut payload_bytes = 0_usize;
-            let payloads = self.verified.push(&wire).map_err(|error| {
-                ArdClientError::Message(format!(
-                    "校验或解密服务端记录 #{record_sequence} 失败：{error}"
-                ))
-            })?;
-            for payload in payloads {
-                let messages = self
-                    .dispatcher
-                    .push(&payload, &mut self.decoder, &mut self.framebuffer)
-                    .map_err(|error| {
-                        let payload_prefix = payload
-                            .iter()
-                            .take(32)
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        ArdClientError::Message(format!(
-                            "解析或解码服务端记录 #{record_sequence} 失败（已缓冲 {} 字节，负载前缀 {payload_prefix}）：{error}",
-                            self.dispatcher.buffered_bytes(),
-                        ))
-                    })?;
-                for message in messages {
-                    if let ArdServerMessage::FramebufferUpdate {
-                        rectangle_count: rectangles,
-                        bytes,
-                    } = message
-                    {
-                        framebuffer_updates = framebuffer_updates.saturating_add(1);
-                        rectangle_count = rectangle_count.saturating_add(rectangles);
-                        payload_bytes = payload_bytes.saturating_add(bytes);
-                    }
+            self.verified
+                .decode_record_in_place(&mut self.record_scratch)
+                .map_err(|error| {
+                    ArdClientError::Message(format!(
+                        "校验或解密服务端记录 #{record_sequence} 失败：{error}"
+                    ))
+                })?;
+            let payload = &self.record_scratch;
+            let messages = self
+                .dispatcher
+                .push(payload, &mut self.decoder, &mut self.framebuffer)
+                .map_err(|error| {
+                    let payload_prefix = payload
+                        .iter()
+                        .take(32)
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ArdClientError::Message(format!(
+                        "解析或解码服务端记录 #{record_sequence} 失败（已缓冲 {} 字节，负载前缀 {payload_prefix}）：{error}",
+                        self.dispatcher.buffered_bytes(),
+                    ))
+                })?;
+            for message in messages {
+                if let ArdServerMessage::FramebufferUpdate {
+                    rectangle_count: rectangles,
+                    bytes,
+                } = message
+                {
+                    framebuffer_updates = framebuffer_updates.saturating_add(1);
+                    rectangle_count = rectangle_count.saturating_add(rectangles);
+                    payload_bytes = payload_bytes.saturating_add(bytes);
                 }
             }
             if framebuffer_updates == 0 {
@@ -456,7 +466,10 @@ fn read_exact_vector(stream: &mut TcpStream, len: usize) -> io::Result<Vec<u8>> 
     Ok(bytes)
 }
 
-fn read_encrypted_record_wire(stream: &mut TcpStream) -> Result<Vec<u8>, ArdClientError> {
+fn read_encrypted_record(
+    stream: &mut TcpStream,
+    ciphertext: &mut Vec<u8>,
+) -> Result<usize, ArdClientError> {
     let mut length = [0_u8; 2];
     stream.read_exact(&mut length)?;
     let ciphertext_len = usize::from(u16::from_be_bytes(length));
@@ -465,10 +478,9 @@ fn read_encrypted_record_wire(stream: &mut TcpStream) -> Result<Vec<u8>, ArdClie
             "invalid encrypted-record length".to_owned(),
         ));
     }
-    let mut wire = vec![0_u8; 2 + ciphertext_len];
-    wire[..2].copy_from_slice(&length);
-    stream.read_exact(&mut wire[2..])?;
-    Ok(wire)
+    ciphertext.resize(ciphertext_len, 0);
+    stream.read_exact(ciphertext)?;
+    Ok(2 + ciphertext_len)
 }
 
 fn read_encryption_control(

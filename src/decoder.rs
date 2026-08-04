@@ -31,6 +31,8 @@ pub struct Decoder {
     limits: DecodeLimits,
     streams: [Decompress; 5],
     zlib_scratch: [Vec<u8>; 5],
+    zrle_palette_scratch: Vec<[u8; 4]>,
+    zrle_pixels_scratch: Vec<[u8; 4]>,
     mvs: MvsState,
     pending_encryption_control: Option<ArdEncryptionControl>,
     gpu_mvs_output: bool,
@@ -51,6 +53,8 @@ impl Decoder {
             // grayscale, thousands, full-colour zlib, and ZRLE.
             streams: core::array::from_fn(|_| Decompress::new(true)),
             zlib_scratch: core::array::from_fn(|_| Vec::new()),
+            zrle_palette_scratch: Vec::new(),
+            zrle_pixels_scratch: Vec::new(),
             mvs: MvsState::default(),
             pending_encryption_control: None,
             gpu_mvs_output: false,
@@ -70,6 +74,14 @@ impl Decoder {
 
     pub fn take_gpu_mvs_frames(&mut self) -> Vec<crate::MvsGpuFrame> {
         core::mem::take(&mut self.pending_gpu_mvs_frames)
+    }
+
+    /// Delivers pending GPU frames while retaining the decoder's outer frame
+    /// vector allocation for the next update.
+    pub fn drain_gpu_mvs_frames(&mut self, mut visit: impl FnMut(crate::MvsGpuFrame)) {
+        for frame in self.pending_gpu_mvs_frames.drain(..) {
+            visit(frame);
+        }
     }
 
     pub fn limits(&self) -> DecodeLimits {
@@ -463,7 +475,14 @@ impl Decoder {
             self.limits.max_decompressed_bytes,
             &mut self.zlib_scratch[4],
         )?;
-        let result = Self::blit_zrle_tiles(pixel_format, rect, decoded, framebuffer);
+        let result = Self::blit_zrle_tiles(
+            pixel_format,
+            rect,
+            decoded,
+            framebuffer,
+            &mut self.zrle_palette_scratch,
+            &mut self.zrle_pixels_scratch,
+        );
         if self.zlib_scratch[4].capacity() > MAX_REUSABLE_ZRLE_SCRATCH {
             // Very large one-off frames should not permanently pin a full
             // decompressed framebuffer-sized buffer in the decoder.
@@ -478,11 +497,11 @@ impl Decoder {
         rect: Rectangle,
         bytes: &[u8],
         framebuffer: &mut Framebuffer,
+        palette: &mut Vec<[u8; 4]>,
+        pixels: &mut Vec<[u8; 4]>,
     ) -> Result<()> {
         let mut cursor = Cursor::new(bytes);
         let cpixel = compact_pixel_bytes(pixel_format)?;
-        let mut palette = Vec::with_capacity(127);
-        let mut pixels = Vec::with_capacity(64 * 64);
         for tile_y in (0..rect.height).step_by(64) {
             let tile_height = (rect.height - tile_y).min(64);
             for tile_x in (0..rect.width).step_by(64) {
@@ -519,15 +538,15 @@ impl Decoder {
                             tile_width,
                             tile_height,
                             bits,
-                            &palette,
-                            &mut pixels,
+                            palette,
+                            pixels,
                         )?;
                     }
                     (true, 0) => {
                         while pixels.len() < count {
                             let pixel = decode_compact_pixel(pixel_format, cursor.take(cpixel)?)?;
                             let run = read_run_length(&mut cursor)?;
-                            append_run(&mut pixels, pixel, run, count)?;
+                            append_run(pixels, pixel, run, count)?;
                         }
                     }
                     (true, 1..=127) => {
@@ -543,7 +562,7 @@ impl Decoder {
                             } else {
                                 1
                             };
-                            append_run(&mut pixels, pixel, run, count)?;
+                            append_run(pixels, pixel, run, count)?;
                         }
                     }
                     _ => return Err(Error::Invalid("unknown ZRLE subencoding")),

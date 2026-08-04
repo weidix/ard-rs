@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+#[cfg(test)]
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const WINDOW_TITLE: &str = "ard-rs Viewer";
+const MAX_RGBA_POOL: usize = 2;
 
 #[derive(Debug)]
 enum ViewerEvent {
@@ -45,6 +47,8 @@ const MAX_DENSE_TILE_SLOTS: usize = 1_048_576;
 /// unusually large protocol dimensions so a malicious size cannot force a
 /// large slot table.
 struct TileSet {
+    width: u16,
+    height: u16,
     tiles_wide: usize,
     storage: TileStorage,
 }
@@ -53,15 +57,22 @@ enum TileStorage {
     Dense {
         slots: Vec<u32>,
         tiles: Vec<MvsGpuTileUpdate>,
+        dirty_bits: Vec<u64>,
+        dirty_positions: Vec<usize>,
     },
-    Sparse(HashMap<(u16, u16), MvsGpuTileUpdate>),
+    Sparse {
+        tiles: HashMap<(u16, u16), MvsGpuTileUpdate>,
+        dirty: HashSet<(u16, u16)>,
+    },
 }
 
+#[cfg(test)]
 enum TileSetIter<'a> {
     Dense(slice::Iter<'a, MvsGpuTileUpdate>),
     Sparse(std::collections::hash_map::Values<'a, (u16, u16), MvsGpuTileUpdate>),
 }
 
+#[cfg(test)]
 impl<'a> Iterator for TileSetIter<'a> {
     type Item = &'a MvsGpuTileUpdate;
 
@@ -80,64 +91,247 @@ impl TileSet {
         let tile_count = tiles_wide.saturating_mul(tiles_high);
         if tile_count <= MAX_DENSE_TILE_SLOTS {
             Self {
+                width,
+                height,
                 tiles_wide,
                 storage: TileStorage::Dense {
                     slots: vec![EMPTY_TILE_SLOT; tile_count],
                     tiles: Vec::with_capacity(expected_tiles),
+                    dirty_bits: vec![0; tile_count.div_ceil(64)],
+                    dirty_positions: Vec::with_capacity(expected_tiles),
                 },
             }
         } else {
             Self {
+                width,
+                height,
                 tiles_wide,
-                storage: TileStorage::Sparse(HashMap::with_capacity(expected_tiles)),
+                storage: TileStorage::Sparse {
+                    tiles: HashMap::with_capacity(expected_tiles),
+                    dirty: HashSet::with_capacity(expected_tiles),
+                },
             }
         }
     }
 
+    fn from_updates(width: u16, height: u16, updates: Vec<MvsGpuTileUpdate>) -> Self {
+        let tiles_wide = usize::from(width).div_ceil(8);
+        let tiles_high = usize::from(height).div_ceil(8);
+        let tile_count = tiles_wide.saturating_mul(tiles_high);
+        let expected_tiles = updates.len();
+        if tile_count <= MAX_DENSE_TILE_SLOTS {
+            let mut slots = vec![EMPTY_TILE_SLOT; tile_count];
+            let mut dirty_bits = vec![0; tile_count.div_ceil(64)];
+            let mut dirty_positions = Vec::with_capacity(expected_tiles);
+            let mut unique_slots = true;
+            for (position, update) in updates.iter().enumerate() {
+                let slot = (usize::from(update.y) / 8)
+                    .saturating_mul(tiles_wide)
+                    .saturating_add(usize::from(update.x) / 8);
+                let Some(slot_position) = slots.get_mut(slot) else {
+                    unique_slots = false;
+                    break;
+                };
+                if *slot_position != EMPTY_TILE_SLOT {
+                    unique_slots = false;
+                    break;
+                }
+                *slot_position = u32::try_from(position).expect("MVS tile count fits u32");
+                let word = slot / 64;
+                dirty_bits[word] |= 1_u64 << (slot % 64);
+                dirty_positions.push(position);
+            }
+            if unique_slots {
+                return Self {
+                    width,
+                    height,
+                    tiles_wide,
+                    storage: TileStorage::Dense {
+                        slots,
+                        tiles: updates,
+                        dirty_bits,
+                        dirty_positions,
+                    },
+                };
+            }
+        } else {
+            let mut tiles = HashMap::with_capacity(expected_tiles);
+            let mut dirty = HashSet::with_capacity(expected_tiles);
+            for update in updates {
+                let key = (update.x, update.y);
+                tiles.insert(key, update);
+                dirty.insert(key);
+            }
+            return Self {
+                width,
+                height,
+                tiles_wide,
+                storage: TileStorage::Sparse { tiles, dirty },
+            };
+        }
+
+        let mut set = Self::new(width, height, expected_tiles);
+        for update in updates {
+            set.insert_force_dirty(update);
+        }
+        set
+    }
+
     fn insert(&mut self, update: MvsGpuTileUpdate) {
+        self.insert_inner(update, false);
+    }
+
+    fn insert_force_dirty(&mut self, update: MvsGpuTileUpdate) {
+        self.insert_inner(update, true);
+    }
+
+    fn insert_inner(&mut self, update: MvsGpuTileUpdate, force_dirty: bool) {
         match &mut self.storage {
-            TileStorage::Dense { slots, tiles } => {
+            TileStorage::Dense {
+                slots,
+                tiles,
+                dirty_bits,
+                dirty_positions,
+            } => {
                 let slot = (usize::from(update.y) / 8)
                     .saturating_mul(self.tiles_wide)
                     .saturating_add(usize::from(update.x) / 8);
                 if let Some(position) = slots.get_mut(slot) {
-                    if *position == EMPTY_TILE_SLOT {
-                        *position = u32::try_from(tiles.len()).expect("MVS tile count fits u32");
+                    let mut changed = force_dirty;
+                    let position = if *position == EMPTY_TILE_SLOT {
+                        let slot_position =
+                            u32::try_from(tiles.len()).expect("MVS tile count fits u32");
+                        *position = slot_position;
                         tiles.push(update);
+                        changed = true;
+                        slot_position as usize
                     } else {
-                        let current = &tiles[*position as usize];
-                        if current.x != update.x
+                        let position = *position as usize;
+                        let current = &tiles[position];
+                        if force_dirty
+                            || current.x != update.x
                             || current.y != update.y
                             || current.width != update.width
                             || current.height != update.height
                             || !same_mvs_tile(&current.tile, &update.tile)
                         {
-                            tiles[*position as usize] = update;
+                            tiles[position] = update;
+                            changed = true;
+                        }
+                        position
+                    };
+                    if changed {
+                        let word = slot / 64;
+                        let mask = 1_u64 << (slot % 64);
+                        if dirty_bits[word] & mask == 0 {
+                            dirty_bits[word] |= mask;
+                            dirty_positions.push(position);
                         }
                     }
                 }
             }
-            TileStorage::Sparse(tiles) => {
+            TileStorage::Sparse { tiles, dirty } => {
+                let key = (update.x, update.y);
+                let changed = force_dirty
+                    || tiles.get(&key).is_none_or(|current| {
+                        current.width != update.width
+                            || current.height != update.height
+                            || !same_mvs_tile(&current.tile, &update.tile)
+                    });
                 tiles.insert((update.x, update.y), update);
+                if changed {
+                    dirty.insert(key);
+                }
             }
         }
     }
 
-    fn len(&self) -> usize {
-        match &self.storage {
-            TileStorage::Dense { tiles, .. } => tiles.len(),
-            TileStorage::Sparse(tiles) => tiles.len(),
+    fn merge(&mut self, other: TileSet, force_dirty: bool) {
+        match other.storage {
+            TileStorage::Dense { tiles, .. } => {
+                for update in tiles {
+                    if force_dirty {
+                        self.insert_force_dirty(update);
+                    } else {
+                        self.insert(update);
+                    }
+                }
+            }
+            TileStorage::Sparse { tiles, .. } => {
+                for (_, update) in tiles {
+                    if force_dirty {
+                        self.insert_force_dirty(update);
+                    } else {
+                        self.insert(update);
+                    }
+                }
+            }
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    fn clear_dirty(&mut self) {
+        match &mut self.storage {
+            TileStorage::Dense {
+                dirty_bits,
+                dirty_positions,
+                ..
+            } => {
+                dirty_bits.fill(0);
+                dirty_positions.clear();
+            }
+            TileStorage::Sparse { dirty, .. } => dirty.clear(),
+        }
     }
 
+    fn matches_dimensions(&self, width: u16, height: u16) -> bool {
+        (self.width, self.height) == (width, height)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match &self.storage {
+            TileStorage::Dense { tiles, .. } => tiles.len(),
+            TileStorage::Sparse { tiles, .. } => tiles.len(),
+        }
+    }
+
+    #[cfg(test)]
     fn iter(&self) -> TileSetIter<'_> {
         match &self.storage {
             TileStorage::Dense { tiles, .. } => TileSetIter::Dense(tiles.iter()),
-            TileStorage::Sparse(tiles) => TileSetIter::Sparse(tiles.values()),
+            TileStorage::Sparse { tiles, .. } => TileSetIter::Sparse(tiles.values()),
+        }
+    }
+
+    fn dirty_len(&self) -> usize {
+        match &self.storage {
+            TileStorage::Dense {
+                dirty_positions, ..
+            } => dirty_positions.len(),
+            TileStorage::Sparse { dirty, .. } => dirty.len(),
+        }
+    }
+
+    fn for_each_dirty(&self, mut visit: impl FnMut(&MvsGpuTileUpdate)) {
+        match &self.storage {
+            TileStorage::Dense {
+                tiles,
+                dirty_positions,
+                ..
+            } => {
+                for &position in dirty_positions {
+                    if let Some(update) = tiles.get(position) {
+                        visit(update);
+                    }
+                }
+            }
+            TileStorage::Sparse { tiles, dirty } => {
+                for key in dirty {
+                    if let Some(update) = tiles.get(key) {
+                        visit(update);
+                    }
+                }
+            }
         }
     }
 }
@@ -149,28 +343,28 @@ fn same_mvs_tile(left: &MvsGpuTile, right: &MvsGpuTile) -> bool {
         (MvsGpuTile::PixelsYcbcr(left), MvsGpuTile::PixelsYcbcr(right)) => left == right,
         (MvsGpuTile::PixelsRgba(left), MvsGpuTile::PixelsRgba(right)) => left == right,
         (MvsGpuTile::RiceDct(left), MvsGpuTile::RiceDct(right))
-        | (MvsGpuTile::Dct(left), MvsGpuTile::Dct(right)) => Arc::ptr_eq(left, right),
+        | (MvsGpuTile::Dct(left), MvsGpuTile::Dct(right)) => {
+            Arc::ptr_eq(left, right) || left == right
+        }
         _ => false,
     }
 }
 
 impl FramePacket {
     fn from_mvs(frame: MvsGpuFrame, quality: ArdVideoQuality) -> Self {
-        let mut packet = Self {
+        Self {
             width: frame.framebuffer_width,
             height: frame.framebuffer_height,
             quality,
             luminance_quantization: frame.luminance_quantization,
             chrominance_quantization: frame.chrominance_quantization,
-            tiles: TileSet::new(
+            tiles: TileSet::from_updates(
                 frame.framebuffer_width,
                 frame.framebuffer_height,
-                frame.tiles.len(),
+                frame.tiles,
             ),
             rgba: None,
-        };
-        packet.merge_mvs(frame);
-        packet
+        }
     }
 
     fn from_rgba(width: u16, height: u16, rgba: Vec<u8>, quality: ArdVideoQuality) -> Self {
@@ -427,21 +621,22 @@ impl ViewerApp {
             }
             frame
         };
-        let Some(frame) = frame else { return };
-        if let Some(renderer) = &mut self.renderer {
-            renderer.upload(&frame);
-        }
+        let Some(mut frame) = frame else { return };
+        let changed = self
+            .renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.upload(&mut frame));
         if self.status != "正在查看" {
             self.status = "正在查看".to_owned();
             self.update_title(Some(&frame));
         }
-        if let Some(window) = &self.window {
+        if changed && let Some(window) = &self.window {
             self.redraw_pending = true;
             window.request_redraw();
         }
         let mut mailbox = self.mailbox.lock().expect("frame mailbox poisoned");
         if let Some(buffer) = frame.rgba
-            && mailbox.rgba_pool.len() < 3
+            && mailbox.rgba_pool.len() < MAX_RGBA_POOL
         {
             mailbox.rgba_pool.push(buffer);
         }
@@ -478,6 +673,8 @@ struct Renderer {
     records_scratch: Vec<u32>,
     payload_scratch: Vec<i32>,
     quantization_scratch: Vec<u32>,
+    uploaded_quantization: Option<([u16; 64], [u16; 64])>,
+    uploaded_mvs_tiles: Option<TileSet>,
     mvs_bind_group: Option<wgpu::BindGroup>,
     pending_mvs_decode: Option<u32>,
 }
@@ -651,18 +848,20 @@ impl Renderer {
             records_scratch: Vec::new(),
             payload_scratch: Vec::new(),
             quantization_scratch: Vec::with_capacity(128),
+            uploaded_quantization: None,
+            uploaded_mvs_tiles: None,
             mvs_bind_group: None,
             pending_mvs_decode: None,
         })
     }
 
-    fn ensure_decoded_texture(&mut self, width: u32, height: u32) {
+    fn ensure_decoded_texture(&mut self, width: u32, height: u32) -> bool {
         if self
             .decoded
             .as_ref()
             .is_some_and(|decoded| decoded.width == width && decoded.height == height)
         {
-            return;
+            return false;
         }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("GPU-decoded MVS framebuffer"),
@@ -706,33 +905,34 @@ impl Renderer {
             storage_view,
             render_bind_group,
         });
+        true
     }
 
-    fn upload(&mut self, frame: &FramePacket) {
+    fn upload(&mut self, frame: &mut FramePacket) -> bool {
         if frame.rgba.is_some() {
-            self.upload_rgba(frame);
+            self.upload_rgba(frame)
         } else {
-            self.upload_mvs(frame);
+            self.upload_mvs(frame)
         }
     }
 
-    fn upload_rgba(&mut self, frame: &FramePacket) {
+    fn upload_rgba(&mut self, frame: &FramePacket) -> bool {
         let Some(rgba) = frame.rgba.as_deref() else {
-            return;
+            return false;
         };
         let width = u32::from(frame.width);
         let height = u32::from(frame.height);
         let Some(bytes_per_row) = width.checked_mul(4) else {
-            return;
+            return false;
         };
         let Some(expected_len) = usize::try_from(bytes_per_row)
             .ok()
             .and_then(|row| row.checked_mul(usize::try_from(height).ok()?))
         else {
-            return;
+            return false;
         };
         if rgba.len() != expected_len {
-            return;
+            return false;
         }
         self.pending_mvs_decode = None;
         self.ensure_decoded_texture(width, height);
@@ -756,30 +956,43 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        true
     }
 
-    fn upload_mvs(&mut self, frame: &FramePacket) {
-        if frame.tiles.is_empty() {
-            return;
+    fn upload_mvs(&mut self, frame: &mut FramePacket) -> bool {
+        let incoming_tiles = std::mem::replace(&mut frame.tiles, TileSet::new(0, 0, 0));
+        let texture_recreated =
+            self.ensure_decoded_texture(u32::from(frame.width), u32::from(frame.height));
+        let same_dimensions = self
+            .uploaded_mvs_tiles
+            .as_ref()
+            .is_some_and(|tiles| tiles.matches_dimensions(frame.width, frame.height));
+        let quantization = (frame.luminance_quantization, frame.chrominance_quantization);
+        let quantization_changed =
+            self.uploaded_quantization != Some(quantization) || self.quantization_buffer.is_none();
+        let mut uploaded_tiles = if same_dimensions {
+            let mut uploaded_tiles = self
+                .uploaded_mvs_tiles
+                .take()
+                .expect("MVS tile dimensions checked");
+            uploaded_tiles.merge(incoming_tiles, texture_recreated || quantization_changed);
+            uploaded_tiles
+        } else {
+            // FramePacket construction marks every tile in a new MVS state
+            // dirty, so the first upload can take ownership of its storage
+            // directly instead of rebuilding a second TileSet.
+            incoming_tiles
+        };
+        let dirty_tiles = uploaded_tiles.dirty_len();
+        if dirty_tiles == 0 {
+            uploaded_tiles.clear_dirty();
+            self.uploaded_mvs_tiles = Some(uploaded_tiles);
+            return false;
         }
-        self.ensure_decoded_texture(u32::from(frame.width), u32::from(frame.height));
-        pack_gpu_tiles(
-            frame.tiles.iter(),
+        pack_dirty_gpu_tiles(
+            &uploaded_tiles,
             &mut self.records_scratch,
             &mut self.payload_scratch,
-        );
-        self.quantization_scratch.clear();
-        self.quantization_scratch.extend(
-            frame
-                .luminance_quantization
-                .iter()
-                .map(|&value| u32::from(value)),
-        );
-        self.quantization_scratch.extend(
-            frame
-                .chrominance_quantization
-                .iter()
-                .map(|&value| u32::from(value)),
         );
         let records_recreated = write_storage_buffer(
             &self.device,
@@ -795,13 +1008,32 @@ impl Renderer {
             "MVS tile payload",
             &self.payload_scratch,
         );
-        let quantization_recreated = write_storage_buffer(
-            &self.device,
-            &self.queue,
-            &mut self.quantization_buffer,
-            "MVS quantization tables",
-            &self.quantization_scratch,
-        );
+        let quantization_recreated = if quantization_changed {
+            self.quantization_scratch.clear();
+            self.quantization_scratch.extend(
+                frame
+                    .luminance_quantization
+                    .iter()
+                    .map(|&value| u32::from(value)),
+            );
+            self.quantization_scratch.extend(
+                frame
+                    .chrominance_quantization
+                    .iter()
+                    .map(|&value| u32::from(value)),
+            );
+            let recreated = write_storage_buffer(
+                &self.device,
+                &self.queue,
+                &mut self.quantization_buffer,
+                "MVS quantization tables",
+                &self.quantization_scratch,
+            );
+            self.uploaded_quantization = Some(quantization);
+            recreated
+        } else {
+            false
+        };
         if records_recreated
             || payload_recreated
             || quantization_recreated
@@ -838,7 +1070,10 @@ impl Renderer {
             }));
         }
         self.pending_mvs_decode =
-            Some(u32::try_from(frame.tiles.len()).expect("MVS tile count fits u32"));
+            Some(u32::try_from(dirty_tiles).expect("MVS tile count fits u32"));
+        uploaded_tiles.clear_dirty();
+        self.uploaded_mvs_tiles = Some(uploaded_tiles);
+        true
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -987,6 +1222,7 @@ fn buffer_entry<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEn
     }
 }
 
+#[cfg(test)]
 fn pack_gpu_tiles<'a>(
     tiles: impl Iterator<Item = &'a MvsGpuTileUpdate>,
     records: &mut Vec<u32>,
@@ -998,45 +1234,59 @@ fn pack_gpu_tiles<'a>(
     payload.clear();
     records.reserve(tile_count.saturating_mul(8));
     for update in tiles {
-        let data_offset = payload.len() as u32;
-        let (kind, color) = match &update.tile {
-            MvsGpuTile::SolidYcbcr(sample) => (0, pack_bytes(*sample, 255)),
-            MvsGpuTile::SolidRgba(rgba) => (1, u32::from_le_bytes(*rgba)),
-            MvsGpuTile::PixelsYcbcr(samples) => {
-                payload.extend(samples.iter().map(|&sample| pack_bytes(sample, 255) as i32));
-                (2, 0)
-            }
-            MvsGpuTile::PixelsRgba(samples) => {
-                payload.extend(samples.iter().map(|&rgba| u32::from_le_bytes(rgba) as i32));
-                (3, 0)
-            }
-            MvsGpuTile::RiceDct(coefficients) => {
-                for component in coefficients.iter() {
-                    payload.extend(component.iter().map(|&value| i32::from(value)));
-                }
-                (5, 0)
-            }
-            MvsGpuTile::Dct(coefficients) => {
-                for component in coefficients.iter() {
-                    payload.extend(component.iter().map(|&value| i32::from(value)));
-                }
-                (4, 0)
-            }
-        };
-        records.extend_from_slice(&[
-            u32::from(update.x),
-            u32::from(update.y),
-            u32::from(update.width),
-            u32::from(update.height),
-            kind,
-            data_offset,
-            color,
-            0,
-        ]);
+        pack_one_gpu_tile(update, records, payload);
     }
     if payload.is_empty() {
         payload.push(0);
     }
+}
+
+fn pack_dirty_gpu_tiles(tiles: &TileSet, records: &mut Vec<u32>, payload: &mut Vec<i32>) {
+    records.clear();
+    payload.clear();
+    records.reserve(tiles.dirty_len().saturating_mul(8));
+    tiles.for_each_dirty(|update| pack_one_gpu_tile(update, records, payload));
+    if payload.is_empty() {
+        payload.push(0);
+    }
+}
+
+fn pack_one_gpu_tile(update: &MvsGpuTileUpdate, records: &mut Vec<u32>, payload: &mut Vec<i32>) {
+    let data_offset = payload.len() as u32;
+    let (kind, color) = match &update.tile {
+        MvsGpuTile::SolidYcbcr(sample) => (0, pack_bytes(*sample, 255)),
+        MvsGpuTile::SolidRgba(rgba) => (1, u32::from_le_bytes(*rgba)),
+        MvsGpuTile::PixelsYcbcr(samples) => {
+            payload.extend(samples.iter().map(|&sample| pack_bytes(sample, 255) as i32));
+            (2, 0)
+        }
+        MvsGpuTile::PixelsRgba(samples) => {
+            payload.extend(samples.iter().map(|&rgba| u32::from_le_bytes(rgba) as i32));
+            (3, 0)
+        }
+        MvsGpuTile::RiceDct(coefficients) => {
+            for component in coefficients.iter() {
+                payload.extend(component.iter().map(|&value| i32::from(value)));
+            }
+            (5, 0)
+        }
+        MvsGpuTile::Dct(coefficients) => {
+            for component in coefficients.iter() {
+                payload.extend(component.iter().map(|&value| i32::from(value)));
+            }
+            (4, 0)
+        }
+    };
+    records.extend_from_slice(&[
+        u32::from(update.x),
+        u32::from(update.y),
+        u32::from(update.width),
+        u32::from(update.height),
+        kind,
+        data_offset,
+        color,
+        0,
+    ]);
 }
 
 fn pack_bytes(rgb: [u8; 3], alpha: u8) -> u32 {
@@ -1099,9 +1349,34 @@ fn start_receiver(
                     rates.updates_per_second, rates.megabits_per_second
                 );
             }
-            let frames = client.take_gpu_mvs_frames();
             let mut queued = mailbox.lock().expect("frame mailbox poisoned");
-            if frames.is_empty() {
+            let mut has_gpu_frames = false;
+            client.drain_gpu_mvs_frames(|frame| {
+                has_gpu_frames = true;
+                let can_merge = queued.latest.as_ref().is_some_and(|packet| {
+                    packet.rgba.is_none()
+                        && packet.width == frame.framebuffer_width
+                        && packet.height == frame.framebuffer_height
+                        && packet.luminance_quantization == frame.luminance_quantization
+                        && packet.chrominance_quantization == frame.chrominance_quantization
+                });
+                if can_merge {
+                    queued
+                        .latest
+                        .as_mut()
+                        .expect("merge target checked")
+                        .merge_mvs(frame);
+                } else {
+                    let packet = FramePacket::from_mvs(frame, quality);
+                    if let Some(old) = queued.latest.replace(packet)
+                        && let Some(buffer) = old.rgba
+                        && queued.rgba_pool.len() < MAX_RGBA_POOL
+                    {
+                        queued.rgba_pool.push(buffer);
+                    }
+                }
+            });
+            if !has_gpu_frames {
                 let framebuffer = client.framebuffer();
                 if framebuffer.rgba().is_empty() {
                     continue;
@@ -1117,34 +1392,9 @@ fn start_receiver(
                 );
                 if let Some(old) = queued.latest.replace(packet)
                     && let Some(buffer) = old.rgba
-                    && queued.rgba_pool.len() < 3
+                    && queued.rgba_pool.len() < MAX_RGBA_POOL
                 {
                     queued.rgba_pool.push(buffer);
-                }
-            } else {
-                for frame in frames {
-                    let can_merge = queued.latest.as_ref().is_some_and(|packet| {
-                        packet.rgba.is_none()
-                            && packet.width == frame.framebuffer_width
-                            && packet.height == frame.framebuffer_height
-                            && packet.luminance_quantization == frame.luminance_quantization
-                            && packet.chrominance_quantization == frame.chrominance_quantization
-                    });
-                    if can_merge {
-                        queued
-                            .latest
-                            .as_mut()
-                            .expect("merge target checked")
-                            .merge_mvs(frame);
-                    } else {
-                        let packet = FramePacket::from_mvs(frame, quality);
-                        if let Some(old) = queued.latest.replace(packet)
-                            && let Some(buffer) = old.rgba
-                            && queued.rgba_pool.len() < 3
-                        {
-                            queued.rgba_pool.push(buffer);
-                        }
-                    }
                 }
             }
             if !frame_event_pending.swap(true, Ordering::AcqRel) {
@@ -1247,7 +1497,7 @@ fn main() {
 mod tests {
     use std::time::Duration;
 
-    use super::{TileSet, fitted_viewport, pack_gpu_tiles, parse_cli_args};
+    use super::{TileSet, fitted_viewport, pack_dirty_gpu_tiles, pack_gpu_tiles, parse_cli_args};
     use ard_rs::{ArdVideoQuality, MvsGpuTile, MvsGpuTileUpdate};
 
     #[test]
@@ -1328,6 +1578,64 @@ mod tests {
         let update = tiles.iter().next().expect("tile was inserted");
         assert_eq!(tiles.len(), 1);
         assert_eq!((update.width, update.height), (8, 8));
+    }
+
+    #[test]
+    fn tile_set_tracks_only_changed_tiles_for_incremental_uploads() {
+        let mut tiles = TileSet::new(16, 16, 2);
+        let update = MvsGpuTileUpdate {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+            tile: MvsGpuTile::SolidRgba([1, 2, 3, 255]),
+        };
+        tiles.insert(update.clone());
+        tiles.insert(update.clone());
+        assert_eq!(tiles.dirty_len(), 1);
+
+        tiles.insert(MvsGpuTileUpdate {
+            x: 8,
+            y: 0,
+            width: 8,
+            height: 8,
+            tile: update.tile,
+        });
+        assert_eq!(tiles.dirty_len(), 2);
+
+        let mut records = Vec::new();
+        let mut payload = Vec::new();
+        pack_dirty_gpu_tiles(&tiles, &mut records, &mut payload);
+        assert_eq!(records.len(), 2 * 8);
+    }
+
+    #[test]
+    fn tile_set_from_updates_preserves_unique_and_duplicate_updates() {
+        let first = MvsGpuTileUpdate {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+            tile: MvsGpuTile::SolidRgba([1, 2, 3, 255]),
+        };
+        let second = MvsGpuTileUpdate {
+            x: 8,
+            y: 0,
+            width: 8,
+            height: 8,
+            tile: MvsGpuTile::SolidRgba([4, 5, 6, 255]),
+        };
+        let unique = TileSet::from_updates(16, 8, vec![first.clone(), second.clone()]);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique.dirty_len(), 2);
+
+        let replacement = MvsGpuTileUpdate {
+            tile: MvsGpuTile::SolidRgba([7, 8, 9, 255]),
+            ..first.clone()
+        };
+        let duplicate = TileSet::from_updates(16, 8, vec![first, replacement.clone()]);
+        assert_eq!(duplicate.len(), 1);
+        assert_eq!(duplicate.iter().next(), Some(&replacement));
     }
 
     #[test]
