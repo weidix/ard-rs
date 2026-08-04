@@ -206,6 +206,29 @@ fn dispatcher_buffers_partial_cut_text() {
 }
 
 #[test]
+fn dispatcher_handles_native_state_change_message() {
+    let message = [0x14, 0, 0, 4, 0, 1, 0, 0x0c];
+    let mut dispatcher = ArdMessageDispatcher::new(1024, 1024).unwrap();
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(1, 1).unwrap();
+
+    assert_eq!(
+        dispatcher
+            .push(&message[..3], &mut decoder, &mut framebuffer)
+            .unwrap(),
+        Vec::<ArdServerMessage>::new()
+    );
+    assert_eq!(dispatcher.buffered_bytes(), 3);
+    assert_eq!(
+        dispatcher
+            .push(&message[3..], &mut decoder, &mut framebuffer)
+            .unwrap(),
+        [ArdServerMessage::StateChange]
+    );
+    assert_eq!(dispatcher.buffered_bytes(), 0);
+}
+
+#[test]
 fn dispatcher_rejects_unsupported_message_types_transactionally() {
     let stream = vec![2, 0x7f];
     let mut dispatcher = ArdMessageDispatcher::new(1024, 1024).unwrap();

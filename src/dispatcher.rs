@@ -15,6 +15,9 @@ pub enum ArdServerMessage {
     EncryptionControl(ArdEncryptionControl),
     Bell,
     ServerCutText(String),
+    /// Native Screen Sharing's fixed-width user/session state notification.
+    /// The viewer does not need to render this message.
+    StateChange,
 }
 
 /// Bounded, incremental dispatcher for the internal RFB/ARD server-message
@@ -130,6 +133,10 @@ impl ArdMessageDispatcher {
                     self.buffer.drain(..consumed);
                     messages.push(ArdServerMessage::ServerCutText(text));
                 }
+                0x14 => {
+                    self.buffer.drain(..8);
+                    messages.push(ArdServerMessage::StateChange);
+                }
                 other => return Err(Error::UnsupportedServerMessage(other)),
             }
         }
@@ -171,6 +178,16 @@ impl ArdMessageDispatcher {
                     })
                 } else {
                     Ok(total)
+                }
+            }
+            0x14 => {
+                if self.buffer.len() < 8 {
+                    Err(Error::NeedMore {
+                        needed: 8,
+                        available: self.buffer.len(),
+                    })
+                } else {
+                    Ok(8)
                 }
             }
             other => Err(Error::UnsupportedServerMessage(other)),

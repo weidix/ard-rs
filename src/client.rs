@@ -523,6 +523,11 @@ fn read_encryption_control(
                 }
                 let _ = read_exact_vector(stream, text_len)?;
             }
+            0x14 => {
+                // Native screensharingd emits an eight-byte state-change
+                // notification while the session is being established.
+                let _ = read_exact_vector(stream, 7)?;
+            }
             other => {
                 return Err(ArdClientError::Message(format!(
                     "unexpected plaintext server message {other}"

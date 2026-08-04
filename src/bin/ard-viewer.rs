@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -31,8 +32,126 @@ struct FramePacket {
     quality: ArdVideoQuality,
     luminance_quantization: [u16; 64],
     chrominance_quantization: [u16; 64],
-    tiles: HashMap<(u16, u16), MvsGpuTileUpdate>,
+    tiles: TileSet,
     rgba: Option<Vec<u8>>,
+}
+
+const EMPTY_TILE_SLOT: u32 = u32::MAX;
+const MAX_DENSE_TILE_SLOTS: usize = 1_048_576;
+
+/// Coalesces MVS updates without hashing every 8x8 coordinate. Real ARD
+/// framebuffers are small enough for the dense index and avoid the allocator
+/// and rehash traffic of the old per-frame HashMap. Keep a sparse fallback for
+/// unusually large protocol dimensions so a malicious size cannot force a
+/// large slot table.
+struct TileSet {
+    tiles_wide: usize,
+    storage: TileStorage,
+}
+
+enum TileStorage {
+    Dense {
+        slots: Vec<u32>,
+        tiles: Vec<MvsGpuTileUpdate>,
+    },
+    Sparse(HashMap<(u16, u16), MvsGpuTileUpdate>),
+}
+
+enum TileSetIter<'a> {
+    Dense(slice::Iter<'a, MvsGpuTileUpdate>),
+    Sparse(std::collections::hash_map::Values<'a, (u16, u16), MvsGpuTileUpdate>),
+}
+
+impl<'a> Iterator for TileSetIter<'a> {
+    type Item = &'a MvsGpuTileUpdate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(iter) => iter.next(),
+            Self::Sparse(iter) => iter.next(),
+        }
+    }
+}
+
+impl TileSet {
+    fn new(width: u16, height: u16, expected_tiles: usize) -> Self {
+        let tiles_wide = usize::from(width).div_ceil(8);
+        let tiles_high = usize::from(height).div_ceil(8);
+        let tile_count = tiles_wide.saturating_mul(tiles_high);
+        if tile_count <= MAX_DENSE_TILE_SLOTS {
+            Self {
+                tiles_wide,
+                storage: TileStorage::Dense {
+                    slots: vec![EMPTY_TILE_SLOT; tile_count],
+                    tiles: Vec::with_capacity(expected_tiles),
+                },
+            }
+        } else {
+            Self {
+                tiles_wide,
+                storage: TileStorage::Sparse(HashMap::with_capacity(expected_tiles)),
+            }
+        }
+    }
+
+    fn insert(&mut self, update: MvsGpuTileUpdate) {
+        match &mut self.storage {
+            TileStorage::Dense { slots, tiles } => {
+                let slot = (usize::from(update.y) / 8)
+                    .saturating_mul(self.tiles_wide)
+                    .saturating_add(usize::from(update.x) / 8);
+                if let Some(position) = slots.get_mut(slot) {
+                    if *position == EMPTY_TILE_SLOT {
+                        *position = u32::try_from(tiles.len()).expect("MVS tile count fits u32");
+                        tiles.push(update);
+                    } else {
+                        let current = &tiles[*position as usize];
+                        if current.x != update.x
+                            || current.y != update.y
+                            || current.width != update.width
+                            || current.height != update.height
+                            || !same_mvs_tile(&current.tile, &update.tile)
+                        {
+                            tiles[*position as usize] = update;
+                        }
+                    }
+                }
+            }
+            TileStorage::Sparse(tiles) => {
+                tiles.insert((update.x, update.y), update);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match &self.storage {
+            TileStorage::Dense { tiles, .. } => tiles.len(),
+            TileStorage::Sparse(tiles) => tiles.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn iter(&self) -> TileSetIter<'_> {
+        match &self.storage {
+            TileStorage::Dense { tiles, .. } => TileSetIter::Dense(tiles.iter()),
+            TileStorage::Sparse(tiles) => TileSetIter::Sparse(tiles.values()),
+        }
+    }
+}
+
+fn same_mvs_tile(left: &MvsGpuTile, right: &MvsGpuTile) -> bool {
+    match (left, right) {
+        (MvsGpuTile::SolidYcbcr(left), MvsGpuTile::SolidYcbcr(right)) => left == right,
+        (MvsGpuTile::SolidRgba(left), MvsGpuTile::SolidRgba(right)) => left == right,
+        (MvsGpuTile::PixelsYcbcr(left), MvsGpuTile::PixelsYcbcr(right)) => left == right,
+        (MvsGpuTile::PixelsRgba(left), MvsGpuTile::PixelsRgba(right)) => left == right,
+        (MvsGpuTile::RiceDct(left), MvsGpuTile::RiceDct(right))
+        | (MvsGpuTile::Dct(left), MvsGpuTile::Dct(right)) => Arc::ptr_eq(left, right),
+        _ => false,
+    }
 }
 
 impl FramePacket {
@@ -43,7 +162,11 @@ impl FramePacket {
             quality,
             luminance_quantization: frame.luminance_quantization,
             chrominance_quantization: frame.chrominance_quantization,
-            tiles: HashMap::with_capacity(frame.tiles.len()),
+            tiles: TileSet::new(
+                frame.framebuffer_width,
+                frame.framebuffer_height,
+                frame.tiles.len(),
+            ),
             rgba: None,
         };
         packet.merge_mvs(frame);
@@ -57,7 +180,7 @@ impl FramePacket {
             quality,
             luminance_quantization: [0; 64],
             chrominance_quantization: [0; 64],
-            tiles: HashMap::new(),
+            tiles: TileSet::new(width, height, 0),
             rgba: Some(rgba),
         }
     }
@@ -67,9 +190,8 @@ impl FramePacket {
         self.height = frame.framebuffer_height;
         self.luminance_quantization = frame.luminance_quantization;
         self.chrominance_quantization = frame.chrominance_quantization;
-        self.tiles.reserve(frame.tiles.len());
         for tile in frame.tiles {
-            self.tiles.insert((tile.x, tile.y), tile);
+            self.tiles.insert(tile);
         }
     }
 }
@@ -339,6 +461,11 @@ struct UploadBuffer {
     capacity: u64,
 }
 
+struct PendingMvsDecode {
+    bind_group: wgpu::BindGroup,
+    workgroups: u32,
+}
+
 struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -353,6 +480,7 @@ struct Renderer {
     records_buffer: Option<UploadBuffer>,
     payload_buffer: Option<UploadBuffer>,
     quantization_buffer: Option<UploadBuffer>,
+    pending_mvs_decode: Option<PendingMvsDecode>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -521,6 +649,7 @@ impl Renderer {
             records_buffer: None,
             payload_buffer: None,
             quantization_buffer: None,
+            pending_mvs_decode: None,
         })
     }
 
@@ -601,6 +730,7 @@ impl Renderer {
         if rgba.len() != expected_len {
             return;
         }
+        self.pending_mvs_decode = None;
         self.ensure_decoded_texture(width, height);
         let decoded = self.decoded.as_ref().expect("decoded texture created");
         self.queue.write_texture(
@@ -629,7 +759,7 @@ impl Renderer {
             return;
         }
         self.ensure_decoded_texture(u32::from(frame.width), u32::from(frame.height));
-        let (records, payload) = pack_gpu_tiles(frame.tiles.values());
+        let (records, payload) = pack_gpu_tiles(frame.tiles.iter());
         let mut quantization = Vec::with_capacity(128);
         quantization.extend(
             frame
@@ -693,21 +823,10 @@ impl Renderer {
                 },
             ],
         });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("GPU MVS decode commands"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("GPU MVS tile decode"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.compute_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(frame.tiles.len() as u32, 1, 1);
-        }
-        self.queue.submit([encoder.finish()]);
+        self.pending_mvs_decode = Some(PendingMvsDecode {
+            bind_group,
+            workgroups: u32::try_from(frame.tiles.len()).expect("MVS tile count fits u32"),
+        });
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -740,6 +859,15 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("MVS presentation commands"),
             });
+        if let Some(decode) = self.pending_mvs_decode.take() {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("GPU MVS tile decode"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compute_pipeline);
+            pass.set_bind_group(0, &decode.bind_group, &[]);
+            pass.dispatch_workgroups(decode.workgroups, 1, 1);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MVS presentation"),
@@ -1090,7 +1218,7 @@ fn main() {
 mod tests {
     use std::time::Duration;
 
-    use super::{fitted_viewport, pack_gpu_tiles, parse_cli_args};
+    use super::{TileSet, fitted_viewport, pack_gpu_tiles, parse_cli_args};
     use ard_rs::{ArdVideoQuality, MvsGpuTile, MvsGpuTileUpdate};
 
     #[test]
@@ -1130,9 +1258,10 @@ mod tests {
 
     #[test]
     fn gpu_tile_packing_keeps_dct_coefficients_native() {
-        let mut coefficients = Box::new([[0_i16; 64]; 3]);
+        let mut coefficients = [[0_i16; 64]; 3];
         coefficients[0][0] = -12;
         coefficients[2][63] = 99;
+        let coefficients = std::sync::Arc::new(coefficients);
         let tile = MvsGpuTileUpdate {
             x: 8,
             y: 16,
@@ -1145,6 +1274,29 @@ mod tests {
         assert_eq!(payload.len(), 192);
         assert_eq!(payload[0], -12);
         assert_eq!(payload[191], 99);
+    }
+
+    #[test]
+    fn tile_set_coalesces_same_tile_without_stale_dimensions() {
+        let mut tiles = TileSet::new(16, 16, 2);
+        tiles.insert(MvsGpuTileUpdate {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+            tile: MvsGpuTile::SolidRgba([1, 2, 3, 255]),
+        });
+        tiles.insert(MvsGpuTileUpdate {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+            tile: MvsGpuTile::SolidRgba([1, 2, 3, 255]),
+        });
+
+        let update = tiles.iter().next().expect("tile was inserted");
+        assert_eq!(tiles.len(), 1);
+        assert_eq!((update.width, update.height), (8, 8));
     }
 
     #[test]

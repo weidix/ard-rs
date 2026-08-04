@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::wire::Cursor;
 use crate::{Error, Framebuffer, Rectangle, Result};
@@ -59,9 +60,9 @@ const LUMINANCE_AC_VALUES: [u8; 162] = [
     0xf9, 0xfa,
 ];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DctTile {
-    coefficients: [[i16; 64]; 3],
+    coefficients: Arc<[[i16; 64]; 3]>,
 }
 
 /// GPU-facing content of one decoded 8×8 MVS tile. DCT tiles retain the
@@ -74,8 +75,11 @@ pub enum MvsGpuTile {
     PixelsRgba(Box<[[u8; 4]; 64]>),
     /// Partial-update Rice tile: luminance uses IDCT while chroma contains
     /// DC-only samples expanded with the codec's dedicated rounding rule.
-    RiceDct(Box<[[i16; 64]; 3]>),
-    Dct(Box<[[i16; 64]; 3]>),
+    // These coefficient blocks are shared between the decoder's tile cache,
+    // MVS state, and the latest frame mailbox. Cloning an Arc keeps the hot
+    // copy/cache paths from duplicating 384 coefficients per tile.
+    RiceDct(Arc<[[i16; 64]; 3]>),
+    Dct(Arc<[[i16; 64]; 3]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +112,7 @@ enum MvsPixel {
 impl Default for DctTile {
     fn default() -> Self {
         Self {
-            coefficients: [[0; 64]; 3],
+            coefficients: Arc::new([[0; 64]; 3]),
         }
     }
 }
@@ -200,7 +204,7 @@ impl MvsState {
         if index == 0 || index > DCT_CACHE_LAST_INDEX || u32::from(index) > self.cache_insertions {
             return None;
         }
-        let tile = self.cache.get(&index).copied()?;
+        let tile = self.cache.get(&index).cloned()?;
         self.last_cache_reference = index;
         Some(tile)
     }
@@ -381,8 +385,9 @@ impl MvsState {
                             payload[1],
                             payload[2],
                         )?;
-                        decoded_dct = Some((coefficients, luma_count));
-                        MvsGpuTile::RiceDct(Box::new(coefficients))
+                        let coefficients = Arc::new(coefficients);
+                        decoded_dct = Some((Arc::clone(&coefficients), luma_count));
+                        MvsGpuTile::RiceDct(coefficients)
                     }
                     6 | 7 => {
                         let cache_index = if update_type == 6 {
@@ -393,7 +398,7 @@ impl MvsState {
                             next_cache_index(self.last_cache_reference)
                         };
                         match self.cached_tile(cache_index) {
-                            Some(tile) => MvsGpuTile::Dct(Box::new(tile.coefficients)),
+                            Some(tile) => MvsGpuTile::Dct(Arc::clone(&tile.coefficients)),
                             None => {
                                 // Cache_UpdateTile only logs an unavailable
                                 // index and returns on the native decoder.
@@ -520,13 +525,16 @@ impl MvsState {
                             &chrominance_quantization,
                         );
                     }
-                    self.insert_cache_tile(DctTile { coefficients });
+                    let coefficients = Arc::new(coefficients);
+                    self.insert_cache_tile(DctTile {
+                        coefficients: Arc::clone(&coefficients),
+                    });
                     let state = &mut self.tiles[global_tile];
                     // A full update is a refinement of the most recent
                     // partial/Rice-DCT baseline. Screen Sharing caches the
                     // refined result, but deliberately leaves that baseline
                     // untouched for later full updates.
-                    state.gpu_tile = MvsGpuTile::Dct(Box::new(coefficients));
+                    state.gpu_tile = MvsGpuTile::Dct(coefficients);
                     updates.push(MvsGpuTileUpdate {
                         x: x as u16,
                         y: y as u16,
@@ -606,7 +614,7 @@ impl MvsState {
                             &chrominance_quantization,
                         );
                     }
-                    let gpu_tile = MvsGpuTile::Dct(Box::new(tile.coefficients));
+                    let gpu_tile = MvsGpuTile::Dct(Arc::clone(&tile.coefficients));
                     self.tiles[global_tile].gpu_tile = gpu_tile.clone();
                     updates.push(MvsGpuTileUpdate {
                         x: x as u16,
