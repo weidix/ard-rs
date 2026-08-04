@@ -192,39 +192,13 @@ impl MvsState {
         self.cache.insert(index, tile);
     }
 
-    fn cached_tile(
-        &mut self,
-        index: u16,
-        reference: &'static str,
-        tile_index: usize,
-        bit_position: usize,
-    ) -> Result<DctTile> {
+    fn cached_tile(&mut self, index: u16) -> Option<DctTile> {
         if index == 0 || index > DCT_CACHE_LAST_INDEX || u32::from(index) > self.cache_insertions {
-            return Err(self.invalid_cache_index(index, reference, tile_index, bit_position));
+            return None;
         }
-        let Some(tile) = self.cache.get(&index).copied() else {
-            return Err(self.invalid_cache_index(index, reference, tile_index, bit_position));
-        };
+        let tile = self.cache.get(&index).copied()?;
         self.last_cache_reference = index;
-        Ok(tile)
-    }
-
-    fn invalid_cache_index(
-        &self,
-        index: u16,
-        reference: &'static str,
-        tile_index: usize,
-        bit_position: usize,
-    ) -> Error {
-        Error::InvalidMvsDctCacheIndex {
-            index,
-            reference,
-            tile_index,
-            bit_position,
-            entry_count: self.cache_insertions,
-            write_index: self.cache_write_index,
-            last_reference: self.last_cache_reference,
-        }
+        Some(tile)
     }
 
     pub(crate) fn quantization_tables(&self) -> (&[u16; 64], &[u16; 64]) {
@@ -407,23 +381,24 @@ impl MvsState {
                         MvsGpuTile::RiceDct(Box::new(coefficients))
                     }
                     6 | 7 => {
-                        let (cache_index, reference) = if update_type == 6 {
+                        let cache_index = if update_type == 6 {
                             let high = secondary.read(8)? as u16;
                             let low = secondary.read(8)? as u16;
-                            ((high << 8) | low, "partial explicit")
+                            (high << 8) | low
                         } else {
-                            (
-                                next_cache_index(self.last_cache_reference),
-                                "partial sequential",
-                            )
+                            next_cache_index(self.last_cache_reference)
                         };
-                        let tile = self.cached_tile(
-                            cache_index,
-                            reference,
-                            tile_index,
-                            secondary.bit_position,
-                        )?;
-                        MvsGpuTile::Dct(Box::new(tile.coefficients))
+                        match self.cached_tile(cache_index) {
+                            Some(tile) => MvsGpuTile::Dct(Box::new(tile.coefficients)),
+                            None => {
+                                // Cache_UpdateTile only logs an unavailable
+                                // index and returns on the native decoder.
+                                // Keep the tile metadata update, but do not
+                                // emit a replacement for the previous tile.
+                                emit_update = false;
+                                self.tiles[global_tile].gpu_tile.clone()
+                            }
+                        }
                     }
                     _ => unreachable!("three-bit MVS update type"),
                 };
@@ -608,18 +583,19 @@ impl MvsState {
                     });
                 }
                 3 => {
-                    let (cache_index, reference) = if bits.read(1)? != 0 {
-                        (
-                            next_cache_index(self.last_cache_reference),
-                            "full sequential",
-                        )
+                    let cache_index = if bits.read(1)? != 0 {
+                        next_cache_index(self.last_cache_reference)
                     } else {
                         let high = bits.read(8)? as u16;
                         let low = bits.read(8)? as u16;
-                        ((high << 8) | low, "full explicit")
+                        (high << 8) | low
                     };
-                    let tile =
-                        self.cached_tile(cache_index, reference, tile_index, bits.bit_position)?;
+                    let Some(tile) = self.cached_tile(cache_index) else {
+                        // Native _Cache_UpdateTile logs and returns when the
+                        // cache entry is not available. The rest of the MVS
+                        // record remains valid and must still be consumed.
+                        continue;
+                    };
                     if render_cpu {
                         blit_dct_to_framebuffer(
                             &tile.coefficients,

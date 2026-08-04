@@ -828,6 +828,76 @@ fn mvs_sequential_cache_recall_is_independent_of_insertion_cursor() {
 }
 
 #[test]
+fn missing_mvs_cache_recall_is_a_native_noop() {
+    let mut baseline = partial_mvs_packet_with_secondary(
+        &[(0, 1), (5, 3), (0, 1), (0x6d, 8)],
+        &[
+            (0, 1), // new coefficient block
+            (3, 2), // retain zero chroma predictors
+            (0, 1),
+            (0, 1), // zero DC
+            (0, 1),
+            (2, 2), // positive AC coefficient
+            (0, 1),
+            (1, 2),
+            (0, 1), // end block
+        ],
+    );
+    baseline[5] = 2;
+    baseline[6] = 2;
+    let differential = full_mvs_packet(
+        [64, 64],
+        &[
+            (1, 2), // differential DCT selector; inserts cache entry 1
+            (1, 6), // two luma coefficients
+            (1, 3), // increase the signed AC coefficient by one
+            (0, 1), // unchanged Cr DC
+            (0, 2), // JPEG chrominance AC end-of-block
+            (0, 1), // unchanged Cb DC
+            (0, 2), // JPEG chrominance AC end-of-block
+        ],
+    );
+    let explicit_cache =
+        partial_mvs_packet_with_secondary(&[(0, 1), (6, 3), (0, 1), (0x6d, 8)], &[(0, 8), (1, 8)]);
+    let full_sequential_cache = full_mvs_packet(
+        [0, 0],
+        &[(3, 2), (1, 1)], // asks for cache entry 2 after referencing entry 1
+    );
+
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    decoder
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &baseline, &mut framebuffer)
+        .unwrap();
+    decoder
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &differential,
+            &mut framebuffer,
+        )
+        .unwrap();
+    decoder
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &explicit_cache,
+            &mut framebuffer,
+        )
+        .unwrap();
+    let before = framebuffer.rgba().to_vec();
+    assert_eq!(
+        decoder
+            .decode_rectangle(
+                rect(8, 8, Encoding::ArdMvs),
+                &full_sequential_cache,
+                &mut framebuffer,
+            )
+            .unwrap(),
+        full_sequential_cache.len()
+    );
+    assert_eq!(framebuffer.rgba(), before);
+}
+
+#[test]
 fn decodes_zero_limit_mvs_differential_baseline() {
     let baseline = partial_mvs_packet_with_secondary(
         &[(0, 1), (5, 3), (0, 1), (0x6d, 8)],
