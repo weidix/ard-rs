@@ -1,0 +1,204 @@
+use iced::widget::{column, container, row, space, stack, text};
+use iced::{Alignment, Background, Border, Element, Fill, window};
+
+use crate::theme::{self, REMOTE_CANVAS, SUCCESS, SURFACE, TEXT, TEXT_MUTED};
+use crate::widgets::{secondary, window_titlebar};
+use crate::{ArdViewer, Message, SessionAction};
+
+pub fn session(_app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
+    column![
+        window_titlebar(window_id, "Studio Mac", "安全连接 · 18 ms", None, 48),
+        remote_canvas(),
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn remote_canvas() -> Element<'static, Message> {
+    let desktop = remote_desktop();
+    let base = container(column![
+        space().height(62),
+        row![space().width(85), desktop, space().width(85)].height(650),
+        space().height(Fill),
+    ])
+    .width(Fill)
+    .height(Fill)
+    .style(theme::shaped_panel(REMOTE_CANVAS, iced::border::bottom(12)));
+
+    let controls = container(control_bar())
+        .width(Fill)
+        .height(Fill)
+        .padding([14, 0])
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Start);
+    let status = container(
+        container(
+            row![
+                text("●").size(8).color(SUCCESS),
+                text("RGBA · 自适应质量 · 60 fps").size(9).color(TEXT_MUTED)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding(8)
+        .style(theme::bordered_panel(SURFACE, 8.0)),
+    )
+    .width(Fill)
+    .height(Fill)
+    .padding([23, 18])
+    .align_x(Alignment::Start)
+    .align_y(Alignment::End);
+
+    stack![base, controls, status]
+        .width(Fill)
+        .height(Fill)
+        .clip(true)
+        .into()
+}
+
+fn control_bar() -> Element<'static, Message> {
+    let button = |label: &'static str, action| {
+        secondary(label, Message::SessionAction(action))
+            .width(34)
+            .height(34)
+    };
+    container(
+        row![
+            button("▣", SessionAction::Fit),
+            button("⌁", SessionAction::Zoom),
+            button("↔", SessionAction::Input),
+            button("⌨", SessionAction::SystemShortcut),
+            button("⎙", SessionAction::Clipboard),
+            button("◉", SessionAction::Undo),
+            secondary("⛶", Message::ToggleFullscreen)
+                .width(34)
+                .height(34),
+        ]
+        .spacing(5),
+    )
+    .padding(6)
+    .style(theme::bordered_panel(
+        iced::Color::from_rgb8(26, 26, 28),
+        12.0,
+    ))
+    .into()
+}
+
+fn remote_desktop() -> Element<'static, Message> {
+    let menu = container(
+        row![
+            text("●  Finder").size(10).color(TEXT),
+            text("文件   编辑   显示   前往   窗口   帮助")
+                .size(9)
+                .color(TEXT_MUTED),
+            space().width(Fill),
+            text("Wi‑Fi   14:32").size(9).color(TEXT_MUTED),
+        ]
+        .spacing(14)
+        .align_y(Alignment::Center),
+    )
+    .height(28)
+    .padding([0, 12])
+    .width(Fill)
+    .style(theme::panel(iced::Color::from_rgb8(20, 20, 22)));
+
+    let remote_app = remote_app();
+    let contents = column![
+        menu,
+        space().height(90),
+        row![space().width(Fill), remote_app, space().width(Fill)],
+        space().height(Fill),
+    ]
+    .height(Fill)
+    .width(Fill);
+    let gradient = iced::gradient::Linear::new(iced::Degrees(150.0))
+        .add_stop(0.14, iced::Color::from_rgb8(23, 23, 26))
+        .add_stop(0.86, iced::Color::from_rgb8(77, 74, 69));
+    container(contents)
+        .height(650)
+        .width(Fill)
+        .style(move |_| iced::widget::container::Style {
+            background: Some(Background::Gradient(gradient.into())),
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            ..iced::widget::container::Style::default()
+        })
+        .into()
+}
+
+fn remote_app() -> Element<'static, Message> {
+    let chrome = container(
+        text("●  ●  ●     Remote Project")
+            .size(11)
+            .color(iced::Color::from_rgb8(51, 51, 51)),
+    )
+    .height(42)
+    .width(Fill)
+    .padding([0, 12])
+    .center_y(42)
+    .style(theme::panel(iced::Color::from_rgb8(214, 214, 212)));
+    let sidebar = container(
+        column![
+            text("Overview")
+                .size(10)
+                .color(iced::Color::from_rgb8(64, 64, 64)),
+            text("Sessions")
+                .size(10)
+                .color(iced::Color::from_rgb8(64, 64, 64)),
+            text("Devices")
+                .size(10)
+                .color(iced::Color::from_rgb8(64, 64, 64)),
+            text("Settings")
+                .size(10)
+                .color(iced::Color::from_rgb8(64, 64, 64)),
+        ]
+        .spacing(10),
+    )
+    .width(150)
+    .height(Fill)
+    .padding(14)
+    .style(theme::panel(iced::Color::from_rgb8(222, 222, 219)));
+    let session_card = |label: &'static str| {
+        container(
+            text(label)
+                .size(11)
+                .color(iced::Color::from_rgb8(56, 56, 56)),
+        )
+        .height(52)
+        .width(Fill)
+        .padding(12)
+        .center_y(52)
+        .style(theme::rounded_panel(
+            iced::Color::from_rgb8(227, 227, 224),
+            8.0,
+        ))
+    };
+    let pane = container(
+        column![
+            text("Active Sessions")
+                .size(19)
+                .color(iced::Color::from_rgb8(33, 33, 33)),
+            text("2 devices currently connected")
+                .size(10)
+                .color(iced::Color::from_rgb8(107, 107, 107)),
+            session_card("▣  Studio Mac     Connected"),
+            session_card("▣  Office Mini     Idle"),
+        ]
+        .spacing(14),
+    )
+    .width(470)
+    .height(Fill)
+    .padding(22)
+    .style(theme::panel(iced::Color::from_rgb8(242, 242, 240)));
+    container(column![chrome, row![sidebar, pane].height(Fill)])
+        .width(620)
+        .height(390)
+        .style(theme::rounded_panel(
+            iced::Color::from_rgb8(237, 237, 235),
+            10.0,
+        ))
+        .into()
+}

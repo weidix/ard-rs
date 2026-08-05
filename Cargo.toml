@@ -1,3 +1,8 @@
 [workspace]
 members = ["crates/ard-core", "crates/ard-viewer"]
 resolver = "3"
+
+[patch.crates-io]
+# metal 0.32 still depends on the unmaintained block 0.1.6 release. Keep the
+# public API intact while fixing its future-incompatible opaque FFI type.
+block = { path = "vendor/block" }

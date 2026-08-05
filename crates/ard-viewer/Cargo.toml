@@ -7,15 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 ard_rs = { package = "ard-core", path = "../ard-core" }
-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
-bytemuck = { version = "1.25.0" }
-pollster = { version = "0.4.0" }
-wgpu = { version = "30.0.0" }
-winit = { version = "0.30.13" }
+iced = { version = "0.14.0", default-features = false, features = ["crisp", "linux-theme-detection", "thread-pool", "wayland", "wgpu", "x11"] }
 
 [dev-dependencies]
-naga = { version = "30.0.0", features = ["wgsl-in"] }
-
-[[bin]]
-name = "ard-viewer"
-path = "src/bin/ard-viewer.rs"
+iced_test = "0.14.0"
