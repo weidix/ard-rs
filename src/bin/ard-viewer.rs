@@ -25,6 +25,11 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 const WINDOW_TITLE: &str = "ard-rs Viewer";
 const MAX_RGBA_POOL: usize = 2;
+// RFB represents scrolling as discrete wheel-button clicks. Winit reports
+// precise-device deltas as physical pixels, so convert them to logical pixels
+// before accumulating them into one remote line.
+const PRECISE_SCROLL_LOGICAL_PIXELS_PER_LINE: f64 = 20.0;
+const MAX_SCROLL_CLICKS_PER_EVENT: f64 = 64.0;
 
 #[derive(Debug)]
 enum ViewerEvent {
@@ -515,18 +520,84 @@ struct ViewerApp {
     clipboard: Option<ClipboardBridge>,
     pending_clipboard: Option<String>,
     button_mask: u8,
+    pressed_mouse_buttons: HashMap<MouseButton, u8>,
     cursor_position: Option<(u16, u16)>,
     pointer_inside: bool,
+    scroll: ScrollAccumulator,
     modifiers: ModifiersState,
     pressed_keys: HashMap<PhysicalKey, u32>,
     ime_suppressed_keys: HashSet<PhysicalKey>,
     paste_suppressed_keys: HashSet<PhysicalKey>,
+    system_shortcut_suppressed_keys: HashSet<PhysicalKey>,
     ime_active: bool,
 }
 
 struct PresentationMeter {
     window_started: Instant,
     presented_frames: usize,
+}
+
+#[derive(Default)]
+struct ScrollAccumulator {
+    horizontal: f64,
+    vertical: f64,
+}
+
+impl ScrollAccumulator {
+    fn update(&mut self, delta: MouseScrollDelta, scale_factor: f64) -> (i32, i32) {
+        let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
+        let (horizontal, vertical) = match delta {
+            MouseScrollDelta::LineDelta(horizontal, vertical) => {
+                (f64::from(horizontal), f64::from(vertical))
+            }
+            MouseScrollDelta::PixelDelta(position) => (
+                position.x / scale_factor / PRECISE_SCROLL_LOGICAL_PIXELS_PER_LINE,
+                position.y / scale_factor / PRECISE_SCROLL_LOGICAL_PIXELS_PER_LINE,
+            ),
+        };
+        if !horizontal.is_finite() || !vertical.is_finite() {
+            return (0, 0);
+        }
+        self.horizontal += horizontal;
+        self.vertical += vertical;
+        (
+            take_scroll_clicks(&mut self.horizontal),
+            take_scroll_clicks(&mut self.vertical),
+        )
+    }
+
+    fn reset(&mut self) {
+        self.horizontal = 0.0;
+        self.vertical = 0.0;
+    }
+
+    fn finish(&mut self) -> (i32, i32) {
+        (
+            finish_scroll_remainder(&mut self.horizontal),
+            finish_scroll_remainder(&mut self.vertical),
+        )
+    }
+}
+
+fn take_scroll_clicks(remainder: &mut f64) -> i32 {
+    let whole = remainder.trunc();
+    let clicks = whole.clamp(-MAX_SCROLL_CLICKS_PER_EVENT, MAX_SCROLL_CLICKS_PER_EVENT);
+    *remainder -= clicks;
+    clicks as i32
+}
+
+fn finish_scroll_remainder(remainder: &mut f64) -> i32 {
+    let click = if *remainder == 0.0 {
+        0
+    } else {
+        remainder.signum() as i32
+    };
+    *remainder = 0.0;
+    click
 }
 
 impl PresentationMeter {
@@ -564,12 +635,15 @@ impl ViewerApp {
             clipboard: None,
             pending_clipboard: None,
             button_mask: 0,
+            pressed_mouse_buttons: HashMap::new(),
             cursor_position: None,
             pointer_inside: false,
+            scroll: ScrollAccumulator::default(),
             modifiers: ModifiersState::default(),
             pressed_keys: HashMap::new(),
             ime_suppressed_keys: HashSet::new(),
             paste_suppressed_keys: HashSet::new(),
+            system_shortcut_suppressed_keys: HashSet::new(),
             ime_active: false,
         }
     }
@@ -755,7 +829,15 @@ impl ViewerApp {
     }
 
     fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
-        let Some(bit) = mouse_button_bit(button) else {
+        let bit = match state {
+            ElementState::Pressed => mouse_button_bit(button, self.modifiers),
+            ElementState::Released => self
+                .pressed_mouse_buttons
+                .get(&button)
+                .copied()
+                .or_else(|| mouse_button_bit(button, self.modifiers)),
+        };
+        let Some(bit) = bit else {
             return;
         };
         let Some((x, y)) = self.cursor_position else {
@@ -765,8 +847,14 @@ impl ViewerApp {
             return;
         }
         match state {
-            ElementState::Pressed => self.button_mask |= bit,
-            ElementState::Released => self.button_mask &= !bit,
+            ElementState::Pressed => {
+                self.pressed_mouse_buttons.insert(button, bit);
+                self.button_mask |= bit;
+            }
+            ElementState::Released => {
+                self.pressed_mouse_buttons.remove(&button);
+                self.button_mask &= !bit;
+            }
         }
         if let Some(input) = &self.input
             && let Err(error) = input.send_pointer_event(self.button_mask, x, y)
@@ -776,30 +864,32 @@ impl ViewerApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
-        if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+        if !self.pointer_inside {
+            self.scroll.reset();
             return;
         }
-        let (horizontal, vertical) = match delta {
-            MouseScrollDelta::LineDelta(horizontal, vertical) => {
-                (f64::from(horizontal), f64::from(vertical))
-            }
-            MouseScrollDelta::PixelDelta(position) => (position.x / 40.0, position.y / 40.0),
-        };
-        if vertical != 0.0 {
-            let button = if vertical.is_sign_negative() {
-                0x08
-            } else {
-                0x10
-            };
-            self.send_scroll_clicks(button, vertical.abs().round().clamp(1.0, 8.0) as usize);
+        if phase == TouchPhase::Cancelled {
+            self.scroll.reset();
+            return;
         }
-        if horizontal != 0.0 {
-            let button = if horizontal.is_sign_negative() {
-                0x20
-            } else {
-                0x40
-            };
-            self.send_scroll_clicks(button, horizontal.abs().round().clamp(1.0, 8.0) as usize);
+        let (horizontal, vertical) = if phase == TouchPhase::Ended {
+            let remainder = self.scroll.finish();
+            self.scroll.reset();
+            remainder
+        } else {
+            let scale_factor = self
+                .window
+                .as_ref()
+                .map_or(1.0, |window| window.scale_factor());
+            self.scroll.update(delta, scale_factor)
+        };
+        if vertical != 0 {
+            let button = if vertical.is_negative() { 0x08 } else { 0x10 };
+            self.send_scroll_clicks(button, vertical.unsigned_abs() as usize);
+        }
+        if horizontal != 0 {
+            let button = if horizontal.is_negative() { 0x20 } else { 0x40 };
+            self.send_scroll_clicks(button, horizontal.unsigned_abs() as usize);
         }
     }
 
@@ -811,20 +901,23 @@ impl ViewerApp {
             return;
         };
         let Some(input) = &self.input else { return };
+        let mut events = Vec::with_capacity(count.saturating_mul(2));
         for _ in 0..count {
-            if let Err(error) = input.send_pointer_event(self.button_mask | button, x, y) {
-                eprintln!("发送滚轮事件失败：{error}");
-                return;
-            }
-            if let Err(error) = input.send_pointer_event(self.button_mask, x, y) {
-                eprintln!("发送滚轮释放事件失败：{error}");
-                return;
-            }
+            events.push((self.button_mask | button, x, y));
+            events.push((self.button_mask, x, y));
+        }
+        if let Err(error) = input.send_pointer_events(&events) {
+            eprintln!("发送滚轮事件失败：{error}");
         }
     }
 
     fn handle_keyboard_input(&mut self, event: KeyEvent) {
         let physical_key = event.physical_key;
+        if event.state == ElementState::Released
+            && self.system_shortcut_suppressed_keys.remove(&physical_key)
+        {
+            return;
+        }
         if event.state == ElementState::Pressed && is_paste_shortcut(&event, self.modifiers) {
             self.paste_suppressed_keys.insert(physical_key);
             self.send_local_clipboard();
@@ -835,6 +928,12 @@ impl ViewerApp {
             return;
         }
         if event.state == ElementState::Released && self.ime_suppressed_keys.remove(&physical_key) {
+            return;
+        }
+        if event.state == ElementState::Pressed
+            && is_system_shortcut(physical_key, &event.logical_key, self.modifiers)
+        {
+            self.suppress_system_shortcut(physical_key);
             return;
         }
         if self.ime_active && is_textual_key(&event) {
@@ -855,6 +954,31 @@ impl ViewerApp {
             && let Err(error) = input.send_key_event(event.state == ElementState::Pressed, keysym)
         {
             eprintln!("发送键盘事件失败：{error}");
+        }
+    }
+
+    fn suppress_system_shortcut(&mut self, physical_key: PhysicalKey) {
+        let mut keys_to_suppress = vec![physical_key];
+        keys_to_suppress.extend(
+            self.pressed_keys
+                .keys()
+                .copied()
+                .filter(|key| is_modifier_physical_key(*key)),
+        );
+
+        let mut releases = Vec::new();
+        for key in keys_to_suppress {
+            self.system_shortcut_suppressed_keys.insert(key);
+            if let Some(keysym) = self.pressed_keys.remove(&key) {
+                releases.push(keysym);
+            }
+        }
+        if let Some(input) = &self.input {
+            for keysym in releases {
+                if let Err(error) = input.send_key_event(false, keysym) {
+                    eprintln!("释放系统快捷键远端修饰键失败：{error}");
+                }
+            }
         }
     }
 
@@ -904,6 +1028,7 @@ impl ViewerApp {
         let pressed_keys = core::mem::take(&mut self.pressed_keys);
         self.ime_suppressed_keys.clear();
         self.paste_suppressed_keys.clear();
+        self.system_shortcut_suppressed_keys.clear();
         if let Some(input) = &self.input {
             for keysym in pressed_keys.values().copied() {
                 let _ = input.send_key_event(false, keysym);
@@ -916,7 +1041,9 @@ impl ViewerApp {
             let _ = input.send_pointer_event(0, x, y);
         }
         self.button_mask = 0;
+        self.pressed_mouse_buttons.clear();
         self.pointer_inside = false;
+        self.scroll.reset();
     }
 
     fn process_latest_frame(&mut self) {
@@ -1653,7 +1780,12 @@ fn fitted_viewport(
     )
 }
 
-fn mouse_button_bit(button: MouseButton) -> Option<u8> {
+fn mouse_button_bit(button: MouseButton, modifiers: ModifiersState) -> Option<u8> {
+    // macOS commonly reports a trackpad Control-click as a left-button event
+    // with the Control modifier instead of a native right-button event.
+    if cfg!(target_os = "macos") && button == MouseButton::Left && modifiers.control_key() {
+        return Some(0x04);
+    }
     match button {
         MouseButton::Left => Some(0x01),
         MouseButton::Middle => Some(0x02),
@@ -1665,6 +1797,12 @@ fn mouse_button_bit(button: MouseButton) -> Option<u8> {
 }
 
 fn is_paste_shortcut(event: &KeyEvent, modifiers: ModifiersState) -> bool {
+    // On Windows and Linux, the Super key belongs to the local desktop. In
+    // particular, Super+V opens the system clipboard history on Windows and
+    // must not be mistaken for the viewer's remote paste shortcut.
+    if modifiers.super_key() && !cfg!(target_os = "macos") {
+        return false;
+    }
     if matches!(event.logical_key, Key::Named(NamedKey::Paste)) {
         return true;
     }
@@ -1680,6 +1818,42 @@ fn is_paste_shortcut(event: &KeyEvent, modifiers: ModifiersState) -> bool {
     text.chars()
         .next()
         .is_some_and(|character| character.eq_ignore_ascii_case(&'v'))
+}
+
+fn is_system_shortcut(
+    physical_key: PhysicalKey,
+    logical_key: &Key,
+    modifiers: ModifiersState,
+) -> bool {
+    let is_super_key = matches!(
+        physical_key,
+        PhysicalKey::Code(KeyCode::SuperLeft | KeyCode::SuperRight)
+    ) || matches!(logical_key, Key::Named(NamedKey::Super));
+    if is_super_key || modifiers.super_key() {
+        return true;
+    }
+
+    let is_named = |expected| matches!(logical_key, Key::Named(key) if *key == expected);
+    (modifiers.alt_key()
+        && (is_named(NamedKey::Tab) || is_named(NamedKey::F4) || is_named(NamedKey::Space)))
+        || (modifiers.control_key()
+            && (is_named(NamedKey::Escape) || (modifiers.alt_key() && is_named(NamedKey::Delete))))
+}
+
+fn is_modifier_physical_key(key: PhysicalKey) -> bool {
+    matches!(
+        key,
+        PhysicalKey::Code(
+            KeyCode::AltLeft
+                | KeyCode::AltRight
+                | KeyCode::ControlLeft
+                | KeyCode::ControlRight
+                | KeyCode::ShiftLeft
+                | KeyCode::ShiftRight
+                | KeyCode::SuperLeft
+                | KeyCode::SuperRight
+        )
+    )
 }
 
 fn is_textual_key(event: &KeyEvent) -> bool {
@@ -2133,8 +2307,15 @@ fn main() {
 mod tests {
     use std::time::Duration;
 
-    use super::{TileSet, fitted_viewport, pack_dirty_gpu_tiles, pack_gpu_tiles, parse_cli_args};
+    use super::{
+        ScrollAccumulator, TileSet, fitted_viewport, is_system_shortcut, mouse_button_bit,
+        pack_dirty_gpu_tiles, pack_gpu_tiles, parse_cli_args,
+    };
     use ard_rs::{ArdVideoQuality, MvsGpuTile, MvsGpuTileUpdate};
+    use winit::dpi::PhysicalPosition;
+    use winit::event::MouseButton;
+    use winit::event::MouseScrollDelta;
+    use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
     #[test]
     fn viewer_defaults_to_adaptive_mvs_and_native_maximum_rate() {
@@ -2157,6 +2338,154 @@ mod tests {
         .unwrap();
         assert_eq!(quality, ArdVideoQuality::Adaptive);
         assert_eq!(interval, Duration::from_millis(16));
+    }
+
+    #[test]
+    fn right_button_uses_the_rfb_button_three_mask() {
+        assert_eq!(
+            mouse_button_bit(MouseButton::Right, ModifiersState::default()),
+            Some(0x04)
+        );
+        assert_eq!(
+            mouse_button_bit(MouseButton::Left, ModifiersState::default()),
+            Some(0x01)
+        );
+    }
+
+    #[test]
+    fn macos_control_click_maps_to_remote_right_button() {
+        let control = ModifiersState::CONTROL;
+        let expected = if cfg!(target_os = "macos") {
+            Some(0x04)
+        } else {
+            Some(0x01)
+        };
+        assert_eq!(mouse_button_bit(MouseButton::Left, control), expected);
+    }
+
+    #[test]
+    fn super_key_and_its_shortcuts_stay_local() {
+        assert!(is_system_shortcut(
+            PhysicalKey::Code(KeyCode::SuperLeft),
+            &Key::Named(NamedKey::Super),
+            ModifiersState::default()
+        ));
+        assert!(is_system_shortcut(
+            PhysicalKey::Code(KeyCode::Tab),
+            &Key::Named(NamedKey::Tab),
+            ModifiersState::SUPER
+        ));
+        assert!(!is_system_shortcut(
+            PhysicalKey::Code(KeyCode::Enter),
+            &Key::Named(NamedKey::Enter),
+            ModifiersState::default()
+        ));
+    }
+
+    #[test]
+    fn common_windows_system_shortcuts_stay_local() {
+        assert!(is_system_shortcut(
+            PhysicalKey::Code(KeyCode::Tab),
+            &Key::Named(NamedKey::Tab),
+            ModifiersState::ALT
+        ));
+        assert!(is_system_shortcut(
+            PhysicalKey::Code(KeyCode::Escape),
+            &Key::Named(NamedKey::Escape),
+            ModifiersState::CONTROL
+        ));
+        assert!(is_system_shortcut(
+            PhysicalKey::Code(KeyCode::Delete),
+            &Key::Named(NamedKey::Delete),
+            ModifiersState::CONTROL | ModifiersState::ALT
+        ));
+    }
+
+    #[test]
+    fn scroll_accumulator_normalizes_line_and_pixel_deltas() {
+        let mut scroll = ScrollAccumulator::default();
+        assert_eq!(
+            scroll.update(MouseScrollDelta::LineDelta(0.0, 0.5), 1.0),
+            (0, 0)
+        );
+        assert_eq!(
+            scroll.update(MouseScrollDelta::LineDelta(0.0, 0.5), 1.0),
+            (0, 1)
+        );
+        assert_eq!(
+            scroll.update(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -10.0)),
+                1.0
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            scroll.update(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -10.0)),
+                1.0
+            ),
+            (0, -1)
+        );
+    }
+
+    #[test]
+    fn scroll_accumulator_preserves_fractional_direction_changes() {
+        let mut scroll = ScrollAccumulator::default();
+        assert_eq!(
+            scroll.update(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 10.0)),
+                1.0
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            scroll.update(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -5.0)),
+                1.0
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            scroll.update(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 15.0)),
+                1.0
+            ),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn scroll_accumulator_normalizes_high_dpi_pixel_deltas() {
+        let mut scroll = ScrollAccumulator::default();
+        assert_eq!(
+            scroll.update(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 20.0)),
+                1.0,
+            ),
+            (0, 1)
+        );
+        scroll.reset();
+        assert_eq!(
+            scroll.update(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 40.0)),
+                2.0,
+            ),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn scroll_accumulator_finishes_a_subline_gesture() {
+        let mut scroll = ScrollAccumulator::default();
+        assert_eq!(
+            scroll.update(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 5.0)),
+                1.0,
+            ),
+            (0, 0)
+        );
+        assert_eq!(scroll.finish(), (0, 1));
+        assert_eq!(scroll.finish(), (0, 0));
     }
 
     #[test]

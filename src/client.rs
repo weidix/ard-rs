@@ -201,6 +201,26 @@ impl ArdClientInput {
         ))
     }
 
+    /// Queues several pointer updates in order as one outbound payload.
+    ///
+    /// RFB permits multiple client messages in one encrypted record. Keeping
+    /// a scroll gesture in one payload avoids paying the per-record write and
+    /// flush cost for every wheel press/release pair.
+    pub fn send_pointer_events(&self, events: &[(u8, u16, u16)]) -> Result<(), ArdClientError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let events_per_record = MAX_OUTBOUND_PAYLOAD_BYTES / 6;
+        for chunk in events.chunks(events_per_record) {
+            let mut payload = Vec::with_capacity(chunk.len() * 6);
+            for &(button_mask, x, y) in chunk {
+                payload.extend_from_slice(&build_pointer_event(button_mask, x, y));
+            }
+            self.submit(OutboundMessage::Payload(payload))?;
+        }
+        Ok(())
+    }
+
     /// Queues a pointer update without blocking the GUI event loop when the
     /// network writer is temporarily behind. Button transitions should use
     /// [`Self::send_pointer_event`] so they are never silently dropped.
