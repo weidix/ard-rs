@@ -2,13 +2,14 @@ use ard_rs::ArdVideoQuality;
 use iced::widget::{checkbox, column, container, pick_list, row, space, text};
 use iced::{Alignment, Element, Fill, window};
 
+use crate::icons::{Icon, icon};
 use crate::state::SettingsSection;
 use crate::theme::{
     self, BACKGROUND, BODY_SIZE, BORDER, CAPTION_SIZE, CARD_RADIUS, CONTENT_PADDING_X,
     CONTROL_HEIGHT, ICON_SIZE, SURFACE, SURFACE_ACTIVE, TEXT, TEXT_DIM, TEXT_MUTED, TITLE_SIZE,
     WINDOW_RADIUS,
 };
-use crate::widgets::{card, muted, secondary, window_titlebar};
+use crate::widgets::{card, muted, secondary, secondary_with_icon, window_titlebar};
 use crate::{ArdViewer, Message};
 
 pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
@@ -24,14 +25,19 @@ pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> 
 fn sidebar(app: &ArdViewer) -> Element<'_, Message> {
     let mut nav = column![text("设置").size(CAPTION_SIZE).color(TEXT_MUTED)].spacing(6);
     for section in SettingsSection::ALL {
+        let selected = section == app.settings_section;
         nav = nav.push(
             iced::widget::button(container(
                 row![
-                    container(text(section.icon()).size(ICON_SIZE))
-                        .width(20)
-                        .height(Fill)
-                        .center_x(20)
-                        .center_y(Fill),
+                    container(icon(
+                        section.icon(),
+                        ICON_SIZE,
+                        if selected { TEXT } else { TEXT_MUTED }
+                    ))
+                    .width(20)
+                    .height(Fill)
+                    .center_x(20)
+                    .center_y(Fill),
                     text(section.label()).size(BODY_SIZE),
                 ]
                 .spacing(8)
@@ -42,7 +48,7 @@ fn sidebar(app: &ArdViewer) -> Element<'_, Message> {
             .height(36)
             .padding([0, 10])
             .width(Fill)
-            .style(theme::nav_button(section == app.settings_section))
+            .style(theme::nav_button(selected))
             .on_press(Message::SettingsSectionSelected(section)),
         );
     }
@@ -152,7 +158,7 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
                         text(mapping.remote).size(BODY_SIZE).color(TEXT).width(220),
                         text(mapping.scope).size(BODY_SIZE).color(TEXT).width(160),
                         iced::widget::button(
-                            container(text("•••").size(BODY_SIZE).color(TEXT_MUTED))
+                            container(icon(Icon::MoreHorizontal, ICON_SIZE, TEXT_MUTED))
                                 .width(Fill)
                                 .height(Fill)
                                 .center_x(Fill)
@@ -177,7 +183,7 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
         .width(Fill)
         .style(theme::bordered_panel(SURFACE, CARD_RADIUS));
     let add = row![
-        secondary("＋ 添加映射", Message::AddMapping)
+        secondary_with_icon(Icon::Plus, "添加映射", Message::AddMapping)
             .width(112)
             .height(CONTROL_HEIGHT),
         container(text("拖动可调整优先级").size(CAPTION_SIZE).color(TEXT_DIM))

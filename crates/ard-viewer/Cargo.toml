@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 ard_rs = { package = "ard-core", path = "../ard-core" }
-iced = { version = "0.14.0", default-features = false, features = ["crisp", "linux-theme-detection", "thread-pool", "wayland", "wgpu", "x11"] }
+iced = { version = "0.14.0", default-features = false, features = ["crisp", "linux-theme-detection", "svg", "tokio", "wayland", "wgpu", "x11"] }
 
 [dev-dependencies]
 iced_test = "0.14.0"

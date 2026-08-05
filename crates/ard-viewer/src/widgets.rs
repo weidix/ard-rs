@@ -2,6 +2,7 @@ use iced::widget::{button, column, container, mouse_area, row, space, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::Message;
+use crate::icons::{Icon, icon};
 use crate::theme::{
     self, ACCENT_TEXT, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTROL_HEIGHT, ICON_SIZE, SURFACE,
     TEXT, TEXT_MUTED, WINDOW_RADIUS, WINDOW_TITLE_SIZE,
@@ -20,25 +21,51 @@ fn centered_label<'a>(
         .into()
 }
 
+fn centered_icon(kind: Icon, size: f32, color: iced::Color) -> Element<'static, Message> {
+    container(icon(kind, size, color))
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
+}
+
 pub fn window_titlebar<'a>(
     window_id: window::Id,
     title: &'a str,
     subtitle: &'a str,
-    action: Option<(&'a str, Message)>,
+    action: Option<(Icon, Message)>,
     height: u16,
 ) -> Element<'a, Message> {
     #[cfg(target_os = "macos")]
     let native_controls: Element<'a, Message> = space().width(52).into();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let native_controls: Element<'a, Message> = space().width(14).into();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let native_controls: Element<'a, Message> = space().width(0).into();
 
     #[cfg(target_os = "macos")]
     let platform_controls: Element<'a, Message> = space().width(1).into();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     let platform_controls: Element<'a, Message> = row![
-        titlebar_control("—", Message::MinimizeWindow(window_id), false),
-        titlebar_control("□", Message::ToggleMaximizeWindow(window_id), false),
-        titlebar_control("×", Message::CloseWindow(window_id), true),
+        titlebar_control(Icon::Minimize, Message::MinimizeWindow(window_id), false),
+        titlebar_control(
+            Icon::Maximize,
+            Message::ToggleMaximizeWindow(window_id),
+            false
+        ),
+        titlebar_control(Icon::Close, Message::CloseWindow(window_id), true),
+    ]
+    .into();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let platform_controls: Element<'a, Message> = row![
+        titlebar_control(Icon::Minimize, Message::MinimizeWindow(window_id), false),
+        titlebar_control(
+            Icon::Maximize,
+            Message::ToggleMaximizeWindow(window_id),
+            false
+        ),
+        titlebar_control(Icon::Close, Message::CloseWindow(window_id), true),
     ]
     .spacing(4)
     .into();
@@ -53,7 +80,7 @@ pub fn window_titlebar<'a>(
     .width(Fill)
     .align_y(Alignment::Start);
     let action: Element<'a, Message> = match action {
-        Some((label, message)) => icon_button(label, message).into(),
+        Some((kind, message)) => icon_button(kind, message).into(),
         None => space().width(1).into(),
     };
     mouse_area(
@@ -64,7 +91,7 @@ pub fn window_titlebar<'a>(
         )
         .height(u32::from(height))
         .width(Fill)
-        .padding([0, 14])
+        .padding([0, if cfg!(target_os = "windows") { 0 } else { 14 }])
         .align_y(Alignment::Center)
         .style(theme::shaped_panel(
             SURFACE,
@@ -78,20 +105,36 @@ pub fn window_titlebar<'a>(
 
 #[cfg(not(target_os = "macos"))]
 fn titlebar_control<'a>(
-    label: &'static str,
+    kind: Icon,
     message: Message,
     close: bool,
 ) -> iced::widget::Button<'a, Message> {
-    button(centered_label(label, ICON_SIZE, TEXT))
-        .width(34)
-        .height(28)
+    button(centered_icon(kind, 10.0, TEXT))
+        .width(if cfg!(target_os = "windows") { 46 } else { 34 })
+        .height(if cfg!(target_os = "windows") { 32 } else { 28 })
         .padding(0)
-        .style(if close {
-            theme::close_button
-        } else {
-            theme::secondary_button
-        })
+        .style(titlebar_control_style(close))
         .on_press(message)
+}
+
+#[cfg(target_os = "windows")]
+fn titlebar_control_style(
+    close: bool,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style + Copy {
+    theme::windows_caption_button(close)
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn titlebar_control_style(
+    close: bool,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style + Copy {
+    move |theme, status| {
+        if close {
+            theme::close_button(theme, status)
+        } else {
+            theme::secondary_button(theme, status)
+        }
+    }
 }
 
 pub fn muted<'a>(value: impl Into<String>) -> iced::widget::Text<'a> {
@@ -109,6 +152,31 @@ pub fn secondary<'a>(
         .on_press(message)
 }
 
+pub fn secondary_with_icon<'a>(
+    kind: Icon,
+    label: impl Into<String>,
+    message: Message,
+) -> iced::widget::Button<'a, Message> {
+    button(
+        container(
+            row![
+                icon(kind, ICON_SIZE, TEXT),
+                text(label.into()).size(BODY_SIZE)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill),
+    )
+    .height(CONTROL_HEIGHT)
+    .padding(0)
+    .style(theme::secondary_button)
+    .on_press(message)
+}
+
 pub fn primary<'a>(
     label: impl Into<String>,
     message: Message,
@@ -120,13 +188,30 @@ pub fn primary<'a>(
         .on_press(message)
 }
 
-pub fn icon_button<'a>(label: &'a str, message: Message) -> iced::widget::Button<'a, Message> {
-    button(centered_label(label, ICON_SIZE, TEXT))
+pub fn icon_button(kind: Icon, message: Message) -> iced::widget::Button<'static, Message> {
+    button(centered_icon(kind, ICON_SIZE, TEXT))
         .width(CONTROL_HEIGHT)
         .height(CONTROL_HEIGHT)
         .padding(0)
         .style(theme::secondary_button)
         .on_press(message)
+}
+
+pub fn icon_toggle_button(
+    kind: Icon,
+    selected: bool,
+    message: Message,
+) -> iced::widget::Button<'static, Message> {
+    button(centered_icon(
+        kind,
+        ICON_SIZE,
+        if selected { TEXT } else { TEXT_MUTED },
+    ))
+    .width(CONTROL_HEIGHT)
+    .height(CONTROL_HEIGHT)
+    .padding(0)
+    .style(theme::toggle_button(selected))
+    .on_press(message)
 }
 
 pub fn card<'a>(title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {

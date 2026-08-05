@@ -1,5 +1,7 @@
 use iced::Size;
 
+use crate::icons::Icon;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowKind {
     Connection,
@@ -57,13 +59,13 @@ impl SettingsSection {
             Self::About => "关于",
         }
     }
-    pub fn icon(self) -> &'static str {
+    pub fn icon(self) -> Icon {
         match self {
-            Self::General => "⌘",
-            Self::Display => "◫",
-            Self::KeyMapping => "⌨",
-            Self::Security => "◈",
-            Self::About => "○",
+            Self::General => Icon::Sliders,
+            Self::Display => Icon::Monitor,
+            Self::KeyMapping => Icon::Keyboard,
+            Self::Security => Icon::Shield,
+            Self::About => Icon::Info,
         }
     }
     pub fn subtitle(self) -> &'static str {

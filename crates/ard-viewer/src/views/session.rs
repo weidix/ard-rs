@@ -1,24 +1,25 @@
-use iced::widget::{column, container, row, space, stack, text};
+use iced::widget::{button, column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Background, Border, Element, Fill, window};
 
+use crate::icons::{Icon, icon};
 use crate::theme::{
     self, BODY_SIZE, CAPTION_SIZE, CONTROL_RADIUS, MICRO_SIZE, REMOTE_CANVAS, SUCCESS, SURFACE,
     TEXT, TEXT_MUTED, WINDOW_RADIUS,
 };
-use crate::widgets::{icon_button, window_titlebar};
+use crate::widgets::{icon_button, icon_toggle_button, window_titlebar};
 use crate::{ArdViewer, Message, SessionAction};
 
-pub fn session(_app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
+pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     column![
         window_titlebar(window_id, "Studio Mac", "安全连接 · 18 ms", None, 48),
-        remote_canvas(),
+        remote_canvas(app),
     ]
     .width(Fill)
     .height(Fill)
     .into()
 }
 
-fn remote_canvas() -> Element<'static, Message> {
+fn remote_canvas(app: &ArdViewer) -> Element<'static, Message> {
     let desktop = remote_desktop();
     let base = container(column![
         space().height(62),
@@ -32,16 +33,42 @@ fn remote_canvas() -> Element<'static, Message> {
         iced::border::bottom(WINDOW_RADIUS),
     ));
 
-    let controls = container(control_bar())
+    let controls: Element<'static, Message> = if app.session_toolbar_visible {
+        container(
+            mouse_area(control_bar(app.session_toolbar_pinned))
+                .on_enter(Message::SessionToolbarInteraction)
+                .on_move(|_| Message::SessionToolbarInteraction),
+        )
         .width(Fill)
         .height(Fill)
-        .padding([14, 0])
         .align_x(Alignment::Center)
-        .align_y(Alignment::Start);
+        .align_y(Alignment::Start)
+        .into()
+    } else {
+        container(
+            button(
+                container(icon(Icon::ChevronDown, 14.0, TEXT))
+                    .width(Fill)
+                    .height(Fill)
+                    .center_x(Fill)
+                    .center_y(Fill),
+            )
+            .width(46)
+            .height(22)
+            .padding(0)
+            .style(theme::toolbar_marker)
+            .on_press(Message::ShowSessionToolbar),
+        )
+        .width(Fill)
+        .height(Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Start)
+        .into()
+    };
     let status = container(
         container(
             row![
-                text("●").size(MICRO_SIZE).color(SUCCESS),
+                dot(SUCCESS, 6.0),
                 text("RGBA · 自适应质量 · 60 fps")
                     .size(MICRO_SIZE)
                     .color(TEXT_MUTED)
@@ -65,19 +92,37 @@ fn remote_canvas() -> Element<'static, Message> {
         .into()
 }
 
-fn control_bar() -> Element<'static, Message> {
-    let button = |label: &'static str, action| icon_button(label, Message::SessionAction(action));
+fn control_bar(pinned: bool) -> Element<'static, Message> {
+    let action_button = |kind, action| icon_button(kind, Message::SessionAction(action));
+    let collapse = button(
+        container(icon(Icon::ChevronUp, 16.0, TEXT))
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill),
+    )
+    .width(theme::CONTROL_HEIGHT)
+    .height(theme::CONTROL_HEIGHT)
+    .padding(0)
+    .style(theme::toolbar_embedded_button)
+    .on_press(Message::HideSessionToolbar);
     container(
         row![
-            button("▣", SessionAction::Fit),
-            button("⌁", SessionAction::Zoom),
-            button("↔", SessionAction::Input),
-            button("⌨", SessionAction::SystemShortcut),
-            button("⎙", SessionAction::Clipboard),
-            button("◉", SessionAction::Undo),
-            icon_button("⛶", Message::ToggleFullscreen),
+            row![
+                action_button(Icon::Scan, SessionAction::Fit),
+                action_button(Icon::ZoomIn, SessionAction::Zoom),
+                action_button(Icon::Pointer, SessionAction::Input),
+                action_button(Icon::Keyboard, SessionAction::SystemShortcut),
+                action_button(Icon::Clipboard, SessionAction::Clipboard),
+                action_button(Icon::Undo, SessionAction::Undo),
+                icon_toggle_button(Icon::Pin, pinned, Message::ToggleSessionToolbarPin),
+                icon_button(Icon::Fullscreen, Message::ToggleFullscreen),
+            ]
+            .spacing(5),
+            collapse,
         ]
-        .spacing(5),
+        .spacing(0)
+        .align_y(Alignment::Center),
     )
     .padding(6)
     .style(theme::bordered_panel(
@@ -90,7 +135,8 @@ fn control_bar() -> Element<'static, Message> {
 fn remote_desktop() -> Element<'static, Message> {
     let menu = container(
         row![
-            text("●  Finder").size(CAPTION_SIZE).color(TEXT),
+            dot(TEXT, 6.0),
+            text("Finder").size(CAPTION_SIZE).color(TEXT),
             text("文件   编辑   显示   前往   窗口   帮助")
                 .size(MICRO_SIZE)
                 .color(TEXT_MUTED),
@@ -136,9 +182,16 @@ fn remote_desktop() -> Element<'static, Message> {
 
 fn remote_app() -> Element<'static, Message> {
     let chrome = container(
-        text("●  ●  ●     Remote Project")
-            .size(BODY_SIZE)
-            .color(iced::Color::from_rgb8(51, 51, 51)),
+        row![
+            dot(iced::Color::from_rgb8(51, 51, 51), 8.0),
+            dot(iced::Color::from_rgb8(51, 51, 51), 8.0),
+            dot(iced::Color::from_rgb8(51, 51, 51), 8.0),
+            text("Remote Project")
+                .size(BODY_SIZE)
+                .color(iced::Color::from_rgb8(51, 51, 51)),
+        ]
+        .spacing(7)
+        .align_y(Alignment::Center),
     )
     .height(42)
     .width(Fill)
@@ -172,11 +225,19 @@ fn remote_app() -> Element<'static, Message> {
         iced::Color::from_rgb8(222, 222, 219),
         iced::border::bottom_left(10),
     ));
-    let session_card = |label: &'static str| {
+    let session_card = |label: &'static str, status: &'static str| {
         container(
-            text(label)
-                .size(BODY_SIZE)
-                .color(iced::Color::from_rgb8(56, 56, 56)),
+            row![
+                icon(Icon::Monitor, 12.0, iced::Color::from_rgb8(56, 56, 56)),
+                text(label)
+                    .size(BODY_SIZE)
+                    .color(iced::Color::from_rgb8(56, 56, 56)),
+                text(status)
+                    .size(BODY_SIZE)
+                    .color(iced::Color::from_rgb8(56, 56, 56)),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
         )
         .height(52)
         .width(Fill)
@@ -195,8 +256,8 @@ fn remote_app() -> Element<'static, Message> {
             text("2 devices currently connected")
                 .size(CAPTION_SIZE)
                 .color(iced::Color::from_rgb8(107, 107, 107)),
-            session_card("▣  Studio Mac     Connected"),
-            session_card("▣  Office Mini     Idle"),
+            session_card("Studio Mac", "Connected"),
+            session_card("Office Mini", "Idle"),
         ]
         .spacing(14),
     )
@@ -214,5 +275,13 @@ fn remote_app() -> Element<'static, Message> {
             iced::Color::from_rgb8(237, 237, 235),
             10.0,
         ))
+        .into()
+}
+
+fn dot(color: iced::Color, size: f32) -> Element<'static, Message> {
+    container(space())
+        .width(size)
+        .height(size)
+        .style(theme::rounded_panel(color, size / 2.0))
         .into()
 }

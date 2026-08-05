@@ -99,6 +99,62 @@ pub fn bordered_panel(color: Color, radius: f32) -> impl Fn(&Theme) -> container
     }
 }
 
+pub fn modal_backdrop(_: &Theme) -> container::Style {
+    container::Style::default().background(Color::from_rgba8(0, 0, 0, 0.68))
+}
+
+pub fn toolbar_marker(_: &Theme, status: button::Status) -> button::Style {
+    let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        SURFACE_ACTIVE
+    } else {
+        SURFACE
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: TEXT,
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: CONTROL_RADIUS.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+pub fn toolbar_embedded_button(_: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+            .then_some(Background::Color(SURFACE_ACTIVE)),
+        text_color: TEXT,
+        border: Border {
+            radius: CONTROL_RADIUS.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+pub fn toggle_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |_, status| {
+        let background =
+            if selected || matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                SURFACE_ACTIVE
+            } else {
+                SURFACE
+            };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: TEXT,
+            border: Border {
+                color: if selected { TEXT_MUTED } else { BORDER },
+                width: 1.0,
+                radius: CONTROL_RADIUS.into(),
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
 pub fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
     let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
         SURFACE_ACTIVE
@@ -134,7 +190,7 @@ pub fn primary_button(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub fn close_button(_: &Theme, status: button::Status) -> button::Style {
     let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
         Color::from_rgb8(196, 55, 55)
@@ -149,6 +205,27 @@ pub fn close_button(_: &Theme, status: button::Status) -> button::Style {
             ..Border::default()
         },
         ..button::Style::default()
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_caption_button(
+    close: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |_, status| {
+        let background = match (close, status) {
+            (true, button::Status::Hovered) => Some(Color::from_rgb8(196, 43, 28)),
+            (true, button::Status::Pressed) => Some(Color::from_rgb8(153, 32, 21)),
+            (false, button::Status::Hovered) => Some(Color::from_rgb8(48, 48, 51)),
+            (false, button::Status::Pressed) => Some(Color::from_rgb8(61, 61, 65)),
+            _ => None,
+        };
+        button::Style {
+            background: background.map(Background::Color),
+            text_color: TEXT,
+            border: Border::default(),
+            ..button::Style::default()
+        }
     }
 }
 
@@ -210,6 +287,17 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
             width: 1.0,
             radius: CONTROL_RADIUS.into(),
         },
+        icon: TEXT_MUTED,
+        placeholder: TEXT_MUTED,
+        value: TEXT,
+        selection: Color::from_rgba8(235, 237, 242, 0.28),
+    }
+}
+
+pub fn inline_input(_: &Theme, _: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
         icon: TEXT_MUTED,
         placeholder: TEXT_MUTED,
         value: TEXT,

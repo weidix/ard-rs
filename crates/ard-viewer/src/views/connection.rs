@@ -1,6 +1,7 @@
 use iced::widget::{button, checkbox, column, container, row, scrollable, space, text};
 use iced::{Alignment, Element, Fill, window};
 
+use crate::icons::{Icon, icon};
 use crate::theme::{
     self, BACKGROUND, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTENT_PADDING_BOTTOM,
     CONTENT_PADDING_X, CONTENT_PADDING_Y, CONTROL_HEIGHT, CONTROL_PADDING_X, CONTROL_RADIUS,
@@ -16,7 +17,7 @@ pub fn connection(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message
             window_id,
             "ARD Viewer",
             "安全连接到远程设备",
-            Some(("⚙", Message::OpenSettings)),
+            Some((Icon::Settings, Message::OpenSettings)),
             52
         ),
         row![device_sidebar(app), form(app)]
@@ -43,7 +44,7 @@ fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
             crate::state::DeviceState::RecentlyUsed => "12 分钟前",
         };
         let content = row![
-            container(text("▣").size(ICON_SIZE).color(TEXT_WARM))
+            container(icon(Icon::Monitor, ICON_SIZE, TEXT_WARM))
                 .width(34)
                 .height(34)
                 .center_x(34)
@@ -60,7 +61,7 @@ fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
             ]
             .spacing(0)
             .width(Fill),
-            container(text("›").size(TITLE_SIZE).color(TEXT_MUTED))
+            container(icon(Icon::ChevronRight, ICON_SIZE, TEXT_MUTED))
                 .height(Fill)
                 .center_y(Fill),
         ]
@@ -84,11 +85,21 @@ fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
                 .color(TEXT_MUTED)
         ]
         .spacing(2),
-        iced::widget::text_input("⌕  搜索设备", &app.search)
-            .on_input(Message::SearchChanged)
-            .padding([8, 10])
-            .size(BODY_SIZE)
-            .style(theme::input),
+        container(
+            row![
+                icon(Icon::Search, 14.0, TEXT_MUTED),
+                iced::widget::text_input("搜索设备", &app.search)
+                    .on_input(Message::SearchChanged)
+                    .padding([8, 0])
+                    .size(BODY_SIZE)
+                    .style(theme::inline_input),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .height(38)
+        .padding([0, 10])
+        .style(theme::bordered_panel(SURFACE, CONTROL_RADIUS)),
         scrollable(devices).height(Fill),
         secondary("管理设备", Message::ManageDevices)
             .width(Fill)
@@ -156,7 +167,7 @@ fn form(app: &ArdViewer) -> Element<'_, Message> {
         column![
             row![
                 text("高级选项").size(BODY_SIZE).color(TEXT).width(Fill),
-                text("⌄").size(BODY_SIZE).color(TEXT_MUTED)
+                icon(Icon::ChevronDown, 14.0, TEXT_MUTED)
             ]
             .align_y(Alignment::Center),
             container(space().height(1))
@@ -175,7 +186,7 @@ fn form(app: &ArdViewer) -> Element<'_, Message> {
 
     let security = container(
         row![
-            text("◈").size(ICON_SIZE).color(TEXT_WARM),
+            icon(Icon::Shield, ICON_SIZE, TEXT_WARM),
             text("密码使用操作系统密钥库加密保存，不写入配置文件。")
                 .size(CAPTION_SIZE)
                 .color(TEXT_MUTED)
