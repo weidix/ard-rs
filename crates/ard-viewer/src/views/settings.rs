@@ -91,8 +91,8 @@ fn content(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         SettingsSection::General => general(app),
         SettingsSection::Display => display(app),
         SettingsSection::KeyMapping => key_mapping(app),
-        SettingsSection::Security => generic_section(app, "安全"),
-        SettingsSection::About => generic_section(app, "关于"),
+        SettingsSection::Security => security(app),
+        SettingsSection::About => about(),
     };
     container(section)
         .padding(iced::Padding {
@@ -230,28 +230,24 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
             .push(
                 container(
                     row![
-                        text(mapping.local)
+                        text(&mapping.local)
                             .size(BODY_SIZE)
                             .color(theme::palette().text)
                             .width(170),
-                        text(mapping.remote)
+                        text(&mapping.remote)
                             .size(BODY_SIZE)
                             .color(theme::palette().text)
                             .width(220),
-                        text(mapping.scope)
+                        text(&mapping.scope)
                             .size(BODY_SIZE)
                             .color(theme::palette().text)
                             .width(160),
                         iced::widget::button(
-                            container(icon(
-                                Icon::MoreHorizontal,
-                                ICON_SIZE,
-                                theme::palette().text_muted
-                            ))
-                            .width(Fill)
-                            .height(Fill)
-                            .center_x(Fill)
-                            .center_y(Fill)
+                            container(icon(Icon::Minus, ICON_SIZE, theme::palette().text_muted))
+                                .width(Fill)
+                                .height(Fill)
+                                .center_x(Fill)
+                                .center_y(Fill)
                         )
                         .padding(0)
                         .width(44)
@@ -272,7 +268,7 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
         .width(Fill)
         .style(theme::bordered_panel(theme::palette().surface, CARD_RADIUS));
     let add = row![
-        secondary_with_icon(Icon::Plus, "添加映射", Message::AddMapping)
+        secondary_with_icon(Icon::Plus, "添加常用映射", Message::AddMapping)
             .width(112)
             .height(CONTROL_HEIGHT),
         container(
@@ -370,20 +366,38 @@ fn display(app: &ArdViewer) -> Element<'_, Message> {
     .into()
 }
 
-fn generic_section<'a>(app: &'a ArdViewer, title: &'static str) -> Element<'a, Message> {
+fn security(app: &ArdViewer) -> Element<'_, Message> {
     column![
-        text(title).size(TITLE_SIZE).color(theme::palette().text),
-        muted(app.settings_section.subtitle()),
+        text("安全").size(TITLE_SIZE).color(theme::palette().text),
+        muted("管理本地凭据与连接数据。"),
         card(
-            "共享设置",
+            "凭据存储",
             column![
-                checkbox(app.show_performance_hud)
-                    .label("显示会话性能信息")
-                    .on_toggle(Message::PerformanceHudChanged)
+                checkbox(app.remember_password)
+                    .label("在操作系统密钥库中保存当前设备密码")
+                    .on_toggle(Message::RememberPasswordChanged)
                     .size(16)
                     .text_size(BODY_SIZE)
                     .style(theme::checkbox),
-                muted("这些设置由三个应用窗口共享。"),
+                muted("配置文件只保存设备地址、用户名和界面偏好；密码不会写入配置文件。"),
+            ]
+            .spacing(10)
+        ),
+    ]
+    .spacing(13)
+    .into()
+}
+
+fn about() -> Element<'static, Message> {
+    column![
+        text("关于").size(TITLE_SIZE).color(theme::palette().text),
+        muted("Apple Remote Desktop 原生 Rust 客户端。"),
+        card(
+            "ARD Viewer",
+            column![
+                text(format!("版本 {}", env!("CARGO_PKG_VERSION"))).size(BODY_SIZE),
+                muted("支持 ARD 认证、加密传输、MVS GPU 解码、键鼠输入、剪贴板与自动重连。"),
+                muted("许可证：MIT OR Apache-2.0"),
             ]
             .spacing(10)
         ),

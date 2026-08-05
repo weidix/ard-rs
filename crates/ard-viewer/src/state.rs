@@ -45,6 +45,7 @@ impl WindowKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum DeviceState {
     Online,
     Saved,
@@ -55,6 +56,7 @@ pub enum DeviceState {
 pub struct SavedDevice {
     pub name: String,
     pub address: String,
+    pub username: String,
     pub state: DeviceState,
 }
 
@@ -93,20 +95,11 @@ impl SettingsSection {
             Self::About => Icon::Info,
         }
     }
-    pub fn subtitle(self) -> &'static str {
-        match self {
-            Self::General => "配置应用的通用行为。",
-            Self::Display => "设置远程画面的质量和性能。",
-            Self::KeyMapping => "配置本地按键如何发送到远程设备。",
-            Self::Security => "管理认证、加密与受信任设备。",
-            Self::About => "查看版本与实现信息。",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct KeyMapping {
-    pub local: &'static str,
-    pub remote: &'static str,
-    pub scope: &'static str,
+    pub local: String,
+    pub remote: String,
+    pub scope: String,
 }

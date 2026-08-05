@@ -2331,8 +2331,8 @@ fn parse_cli_args(
     ))
 }
 
-fn main() {
-    let (address, username, quality, frame_interval) = match parse_cli_args(env::args().skip(1)) {
+pub(crate) fn run_from_gui() {
+    let (address, username, quality, frame_interval) = match parse_cli_args(env::args().skip(2)) {
         Ok(parsed) => parsed,
         Err(error) => {
             if !error.is_empty() {

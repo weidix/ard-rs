@@ -1,12 +1,17 @@
 #![deny(unsafe_code)]
 
+mod config;
 mod icons;
+#[path = "reference/ard-viewer.rs"]
+mod legacy_viewer;
 mod state;
 mod theme;
 mod views;
 mod widgets;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ard_rs::ArdVideoQuality;
@@ -29,6 +34,7 @@ struct ArdViewer {
     device_transition: f32,
     search: String,
     address: String,
+    username: String,
     password: String,
     remember_password: bool,
     remember_device: bool,
@@ -82,6 +88,7 @@ enum Message {
     SearchChanged(String),
     DeviceSelected(usize),
     AddressChanged(String),
+    UsernameChanged(String),
     PasswordChanged(String),
     RememberPasswordChanged(bool),
     RememberDeviceChanged(bool),
@@ -127,46 +134,52 @@ enum SessionAction {
 
 impl ArdViewer {
     fn new() -> (Self, Task<Message>) {
-        let devices = vec![
-            SavedDevice {
-                name: "Studio Mac".into(),
-                address: "10.0.0.42:5900".into(),
-                state: DeviceState::Online,
-            },
-            SavedDevice {
-                name: "Office Mini".into(),
-                address: "office.example.com:5900".into(),
-                state: DeviceState::Saved,
-            },
-            SavedDevice {
-                name: "Home Server".into(),
-                address: "192.168.1.18:5900".into(),
-                state: DeviceState::RecentlyUsed,
-            },
-        ];
+        let cached = config::AppConfig::load();
+        let devices = config::devices_from_cache(&cached);
+        let address = if cached.last_address.is_empty() {
+            devices
+                .first()
+                .map_or_else(String::new, |device| device.address.clone())
+        } else {
+            cached.last_address.clone()
+        };
+        let username = if cached.last_username.is_empty() {
+            devices
+                .first()
+                .map_or_else(String::new, |device| device.username.clone())
+        } else {
+            cached.last_username.clone()
+        };
+        let password = if cached.remember_password {
+            config::load_password(&address, &username).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let mappings = profile_mappings(&cached.key_profile);
         let app = Self {
             windows: BTreeMap::new(),
             maximized_windows: BTreeSet::new(),
-            address: "mac-studio.local".into(),
+            address,
+            username,
             devices,
             selected_device: 0,
             previous_selected_device: 0,
             device_transition: 1.0,
             search: String::new(),
-            password: "ard-password".into(),
-            remember_password: true,
-            remember_device: true,
-            quality: ArdVideoQuality::Adaptive,
-            frame_interval_ms: "Server-driven".into(),
+            password,
+            remember_password: cached.remember_password,
+            remember_device: cached.remember_device,
+            quality: config::quality_from_cache(&cached.quality),
+            frame_interval_ms: cached.frame_interval_ms,
             settings_section: SettingsSection::KeyMapping,
             settings_transition: 1.0,
-            key_profile: "macOS 默认".into(),
-            auto_adapt_keyboard: true,
-            capture_system_shortcuts: false,
-            show_performance_hud: true,
-            theme_preference: ThemePreference::System,
+            key_profile: cached.key_profile,
+            auto_adapt_keyboard: cached.auto_adapt_keyboard,
+            capture_system_shortcuts: cached.capture_system_shortcuts,
+            show_performance_hud: cached.show_performance_hud,
+            theme_preference: config::theme_from_cache(&cached.theme),
             system_dark: false,
-            mappings: default_mappings(),
+            mappings,
             session_zoom: 1.0,
             session_fullscreen: false,
             session_toolbar_visible: true,
@@ -312,12 +325,30 @@ impl ArdViewer {
                     }
                     self.selected_device = index;
                     self.address.clone_from(&device.address);
+                    self.username.clone_from(&device.username);
+                    self.password = if self.remember_password {
+                        config::load_password(&self.address, &self.username).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                 }
             }
             Message::AddressChanged(value) => self.address = value,
+            Message::UsernameChanged(value) => self.username = value,
             Message::PasswordChanged(value) => self.password = value,
-            Message::RememberPasswordChanged(value) => self.remember_password = value,
-            Message::RememberDeviceChanged(value) => self.remember_device = value,
+            Message::RememberPasswordChanged(value) => {
+                self.remember_password = value;
+                if !value
+                    && let Err(error) = config::save_password(&self.address, &self.username, None)
+                {
+                    self.status = format!("移除系统密钥库密码失败：{error}");
+                }
+                self.persist_config();
+            }
+            Message::RememberDeviceChanged(value) => {
+                self.remember_device = value;
+                self.persist_config();
+            }
             Message::SaveDevice => {
                 let address = self.address.trim();
                 if address.is_empty() {
@@ -328,12 +359,14 @@ impl ArdViewer {
                     .position(|device| device.address.eq_ignore_ascii_case(address))
                 {
                     self.selected_device = index;
+                    self.devices[index].username = self.username.trim().to_owned();
                     self.status = "设备已保存".into();
                 } else {
                     let name = address.trim_end_matches(":5900").to_owned();
                     self.devices.push(SavedDevice {
                         name,
                         address: address.to_owned(),
+                        username: self.username.trim().to_owned(),
                         state: DeviceState::Saved,
                     });
                     self.previous_selected_device = self.selected_device;
@@ -341,6 +374,10 @@ impl ArdViewer {
                     self.device_transition = 0.0;
                     self.status = "设备已保存".into();
                 }
+                if !address.is_empty() {
+                    self.store_credentials();
+                }
+                self.persist_config();
             }
             Message::SettingsSectionSelected(section) => {
                 if section != self.settings_section {
@@ -348,15 +385,35 @@ impl ArdViewer {
                     self.settings_transition = 0.0;
                 }
             }
-            Message::QualityChanged(quality) => self.quality = quality,
-            Message::FrameIntervalChanged(value) => self.frame_interval_ms = value,
-            Message::KeyProfileChanged(value) => self.key_profile = value,
-            Message::AutoAdaptChanged(value) => self.auto_adapt_keyboard = value,
-            Message::CaptureShortcutsChanged(value) => self.capture_system_shortcuts = value,
-            Message::PerformanceHudChanged(value) => self.show_performance_hud = value,
+            Message::QualityChanged(quality) => {
+                self.quality = quality;
+                self.persist_config();
+            }
+            Message::FrameIntervalChanged(value) => {
+                self.frame_interval_ms = value;
+                self.persist_config();
+            }
+            Message::KeyProfileChanged(value) => {
+                self.mappings = profile_mappings(&value);
+                self.key_profile = value;
+                self.persist_config();
+            }
+            Message::AutoAdaptChanged(value) => {
+                self.auto_adapt_keyboard = value;
+                self.persist_config();
+            }
+            Message::CaptureShortcutsChanged(value) => {
+                self.capture_system_shortcuts = value;
+                self.persist_config();
+            }
+            Message::PerformanceHudChanged(value) => {
+                self.show_performance_hud = value;
+                self.persist_config();
+            }
             Message::ThemePreferenceChanged(preference) => {
                 self.theme_preference = preference;
                 theme::set_dark(self.effective_dark());
+                self.persist_config();
             }
             Message::SystemThemeChanged(mode) => {
                 self.system_dark = mode == iced::theme::Mode::Dark;
@@ -364,7 +421,10 @@ impl ArdViewer {
                     theme::set_dark(self.system_dark);
                 }
             }
-            Message::ResetMappings => self.mappings = default_mappings(),
+            Message::ResetMappings => {
+                self.mappings = default_mappings();
+                self.status = "按键映射已恢复默认".into();
+            }
             Message::ToggleFullscreen => {
                 self.touch_session_toolbar();
                 self.session_fullscreen = !self.session_fullscreen;
@@ -390,21 +450,62 @@ impl ArdViewer {
                 }
             }
             Message::Connect => {
-                self.session_toolbar_visible = true;
-                self.session_toolbar_last_interaction = Instant::now();
-                if let Some(id) = self.window_id(WindowKind::Session) {
-                    return window::gain_focus(id);
+                if self.address.trim().is_empty() || self.username.trim().is_empty() {
+                    self.status = "请输入设备地址和用户名".into();
+                } else if self.password.is_empty() {
+                    self.status = "请输入密码".into();
+                } else {
+                    self.store_credentials();
+                    self.persist_config();
+                    match self.launch_session() {
+                        Ok(()) => self.status = "已启动远程会话".into(),
+                        Err(error) => self.status = format!("无法启动会话：{error}"),
+                    }
                 }
-                return open_window(WindowKind::Session);
             }
-            Message::ManageDevices => self.status = "Device management is not wired yet".into(),
-            Message::ExportShortcuts => self.status = "Shortcut export is not wired yet".into(),
-            Message::CopyPreset => self.status = "Preset copied".into(),
-            Message::AddMapping => self.status = "Mapping editor is not wired yet".into(),
-            Message::EditMapping(index) => self.status = format!("Mapping {} selected", index + 1),
+            Message::ManageDevices => {
+                if !self.devices.is_empty() {
+                    let removed = self
+                        .devices
+                        .remove(self.selected_device.min(self.devices.len() - 1));
+                    if let Err(error) =
+                        config::save_password(&removed.address, &removed.username, None)
+                    {
+                        self.status = format!("移除系统密钥库密码失败：{error}");
+                    }
+                    self.selected_device = self
+                        .selected_device
+                        .min(self.devices.len().saturating_sub(1));
+                    self.previous_selected_device = self.selected_device;
+                    if !self.status.starts_with("移除系统密钥库密码失败") {
+                        self.status = "已移除所选设备".into();
+                    }
+                    self.persist_config();
+                }
+            }
+            Message::ExportShortcuts => self.export_shortcuts(),
+            Message::CopyPreset => {
+                self.key_profile = format!("{} 副本", self.key_profile.trim_end_matches(" 副本"));
+                self.status = "已复制按键预设".into();
+                self.persist_config();
+            }
+            Message::AddMapping => {
+                self.mappings.push(KeyMapping {
+                    local: "F11".into(),
+                    remote: "显示桌面".into(),
+                    scope: "会话".into(),
+                });
+                self.status = "已添加常用映射".into();
+            }
+            Message::EditMapping(index) => {
+                if index < self.mappings.len() {
+                    self.mappings.remove(index);
+                    self.status = "已移除按键映射".into();
+                }
+            }
             Message::SessionAction(_) => {
                 self.touch_session_toolbar();
-                self.status = "Session transport is not wired yet".into();
+                self.status = "会话输入、剪贴板与快捷键由实时渲染窗口处理".into();
             }
             Message::SessionToolbarTick(now) => {
                 if self.session_toolbar_visible
@@ -571,6 +672,88 @@ impl ArdViewer {
             );
         }
     }
+
+    fn persist_config(&mut self) {
+        let cached = config::AppConfig {
+            devices: if self.remember_device {
+                self.devices
+                    .iter()
+                    .map(|device| config::CachedDevice {
+                        name: device.name.clone(),
+                        address: device.address.clone(),
+                        username: device.username.clone(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            last_address: self.address.trim().to_owned(),
+            last_username: self.username.trim().to_owned(),
+            remember_password: self.remember_password,
+            remember_device: self.remember_device,
+            quality: config::quality_to_cache(self.quality).into(),
+            frame_interval_ms: normalized_frame_interval(&self.frame_interval_ms).to_string(),
+            key_profile: self.key_profile.clone(),
+            auto_adapt_keyboard: self.auto_adapt_keyboard,
+            capture_system_shortcuts: self.capture_system_shortcuts,
+            show_performance_hud: self.show_performance_hud,
+            theme: config::theme_to_cache(self.theme_preference).into(),
+        };
+        if let Err(error) = cached.save() {
+            self.status = format!("保存配置失败：{error}");
+        }
+    }
+
+    fn store_credentials(&mut self) {
+        let password = self.remember_password.then_some(self.password.as_str());
+        if let Err(error) = config::save_password(&self.address, &self.username, password) {
+            self.status = format!("系统密钥库不可用：{error}");
+        }
+    }
+
+    fn launch_session(&self) -> Result<(), String> {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        Command::new(executable)
+            .arg("--session-renderer")
+            .arg("--quality")
+            .arg(config::quality_to_cache(self.quality))
+            .arg("--frame-interval-ms")
+            .arg(normalized_frame_interval(&self.frame_interval_ms).to_string())
+            .arg(self.address.trim())
+            .arg(self.username.trim())
+            .env("ARD_PASSWORD", &self.password)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn export_shortcuts(&mut self) {
+        let Some(path) = config::export_path() else {
+            self.status = "无法确定导出目录".into();
+            return;
+        };
+        let mappings: Vec<_> = self.mappings.iter().map(|mapping| {
+            serde_json::json!({"local": mapping.local, "remote": mapping.remote, "scope": mapping.scope})
+        }).collect();
+        let result = path
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()
+            .and_then(|_| {
+                fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&mappings).expect("JSON serialization cannot fail"),
+                )
+            });
+        self.status = match result {
+            Ok(()) => format!("快捷方式已导出到 {}", path.display()),
+            Err(error) => format!("导出失败：{error}"),
+        };
+    }
+}
+
+fn normalized_frame_interval(value: &str) -> u64 {
+    value.trim().parse().unwrap_or(0)
 }
 
 fn close_confirmation<'a>(
@@ -736,36 +919,49 @@ fn platform_window_settings() -> window::settings::PlatformSpecific {
 }
 
 fn default_mappings() -> Vec<KeyMapping> {
+    profile_mappings("macOS 默认")
+}
+
+fn profile_mappings(profile: &str) -> Vec<KeyMapping> {
+    let (copy, paste, switch) = if profile.starts_with("Windows") || profile.starts_with("Linux") {
+        ("Ctrl C", "Ctrl V", "Alt Tab")
+    } else {
+        ("⌘ C", "⌘ V", "⌘ `")
+    };
     vec![
         KeyMapping {
-            local: "⌘ C",
-            remote: "复制",
-            scope: "全局",
+            local: copy.into(),
+            remote: "复制".into(),
+            scope: "全局".into(),
         },
         KeyMapping {
-            local: "⌘ V",
-            remote: "粘贴",
-            scope: "全局",
+            local: paste.into(),
+            remote: "粘贴".into(),
+            scope: "全局".into(),
         },
         KeyMapping {
-            local: "⌘ ⌥ Esc",
-            remote: "强制退出",
-            scope: "macOS",
+            local: "⌘ ⌥ Esc".into(),
+            remote: "强制退出".into(),
+            scope: "macOS".into(),
         },
         KeyMapping {
-            local: "Ctrl Alt Del",
-            remote: "安全选项",
-            scope: "Windows",
+            local: "Ctrl Alt Del".into(),
+            remote: "安全选项".into(),
+            scope: "Windows".into(),
         },
         KeyMapping {
-            local: "⌘ `",
-            remote: "切换远程窗口",
-            scope: "会话",
+            local: switch.into(),
+            remote: "切换远程窗口".into(),
+            scope: "会话".into(),
         },
     ]
 }
 
 fn main() -> iced::Result {
+    if std::env::args().nth(1).as_deref() == Some("--session-renderer") {
+        legacy_viewer::run_from_gui();
+        return Ok(());
+    }
     iced::daemon(ArdViewer::new, ArdViewer::update, ArdViewer::view)
         .title(ArdViewer::title)
         .theme(ArdViewer::theme)
@@ -939,6 +1135,20 @@ mod tests {
     #[test]
     fn ui_transitions_start_and_converge_smoothly() {
         let (mut app, _task) = ArdViewer::new();
+        app.devices = vec![
+            SavedDevice {
+                name: "A".into(),
+                address: "a.local:5900".into(),
+                username: "a".into(),
+                state: DeviceState::Saved,
+            },
+            SavedDevice {
+                name: "B".into(),
+                address: "b.local:5900".into(),
+                username: "b".into(),
+                state: DeviceState::Saved,
+            },
+        ];
         let now = Instant::now();
         app.animation_clock = now;
 
@@ -1015,7 +1225,10 @@ mod tests {
             ] {
                 let mut ui = iced_test::Simulator::with_size(settings.clone(), size, view);
                 let snapshot = ui.snapshot(&theme::app_theme())?;
-                assert!(snapshot.matches_image(format!("/tmp/ard-viewer-{mode}-{name}"))?);
+                assert!(
+                    snapshot
+                        .matches_image(format!("/tmp/ard-viewer-capabilities-v2-{mode}-{name}"))?
+                );
             }
         }
         Ok(())

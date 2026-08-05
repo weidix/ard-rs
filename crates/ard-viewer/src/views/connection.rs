@@ -121,7 +121,7 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             CONTROL_RADIUS
         )),
         scrollable(devices).height(Fill),
-        secondary("管理设备", Message::ManageDevices)
+        secondary("移除所选设备", Message::ManageDevices)
             .width(Fill)
             .height(CONTROL_HEIGHT),
     ]
@@ -166,6 +166,17 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             .style(theme::input),
     ]
     .spacing(5);
+    let username = column![
+        text("用户名")
+            .size(BODY_SIZE)
+            .color(theme::palette().text_muted),
+        iced::widget::text_input("远程账户名", &app.username)
+            .on_input(Message::UsernameChanged)
+            .padding([10.0, CONTROL_PADDING_X])
+            .size(BODY_SIZE)
+            .style(theme::input),
+    ]
+    .spacing(5);
     let password = column![
         text("密码")
             .size(BODY_SIZE)
@@ -197,19 +208,22 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let advanced = container(
         column![
             row![
-                text("高级选项")
+                text("连接参数")
                     .size(BODY_SIZE)
                     .color(theme::palette().text)
                     .width(Fill),
-                icon(Icon::ChevronDown, 14.0, theme::palette().text_muted)
+                icon(Icon::Sliders, 14.0, theme::palette().text_muted)
             ]
             .align_y(Alignment::Center),
             container(space().height(1))
                 .width(Fill)
                 .style(theme::panel(theme::palette().border)),
-            text("端口  3283        像素格式  自动        编码  自适应")
-                .size(CAPTION_SIZE)
-                .color(theme::palette().text_muted),
+            text(format!(
+                "端口  默认 5900        像素格式  自动        编码  {}",
+                app.quality.label()
+            ))
+            .size(CAPTION_SIZE)
+            .color(theme::palette().text_muted),
         ]
         .spacing(9),
     )
@@ -256,10 +270,14 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let body = column![
         heading,
         address,
+        username,
         password,
         remembers,
         advanced,
         security,
+        text(&app.status)
+            .size(CAPTION_SIZE)
+            .color(theme::palette().text_warm),
         space().height(Fill),
         actions,
     ]
