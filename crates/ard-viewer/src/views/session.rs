@@ -1,8 +1,11 @@
 use iced::widget::{column, container, row, space, stack, text};
 use iced::{Alignment, Background, Border, Element, Fill, window};
 
-use crate::theme::{self, REMOTE_CANVAS, SUCCESS, SURFACE, TEXT, TEXT_MUTED};
-use crate::widgets::{secondary, window_titlebar};
+use crate::theme::{
+    self, BODY_SIZE, CAPTION_SIZE, CONTROL_RADIUS, MICRO_SIZE, REMOTE_CANVAS, SUCCESS, SURFACE,
+    TEXT, TEXT_MUTED, WINDOW_RADIUS,
+};
+use crate::widgets::{icon_button, window_titlebar};
 use crate::{ArdViewer, Message, SessionAction};
 
 pub fn session(_app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
@@ -24,7 +27,10 @@ fn remote_canvas() -> Element<'static, Message> {
     ])
     .width(Fill)
     .height(Fill)
-    .style(theme::shaped_panel(REMOTE_CANVAS, iced::border::bottom(12)));
+    .style(theme::shaped_panel(
+        REMOTE_CANVAS,
+        iced::border::bottom(WINDOW_RADIUS),
+    ));
 
     let controls = container(control_bar())
         .width(Fill)
@@ -35,14 +41,16 @@ fn remote_canvas() -> Element<'static, Message> {
     let status = container(
         container(
             row![
-                text("●").size(8).color(SUCCESS),
-                text("RGBA · 自适应质量 · 60 fps").size(9).color(TEXT_MUTED)
+                text("●").size(MICRO_SIZE).color(SUCCESS),
+                text("RGBA · 自适应质量 · 60 fps")
+                    .size(MICRO_SIZE)
+                    .color(TEXT_MUTED)
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         )
         .padding(8)
-        .style(theme::bordered_panel(SURFACE, 8.0)),
+        .style(theme::bordered_panel(SURFACE, CONTROL_RADIUS)),
     )
     .width(Fill)
     .height(Fill)
@@ -58,11 +66,7 @@ fn remote_canvas() -> Element<'static, Message> {
 }
 
 fn control_bar() -> Element<'static, Message> {
-    let button = |label: &'static str, action| {
-        secondary(label, Message::SessionAction(action))
-            .width(34)
-            .height(34)
-    };
+    let button = |label: &'static str, action| icon_button(label, Message::SessionAction(action));
     container(
         row![
             button("▣", SessionAction::Fit),
@@ -71,9 +75,7 @@ fn control_bar() -> Element<'static, Message> {
             button("⌨", SessionAction::SystemShortcut),
             button("⎙", SessionAction::Clipboard),
             button("◉", SessionAction::Undo),
-            secondary("⛶", Message::ToggleFullscreen)
-                .width(34)
-                .height(34),
+            icon_button("⛶", Message::ToggleFullscreen),
         ]
         .spacing(5),
     )
@@ -88,12 +90,12 @@ fn control_bar() -> Element<'static, Message> {
 fn remote_desktop() -> Element<'static, Message> {
     let menu = container(
         row![
-            text("●  Finder").size(10).color(TEXT),
+            text("●  Finder").size(CAPTION_SIZE).color(TEXT),
             text("文件   编辑   显示   前往   窗口   帮助")
-                .size(9)
+                .size(MICRO_SIZE)
                 .color(TEXT_MUTED),
             space().width(Fill),
-            text("Wi‑Fi   14:32").size(9).color(TEXT_MUTED),
+            text("Wi‑Fi   14:32").size(MICRO_SIZE).color(TEXT_MUTED),
         ]
         .spacing(14)
         .align_y(Alignment::Center),
@@ -101,7 +103,10 @@ fn remote_desktop() -> Element<'static, Message> {
     .height(28)
     .padding([0, 12])
     .width(Fill)
-    .style(theme::panel(iced::Color::from_rgb8(20, 20, 22)));
+    .style(theme::shaped_panel(
+        iced::Color::from_rgb8(20, 20, 22),
+        iced::border::top(6),
+    ));
 
     let remote_app = remote_app();
     let contents = column![
@@ -132,27 +137,30 @@ fn remote_desktop() -> Element<'static, Message> {
 fn remote_app() -> Element<'static, Message> {
     let chrome = container(
         text("●  ●  ●     Remote Project")
-            .size(11)
+            .size(BODY_SIZE)
             .color(iced::Color::from_rgb8(51, 51, 51)),
     )
     .height(42)
     .width(Fill)
     .padding([0, 12])
     .center_y(42)
-    .style(theme::panel(iced::Color::from_rgb8(214, 214, 212)));
+    .style(theme::shaped_panel(
+        iced::Color::from_rgb8(214, 214, 212),
+        iced::border::top(10),
+    ));
     let sidebar = container(
         column![
             text("Overview")
-                .size(10)
+                .size(CAPTION_SIZE)
                 .color(iced::Color::from_rgb8(64, 64, 64)),
             text("Sessions")
-                .size(10)
+                .size(CAPTION_SIZE)
                 .color(iced::Color::from_rgb8(64, 64, 64)),
             text("Devices")
-                .size(10)
+                .size(CAPTION_SIZE)
                 .color(iced::Color::from_rgb8(64, 64, 64)),
             text("Settings")
-                .size(10)
+                .size(CAPTION_SIZE)
                 .color(iced::Color::from_rgb8(64, 64, 64)),
         ]
         .spacing(10),
@@ -160,11 +168,14 @@ fn remote_app() -> Element<'static, Message> {
     .width(150)
     .height(Fill)
     .padding(14)
-    .style(theme::panel(iced::Color::from_rgb8(222, 222, 219)));
+    .style(theme::shaped_panel(
+        iced::Color::from_rgb8(222, 222, 219),
+        iced::border::bottom_left(10),
+    ));
     let session_card = |label: &'static str| {
         container(
             text(label)
-                .size(11)
+                .size(BODY_SIZE)
                 .color(iced::Color::from_rgb8(56, 56, 56)),
         )
         .height(52)
@@ -173,7 +184,7 @@ fn remote_app() -> Element<'static, Message> {
         .center_y(52)
         .style(theme::rounded_panel(
             iced::Color::from_rgb8(227, 227, 224),
-            8.0,
+            CONTROL_RADIUS,
         ))
     };
     let pane = container(
@@ -182,7 +193,7 @@ fn remote_app() -> Element<'static, Message> {
                 .size(19)
                 .color(iced::Color::from_rgb8(33, 33, 33)),
             text("2 devices currently connected")
-                .size(10)
+                .size(CAPTION_SIZE)
                 .color(iced::Color::from_rgb8(107, 107, 107)),
             session_card("▣  Studio Mac     Connected"),
             session_card("▣  Office Mini     Idle"),
@@ -192,7 +203,10 @@ fn remote_app() -> Element<'static, Message> {
     .width(470)
     .height(Fill)
     .padding(22)
-    .style(theme::panel(iced::Color::from_rgb8(242, 242, 240)));
+    .style(theme::shaped_panel(
+        iced::Color::from_rgb8(242, 242, 240),
+        iced::border::bottom_right(10),
+    ));
     container(column![chrome, row![sidebar, pane].height(Fill)])
         .width(620)
         .height(390)

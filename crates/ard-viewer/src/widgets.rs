@@ -2,7 +2,23 @@ use iced::widget::{button, column, container, mouse_area, row, space, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::Message;
-use crate::theme::{self, SURFACE, TEXT, TEXT_MUTED};
+use crate::theme::{
+    self, ACCENT_TEXT, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTROL_HEIGHT, ICON_SIZE, SURFACE,
+    TEXT, TEXT_MUTED, WINDOW_RADIUS, WINDOW_TITLE_SIZE,
+};
+
+fn centered_label<'a>(
+    label: impl Into<String>,
+    size: f32,
+    color: iced::Color,
+) -> Element<'a, Message> {
+    container(text(label.into()).size(size).color(color))
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
+}
 
 pub fn window_titlebar<'a>(
     window_id: window::Id,
@@ -26,14 +42,18 @@ pub fn window_titlebar<'a>(
     ]
     .spacing(4)
     .into();
-    let titles = column![
-        text(title).size(13).color(TEXT),
-        text(subtitle).size(9).color(TEXT_MUTED),
-    ]
-    .spacing(0)
-    .width(Fill);
+    let titles = container(
+        column![
+            text(title).size(WINDOW_TITLE_SIZE).color(TEXT),
+            text(subtitle).size(CAPTION_SIZE).color(TEXT_MUTED),
+        ]
+        .spacing(0),
+    )
+    .height(CONTROL_HEIGHT)
+    .width(Fill)
+    .align_y(Alignment::Start);
     let action: Element<'a, Message> = match action {
-        Some((label, message)) => secondary(label, message).width(34).height(34).into(),
+        Some((label, message)) => icon_button(label, message).into(),
         None => space().width(1).into(),
     };
     mouse_area(
@@ -45,7 +65,11 @@ pub fn window_titlebar<'a>(
         .height(u32::from(height))
         .width(Fill)
         .padding([0, 14])
-        .style(theme::shaped_panel(SURFACE, iced::border::top(12))),
+        .align_y(Alignment::Center)
+        .style(theme::shaped_panel(
+            SURFACE,
+            iced::border::top(WINDOW_RADIUS),
+        )),
     )
     .on_press(Message::DragWindow(window_id))
     .on_double_click(Message::ToggleMaximizeWindow(window_id))
@@ -58,7 +82,7 @@ fn titlebar_control<'a>(
     message: Message,
     close: bool,
 ) -> iced::widget::Button<'a, Message> {
-    button(text(label).size(13))
+    button(centered_label(label, ICON_SIZE, TEXT))
         .width(34)
         .height(28)
         .padding(0)
@@ -71,15 +95,16 @@ fn titlebar_control<'a>(
 }
 
 pub fn muted<'a>(value: impl Into<String>) -> iced::widget::Text<'a> {
-    text(value.into()).color(TEXT_MUTED).size(13)
+    text(value.into()).color(TEXT_MUTED).size(CAPTION_SIZE)
 }
 
 pub fn secondary<'a>(
     label: impl Into<String>,
     message: Message,
 ) -> iced::widget::Button<'a, Message> {
-    button(text(label.into()).size(13))
-        .padding([8, 12])
+    button(centered_label(label, BODY_SIZE, TEXT))
+        .height(CONTROL_HEIGHT)
+        .padding(0)
         .style(theme::secondary_button)
         .on_press(message)
 }
@@ -88,16 +113,26 @@ pub fn primary<'a>(
     label: impl Into<String>,
     message: Message,
 ) -> iced::widget::Button<'a, Message> {
-    button(text(label.into()).size(13))
-        .padding([8, 16])
+    button(centered_label(label, BODY_SIZE, ACCENT_TEXT))
+        .height(CONTROL_HEIGHT)
+        .padding(0)
         .style(theme::primary_button)
         .on_press(message)
 }
 
+pub fn icon_button<'a>(label: &'a str, message: Message) -> iced::widget::Button<'a, Message> {
+    button(centered_label(label, ICON_SIZE, TEXT))
+        .width(CONTROL_HEIGHT)
+        .height(CONTROL_HEIGHT)
+        .padding(0)
+        .style(theme::secondary_button)
+        .on_press(message)
+}
+
 pub fn card<'a>(title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(column![text(title).color(TEXT).size(14), body.into()].spacing(10))
+    container(column![text(title).color(TEXT).size(BODY_SIZE), body.into()].spacing(10))
         .width(Fill)
         .padding(16)
-        .style(theme::panel(SURFACE))
+        .style(theme::bordered_panel(SURFACE, CARD_RADIUS))
         .into()
 }

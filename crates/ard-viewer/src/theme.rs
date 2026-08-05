@@ -1,4 +1,7 @@
-use iced::widget::{button, checkbox as iced_checkbox, container, text_input};
+use iced::widget::overlay::menu;
+use iced::widget::{
+    button, checkbox as iced_checkbox, container, pick_list as iced_pick_list, text_input,
+};
 use iced::{Background, Border, Color, Shadow, Theme, border};
 
 pub const BACKGROUND: Color = Color::from_rgb8(13, 13, 14);
@@ -14,6 +17,26 @@ pub const ACCENT: Color = TEXT;
 pub const ACCENT_TEXT: Color = Color::from_rgb8(9, 9, 10);
 pub const SUCCESS: Color = Color::from_rgb8(87, 158, 107);
 pub const WARNING: Color = TEXT_WARM;
+
+// Layout tokens. Keep geometry here so every window uses the same, predictable
+// control metrics instead of relying on each widget's intrinsic size.
+pub const WINDOW_RADIUS: f32 = 12.0;
+pub const CARD_RADIUS: f32 = 9.0;
+pub const CONTROL_RADIUS: f32 = 8.0;
+pub const CHECKBOX_RADIUS: f32 = 4.0;
+
+pub const TITLE_SIZE: f32 = 15.0;
+pub const WINDOW_TITLE_SIZE: f32 = 13.0;
+pub const ICON_SIZE: f32 = 16.0;
+pub const BODY_SIZE: f32 = 11.0;
+pub const CAPTION_SIZE: f32 = 10.0;
+pub const MICRO_SIZE: f32 = 9.0;
+
+pub const CONTROL_HEIGHT: f32 = 34.0;
+pub const CONTROL_PADDING_X: f32 = 12.0;
+pub const CONTENT_PADDING_X: f32 = 28.0;
+pub const CONTENT_PADDING_Y: f32 = 24.0;
+pub const CONTENT_PADDING_BOTTOM: f32 = 16.0;
 
 pub fn app_theme() -> Theme {
     Theme::custom(
@@ -88,7 +111,7 @@ pub fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
         border: Border {
             color: BORDER,
             width: 1.0,
-            radius: 8.0.into(),
+            radius: CONTROL_RADIUS.into(),
         },
         ..button::Style::default()
     }
@@ -104,7 +127,7 @@ pub fn primary_button(_: &Theme, status: button::Status) -> button::Style {
         background: Some(Background::Color(background)),
         text_color: ACCENT_TEXT,
         border: Border {
-            radius: 8.0.into(),
+            radius: CONTROL_RADIUS.into(),
             ..Border::default()
         },
         ..button::Style::default()
@@ -141,7 +164,7 @@ pub fn nav_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::
             background,
             text_color: if selected { TEXT } else { TEXT_MUTED },
             border: Border {
-                radius: 8.0.into(),
+                radius: CONTROL_RADIUS.into(),
                 ..Border::default()
             },
             ..button::Style::default()
@@ -161,7 +184,7 @@ pub fn device_button(selected: bool) -> impl Fn(&Theme, button::Status) -> butto
             background: Some(Background::Color(background)),
             text_color: if selected { TEXT } else { TEXT_MUTED },
             border: Border {
-                radius: 8.0.into(),
+                radius: CONTROL_RADIUS.into(),
                 ..Border::default()
             },
             ..button::Style::default()
@@ -185,12 +208,49 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
                 BORDER
             },
             width: 1.0,
-            radius: 8.0.into(),
+            radius: CONTROL_RADIUS.into(),
         },
         icon: TEXT_MUTED,
         placeholder: TEXT_MUTED,
         value: TEXT,
         selection: Color::from_rgba8(235, 237, 242, 0.28),
+    }
+}
+
+pub fn pick_list(_: &Theme, status: iced_pick_list::Status) -> iced_pick_list::Style {
+    iced_pick_list::Style {
+        text_color: TEXT,
+        placeholder_color: TEXT_MUTED,
+        handle_color: TEXT_MUTED,
+        background: Background::Color(SURFACE_ACTIVE),
+        border: Border {
+            color: if matches!(status, iced_pick_list::Status::Active) {
+                BORDER
+            } else {
+                TEXT_MUTED
+            },
+            width: 1.0,
+            radius: CONTROL_RADIUS.into(),
+        },
+    }
+}
+
+pub fn pick_list_menu(_: &Theme) -> menu::Style {
+    menu::Style {
+        background: Background::Color(SURFACE_ACTIVE),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: CONTROL_RADIUS.into(),
+        },
+        text_color: TEXT,
+        selected_text_color: TEXT,
+        selected_background: Background::Color(Color::from_rgb8(58, 58, 62)),
+        shadow: Shadow {
+            color: Color::from_rgba8(0, 0, 0, 0.45),
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 12.0,
+        },
     }
 }
 
@@ -206,7 +266,7 @@ pub fn checkbox(_: &Theme, status: iced_checkbox::Status) -> iced_checkbox::Styl
         border: Border {
             color: if checked { ACCENT } else { BORDER },
             width: 1.0,
-            radius: 4.0.into(),
+            radius: CHECKBOX_RADIUS.into(),
         },
         text_color: Some(TEXT),
     }
