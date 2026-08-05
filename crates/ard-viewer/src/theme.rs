@@ -3,20 +3,72 @@ use iced::widget::{
     button, checkbox as iced_checkbox, container, pick_list as iced_pick_list, text_input,
 };
 use iced::{Background, Border, Color, Shadow, Theme, border};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const BACKGROUND: Color = Color::from_rgb8(13, 13, 14);
-pub const REMOTE_CANVAS: Color = Color::from_rgb8(5, 5, 6);
-pub const SURFACE: Color = Color::from_rgb8(22, 22, 24);
-pub const SURFACE_ACTIVE: Color = Color::from_rgb8(41, 41, 43);
-pub const BORDER: Color = Color::from_rgb8(59, 59, 64);
-pub const TEXT: Color = Color::from_rgb8(240, 240, 242);
-pub const TEXT_MUTED: Color = Color::from_rgb8(158, 158, 168);
-pub const TEXT_DIM: Color = Color::from_rgb8(107, 107, 117);
-pub const TEXT_WARM: Color = Color::from_rgb8(209, 204, 194);
-pub const ACCENT: Color = TEXT;
-pub const ACCENT_TEXT: Color = Color::from_rgb8(9, 9, 10);
-pub const SUCCESS: Color = Color::from_rgb8(87, 158, 107);
-pub const WARNING: Color = TEXT_WARM;
+#[derive(Debug, Clone, Copy)]
+pub struct Palette {
+    pub background: Color,
+    pub remote_canvas: Color,
+    pub surface: Color,
+    pub surface_active: Color,
+    pub border: Color,
+    pub text: Color,
+    pub text_muted: Color,
+    pub text_dim: Color,
+    pub text_warm: Color,
+    pub accent: Color,
+    pub accent_text: Color,
+    pub success: Color,
+    pub warning: Color,
+}
+
+const DARK: Palette = Palette {
+    background: Color::from_rgb8(13, 13, 14),
+    remote_canvas: Color::from_rgb8(5, 5, 6),
+    surface: Color::from_rgb8(22, 22, 24),
+    surface_active: Color::from_rgb8(41, 41, 43),
+    border: Color::from_rgb8(59, 59, 64),
+    text: Color::from_rgb8(240, 240, 242),
+    text_muted: Color::from_rgb8(158, 158, 168),
+    text_dim: Color::from_rgb8(107, 107, 117),
+    text_warm: Color::from_rgb8(209, 204, 194),
+    accent: Color::from_rgb8(240, 240, 242),
+    accent_text: Color::from_rgb8(9, 9, 10),
+    success: Color::from_rgb8(87, 158, 107),
+    warning: Color::from_rgb8(209, 204, 194),
+};
+
+// Neutral off-white surfaces with near-black accents, following the familiar
+// grayscale hierarchy used by modern productivity and chat applications.
+const LIGHT: Palette = Palette {
+    background: Color::from_rgb8(247, 247, 245),
+    remote_canvas: Color::from_rgb8(232, 232, 229),
+    surface: Color::from_rgb8(242, 242, 239),
+    surface_active: Color::from_rgb8(229, 229, 225),
+    border: Color::from_rgb8(211, 211, 207),
+    text: Color::from_rgb8(32, 32, 31),
+    text_muted: Color::from_rgb8(100, 100, 97),
+    text_dim: Color::from_rgb8(137, 137, 133),
+    text_warm: Color::from_rgb8(70, 70, 68),
+    accent: Color::from_rgb8(35, 35, 34),
+    accent_text: Color::from_rgb8(248, 248, 246),
+    success: Color::from_rgb8(65, 126, 82),
+    warning: Color::from_rgb8(112, 79, 58),
+};
+
+static DARK_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+pub fn set_dark(is_dark: bool) {
+    DARK_ACTIVE.store(is_dark, Ordering::Relaxed);
+}
+
+pub fn palette() -> Palette {
+    if DARK_ACTIVE.load(Ordering::Relaxed) {
+        DARK
+    } else {
+        LIGHT
+    }
+}
 
 pub fn mix(from: Color, to: Color, amount: f32) -> Color {
     let amount = amount.clamp(0.0, 1.0);
@@ -36,7 +88,6 @@ pub const CONTROL_RADIUS: f32 = 8.0;
 pub const CHECKBOX_RADIUS: f32 = 4.0;
 
 pub const TITLE_SIZE: f32 = 15.0;
-pub const WINDOW_TITLE_SIZE: f32 = 12.0;
 pub const ICON_SIZE: f32 = 16.0;
 pub const BODY_SIZE: f32 = 11.0;
 pub const CAPTION_SIZE: f32 = 10.0;
@@ -45,25 +96,34 @@ pub const MICRO_SIZE: f32 = 9.0;
 pub const CONTROL_HEIGHT: f32 = 34.0;
 pub const CONTROL_PADDING_X: f32 = 12.0;
 pub const CONTENT_PADDING_X: f32 = 28.0;
-pub const CONTENT_PADDING_Y: f32 = 24.0;
 pub const CONTENT_PADDING_BOTTOM: f32 = 16.0;
 
 pub fn app_theme() -> Theme {
+    let palette = palette();
+    let name = if DARK_ACTIVE.load(Ordering::Relaxed) {
+        "ARD Viewer Dark"
+    } else {
+        "ARD Viewer Light"
+    };
     Theme::custom(
-        "ARD Viewer".to_owned(),
+        name,
         iced::theme::Palette {
-            background: Color::TRANSPARENT,
-            text: TEXT,
-            primary: ACCENT,
-            success: SUCCESS,
-            danger: WARNING,
-            warning: WARNING,
+            background: palette.background,
+            text: palette.text,
+            primary: palette.accent,
+            success: palette.success,
+            danger: palette.warning,
+            warning: palette.warning,
         },
     )
 }
 
 pub fn panel(color: Color) -> impl Fn(&Theme) -> container::Style + Copy {
-    move |_| container::Style::default().background(color).color(TEXT)
+    move |_| {
+        container::Style::default()
+            .background(color)
+            .color(palette().text)
+    }
 }
 
 pub fn shaped_panel(
@@ -72,7 +132,7 @@ pub fn shaped_panel(
 ) -> impl Fn(&Theme) -> container::Style + Copy {
     move |_| container::Style {
         background: Some(Background::Color(color)),
-        text_color: Some(TEXT),
+        text_color: Some(palette().text),
         border: Border {
             radius,
             ..Border::default()
@@ -85,7 +145,7 @@ pub fn shaped_panel(
 pub fn rounded_panel(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style + Copy {
     move |_| container::Style {
         background: Some(Background::Color(color)),
-        text_color: Some(TEXT),
+        text_color: Some(palette().text),
         border: Border {
             radius: radius.into(),
             ..Border::default()
@@ -98,9 +158,9 @@ pub fn rounded_panel(color: Color, radius: f32) -> impl Fn(&Theme) -> container:
 pub fn bordered_panel(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style + Copy {
     move |_| container::Style {
         background: Some(Background::Color(color)),
-        text_color: Some(TEXT),
+        text_color: Some(palette().text),
         border: Border {
-            color: BORDER,
+            color: palette().border,
             width: 1.0,
             radius: radius.into(),
         },
@@ -114,73 +174,114 @@ pub fn modal_backdrop(opacity: f32) -> impl Fn(&Theme) -> container::Style + Cop
 }
 
 pub fn modal_panel(progress: f32) -> impl Fn(&Theme) -> container::Style + Copy {
+    move |_| {
+        let surface = palette().surface;
+        container::Style {
+            background: Some(Background::Color(mix(
+                Color { a: 0.0, ..surface },
+                surface,
+                progress,
+            ))),
+            text_color: Some(palette().text),
+            border: Border {
+                color: mix(Color::TRANSPARENT, palette().border, progress),
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            shadow: Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.35 * progress),
+                offset: iced::Vector::new(0.0, 8.0 * progress),
+                blur_radius: 28.0 * progress,
+            },
+            snap: true,
+        }
+    }
+}
+
+pub fn toolbar_foreground(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_rgb8(242, 242, 240)
+    } else {
+        Color::from_rgb8(36, 36, 35)
+    }
+}
+
+fn toolbar_glass_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_rgba8(24, 24, 23, 0.76)
+    } else {
+        Color::from_rgba8(238, 238, 235, 0.82)
+    }
+}
+
+pub fn toolbar_glass(
+    is_dark: bool,
+    radius: border::Radius,
+) -> impl Fn(&Theme) -> container::Style + Copy {
     move |_| container::Style {
-        background: Some(Background::Color(mix(
-            Color::from_rgba8(22, 22, 24, 0.0),
-            SURFACE,
-            progress,
-        ))),
-        text_color: Some(TEXT),
+        background: Some(Background::Color(toolbar_glass_color(is_dark))),
+        text_color: Some(toolbar_foreground(is_dark)),
         border: Border {
-            color: mix(Color::TRANSPARENT, BORDER, progress),
-            width: 1.0,
-            radius: 12.0.into(),
+            radius,
+            ..Border::default()
         },
         shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.35 * progress),
-            offset: iced::Vector::new(0.0, 8.0 * progress),
-            blur_radius: 28.0 * progress,
+            color: Color::from_rgba(0.0, 0.0, 0.0, if is_dark { 0.26 } else { 0.12 }),
+            offset: iced::Vector::new(0.0, 3.0),
+            blur_radius: 12.0,
         },
         snap: true,
     }
 }
 
-pub fn toolbar_marker(_: &Theme, status: button::Status) -> button::Style {
-    let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        SURFACE_ACTIVE
-    } else {
-        SURFACE
-    };
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color: TEXT,
-        border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: CONTROL_RADIUS.into(),
-        },
-        ..button::Style::default()
-    }
-}
-
-pub fn toolbar_embedded_button(_: &Theme, status: button::Status) -> button::Style {
-    button::Style {
-        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
-            .then_some(Background::Color(SURFACE_ACTIVE)),
-        text_color: TEXT,
-        border: Border {
-            radius: CONTROL_RADIUS.into(),
-            ..Border::default()
-        },
-        ..button::Style::default()
-    }
-}
-
-pub fn toggle_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+pub fn toolbar_glass_button(
+    is_dark: bool,
+    selected: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
     move |_, status| {
-        let background =
-            if selected || matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                SURFACE_ACTIVE
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let alpha = match (selected, hovered, is_dark) {
+            (true, true, true) => 0.22,
+            (true, _, true) => 0.16,
+            (false, true, true) => 0.11,
+            (true, true, false) => 0.17,
+            (true, _, false) => 0.12,
+            (false, true, false) => 0.08,
+            _ => 0.0,
+        };
+        button::Style {
+            background: (alpha > 0.0).then_some(Background::Color(if is_dark {
+                Color::from_rgba(1.0, 1.0, 1.0, alpha)
             } else {
-                SURFACE
-            };
+                Color::from_rgba(0.0, 0.0, 0.0, alpha)
+            })),
+            text_color: toolbar_foreground(is_dark),
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+pub fn toolbar_handle(is_dark: bool) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |_, status| {
+        let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+            if is_dark {
+                Color::from_rgba8(38, 38, 37, 0.84)
+            } else {
+                Color::from_rgba8(222, 222, 219, 0.88)
+            }
+        } else {
+            toolbar_glass_color(is_dark)
+        };
         button::Style {
             background: Some(Background::Color(background)),
-            text_color: TEXT,
+            text_color: toolbar_foreground(is_dark),
             border: Border {
-                color: if selected { TEXT_MUTED } else { BORDER },
-                width: 1.0,
-                radius: CONTROL_RADIUS.into(),
+                radius: border::bottom(7),
+                ..Border::default()
             },
             ..button::Style::default()
         }
@@ -189,15 +290,15 @@ pub fn toggle_button(selected: bool) -> impl Fn(&Theme, button::Status) -> butto
 
 pub fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
     let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        SURFACE_ACTIVE
+        palette().surface_active
     } else {
-        SURFACE
+        palette().surface
     };
     button::Style {
         background: Some(Background::Color(background)),
-        text_color: TEXT,
+        text_color: palette().text,
         border: Border {
-            color: BORDER,
+            color: palette().border,
             width: 1.0,
             radius: CONTROL_RADIUS.into(),
         },
@@ -207,13 +308,13 @@ pub fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
 
 pub fn primary_button(_: &Theme, status: button::Status) -> button::Style {
     let background = if matches!(status, button::Status::Pressed) {
-        Color::from_rgb8(210, 212, 218)
+        mix(palette().accent, Color::BLACK, 0.16)
     } else {
-        ACCENT
+        palette().accent
     };
     button::Style {
         background: Some(Background::Color(background)),
-        text_color: ACCENT_TEXT,
+        text_color: palette().accent_text,
         border: Border {
             radius: CONTROL_RADIUS.into(),
             ..Border::default()
@@ -227,11 +328,11 @@ pub fn close_button(_: &Theme, status: button::Status) -> button::Style {
     let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
         Color::from_rgb8(196, 55, 55)
     } else {
-        SURFACE
+        palette().surface
     };
     button::Style {
         background: Some(Background::Color(background)),
-        text_color: TEXT,
+        text_color: palette().text,
         border: Border {
             radius: 6.0.into(),
             ..Border::default()
@@ -254,7 +355,7 @@ pub fn windows_caption_button(
         };
         button::Style {
             background: background.map(Background::Color),
-            text_color: TEXT,
+            text_color: palette().text,
             border: Border::default(),
             ..button::Style::default()
         }
@@ -265,13 +366,17 @@ pub fn nav_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::
     move |_, status| {
         let background =
             if selected || matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                Some(Background::Color(SURFACE_ACTIVE))
+                Some(Background::Color(palette().surface_active))
             } else {
                 None
             };
         button::Style {
             background,
-            text_color: if selected { TEXT } else { TEXT_MUTED },
+            text_color: if selected {
+                palette().text
+            } else {
+                palette().text_muted
+            },
             border: Border {
                 radius: CONTROL_RADIUS.into(),
                 ..Border::default()
@@ -284,18 +389,17 @@ pub fn nav_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::
 pub fn device_button(selection: f32) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
     move |_, status| {
         let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        let amount = if hover {
-            selection.max(0.72)
-        } else {
-            selection
-        };
+        let amount = if hover { selection.max(0.5) } else { selection };
         button::Style {
-            background: Some(Background::Color(mix(SURFACE, SURFACE_ACTIVE, amount))),
-            text_color: mix(TEXT_MUTED, TEXT, amount),
+            background: (amount > 0.0).then_some(Background::Color(mix(
+                Color::TRANSPARENT,
+                palette().surface_active,
+                amount,
+            ))),
+            text_color: mix(palette().text_muted, palette().text, amount),
             border: Border {
-                color: mix(Color::TRANSPARENT, BORDER, amount),
-                width: 1.0,
-                radius: CONTROL_RADIUS.into(),
+                radius: 5.0.into(),
+                ..Border::default()
             },
             ..button::Style::default()
         }
@@ -306,23 +410,23 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(
             if matches!(status, text_input::Status::Focused { is_hovered: _ }) {
-                SURFACE_ACTIVE
+                palette().surface_active
             } else {
-                SURFACE
+                palette().surface
             },
         ),
         border: Border {
             color: if matches!(status, text_input::Status::Focused { is_hovered: _ }) {
-                ACCENT
+                palette().accent
             } else {
-                BORDER
+                palette().border
             },
             width: 1.0,
             radius: CONTROL_RADIUS.into(),
         },
-        icon: TEXT_MUTED,
-        placeholder: TEXT_MUTED,
-        value: TEXT,
+        icon: palette().text_muted,
+        placeholder: palette().text_muted,
+        value: palette().text,
         selection: Color::from_rgba8(235, 237, 242, 0.28),
     }
 }
@@ -331,24 +435,24 @@ pub fn inline_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(Color::TRANSPARENT),
         border: Border::default(),
-        icon: TEXT_MUTED,
-        placeholder: TEXT_MUTED,
-        value: TEXT,
+        icon: palette().text_muted,
+        placeholder: palette().text_muted,
+        value: palette().text,
         selection: Color::from_rgba8(235, 237, 242, 0.28),
     }
 }
 
 pub fn pick_list(_: &Theme, status: iced_pick_list::Status) -> iced_pick_list::Style {
     iced_pick_list::Style {
-        text_color: TEXT,
-        placeholder_color: TEXT_MUTED,
-        handle_color: TEXT_MUTED,
-        background: Background::Color(SURFACE_ACTIVE),
+        text_color: palette().text,
+        placeholder_color: palette().text_muted,
+        handle_color: palette().text_muted,
+        background: Background::Color(palette().surface_active),
         border: Border {
             color: if matches!(status, iced_pick_list::Status::Active) {
-                BORDER
+                palette().border
             } else {
-                TEXT_MUTED
+                palette().text_muted
             },
             width: 1.0,
             radius: CONTROL_RADIUS.into(),
@@ -358,15 +462,19 @@ pub fn pick_list(_: &Theme, status: iced_pick_list::Status) -> iced_pick_list::S
 
 pub fn pick_list_menu(_: &Theme) -> menu::Style {
     menu::Style {
-        background: Background::Color(SURFACE_ACTIVE),
+        background: Background::Color(palette().surface_active),
         border: Border {
-            color: BORDER,
+            color: palette().border,
             width: 1.0,
             radius: CONTROL_RADIUS.into(),
         },
-        text_color: TEXT,
-        selected_text_color: TEXT,
-        selected_background: Background::Color(Color::from_rgb8(58, 58, 62)),
+        text_color: palette().text,
+        selected_text_color: palette().text,
+        selected_background: Background::Color(mix(
+            palette().surface_active,
+            palette().accent,
+            0.18,
+        )),
         shadow: Shadow {
             color: Color::from_rgba8(0, 0, 0, 0.45),
             offset: iced::Vector::new(0.0, 4.0),
@@ -382,13 +490,21 @@ pub fn checkbox(_: &Theme, status: iced_checkbox::Status) -> iced_checkbox::Styl
             | iced_checkbox::Status::Hovered { is_checked: true }
     );
     iced_checkbox::Style {
-        background: Background::Color(if checked { ACCENT } else { SURFACE }),
-        icon_color: ACCENT_TEXT,
+        background: Background::Color(if checked {
+            palette().accent
+        } else {
+            palette().surface
+        }),
+        icon_color: palette().accent_text,
         border: Border {
-            color: if checked { ACCENT } else { BORDER },
+            color: if checked {
+                palette().accent
+            } else {
+                palette().border
+            },
             width: 1.0,
             radius: CHECKBOX_RADIUS.into(),
         },
-        text_color: Some(TEXT),
+        text_color: Some(palette().text),
     }
 }

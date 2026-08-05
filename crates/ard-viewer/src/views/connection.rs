@@ -1,37 +1,33 @@
-use iced::widget::{button, checkbox, column, container, row, scrollable, space, text};
+use iced::widget::{button, checkbox, column, container, row, scrollable, space, stack, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::icons::{Icon, icon};
 use crate::theme::{
-    self, BACKGROUND, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTENT_PADDING_BOTTOM,
-    CONTENT_PADDING_X, CONTENT_PADDING_Y, CONTROL_HEIGHT, CONTROL_PADDING_X, CONTROL_RADIUS,
-    ICON_SIZE, MICRO_SIZE, SURFACE, SURFACE_ACTIVE, TEXT, TEXT_MUTED, TEXT_WARM, TITLE_SIZE,
+    self, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTENT_PADDING_BOTTOM, CONTENT_PADDING_X,
+    CONTROL_HEIGHT, CONTROL_PADDING_X, CONTROL_RADIUS, ICON_SIZE, MICRO_SIZE, TITLE_SIZE,
     WINDOW_RADIUS,
 };
-use crate::widgets::{primary, secondary, window_titlebar};
+use crate::widgets::{icon_button, primary, secondary, window_chrome_with_drag_height};
 use crate::{ArdViewer, Message};
 
+const TITLEBAR_HEIGHT: f32 = 44.0;
+
 pub fn connection(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
-    column![
-        window_titlebar(
-            window_id,
-            "ARD Viewer",
-            "安全连接到远程设备",
-            Some((Icon::Settings, Message::OpenSettings)),
-            52
-        ),
-        row![device_sidebar(app), form(app)]
+    let maximized = app.is_window_maximized(window_id);
+    stack![
+        row![device_sidebar(app, maximized), form(app, maximized)]
             .height(Fill)
             .width(Fill),
+        window_chrome_with_drag_height(window_id, TITLEBAR_HEIGHT),
     ]
     .height(Fill)
     .width(Fill)
     .into()
 }
 
-fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
+fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let query = app.search.trim().to_lowercase();
-    let mut devices = column![].spacing(12);
+    let mut devices = column![].spacing(2);
     for (index, device) in app.devices.iter().enumerate().filter(|(_, device)| {
         query.is_empty()
             || device.name.to_lowercase().contains(&query)
@@ -52,24 +48,29 @@ fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
             crate::state::DeviceState::RecentlyUsed => "12 分钟前",
         };
         let content = row![
-            container(icon(Icon::Monitor, ICON_SIZE, TEXT_WARM))
-                .width(34)
-                .height(34)
-                .center_x(34)
-                .center_y(34)
-                .style(theme::rounded_panel(BACKGROUND, CONTROL_RADIUS)),
+            container(icon(Icon::Monitor, ICON_SIZE, theme::palette().text_warm))
+                .width(24)
+                .height(24)
+                .center_x(24)
+                .center_y(24),
             column![
-                text(&device.name).size(BODY_SIZE).color(TEXT),
+                text(&device.name)
+                    .size(BODY_SIZE)
+                    .color(theme::palette().text),
                 text(format!(
                     "{} · {state}",
                     device.address.trim_end_matches(":5900")
                 ))
                 .size(MICRO_SIZE)
-                .color(theme::mix(TEXT_MUTED, TEXT_WARM, selection)),
+                .color(theme::mix(
+                    theme::palette().text_muted,
+                    theme::palette().text_warm,
+                    selection
+                )),
             ]
-            .spacing(0)
+            .spacing(1)
             .width(Fill),
-            container(icon(Icon::ChevronRight, ICON_SIZE, TEXT_MUTED))
+            container(icon(Icon::ChevronRight, 12.0, theme::palette().text_muted))
                 .height(Fill)
                 .center_y(Fill),
         ]
@@ -77,67 +78,87 @@ fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
         .align_y(Alignment::Center);
         devices = devices.push(
             button(content)
-                .height(58)
+                .height(42)
                 .width(Fill)
-                .padding(10)
+                .padding([5, 8])
                 .style(theme::device_button(selection))
                 .on_press(Message::DeviceSelected(index)),
         );
     }
 
     let body = column![
-        column![
-            text("已保存设备").size(TITLE_SIZE).color(TEXT),
-            text("点击即可快速连接")
-                .size(CAPTION_SIZE)
-                .color(TEXT_MUTED)
+        row![
+            column![
+                text("已保存设备")
+                    .size(TITLE_SIZE)
+                    .color(theme::palette().text),
+                text("点击即可快速连接")
+                    .size(CAPTION_SIZE)
+                    .color(theme::palette().text_muted)
+            ]
+            .spacing(2)
+            .width(Fill),
+            icon_button(Icon::Settings, Message::OpenSettings),
         ]
-        .spacing(2),
+        .align_y(Alignment::Center),
         container(
             row![
-                icon(Icon::Search, 14.0, TEXT_MUTED),
+                icon(Icon::Search, 14.0, theme::palette().text_muted),
                 iced::widget::text_input("搜索设备", &app.search)
                     .on_input(Message::SearchChanged)
-                    .padding([8, 0])
+                    .padding([0, 0])
                     .size(BODY_SIZE)
                     .style(theme::inline_input),
             ]
             .spacing(8)
-            .align_y(Alignment::Center),
+            .align_y(Alignment::Center)
+            .height(Fill),
         )
-        .height(38)
-        .padding([0, 10])
-        .style(theme::bordered_panel(SURFACE, CONTROL_RADIUS)),
+        .height(30)
+        .padding([0, 8])
+        .style(theme::bordered_panel(
+            theme::palette().surface,
+            CONTROL_RADIUS
+        )),
         scrollable(devices).height(Fill),
         secondary("管理设备", Message::ManageDevices)
             .width(Fill)
             .height(CONTROL_HEIGHT),
     ]
-    .spacing(12)
+    .spacing(8)
     .height(Fill);
 
     container(body)
-        .width(270)
+        .width(252)
         .height(Fill)
-        .padding(16)
+        .padding(iced::Padding {
+            top: TITLEBAR_HEIGHT,
+            right: 12.0,
+            bottom: 12.0,
+            left: 12.0,
+        })
         .style(theme::shaped_panel(
-            SURFACE,
-            iced::border::bottom_left(WINDOW_RADIUS),
+            theme::palette().surface,
+            iced::border::left(if maximized { 0.0 } else { WINDOW_RADIUS }),
         ))
         .into()
 }
 
-fn form(app: &ArdViewer) -> Element<'_, Message> {
+fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let heading = column![
-        text("连接到远程设备").size(TITLE_SIZE).color(TEXT),
+        text("连接到远程设备")
+            .size(TITLE_SIZE)
+            .color(theme::palette().text),
         text("输入远程地址和凭据，密码由系统安全存储。")
             .size(CAPTION_SIZE)
-            .color(TEXT_MUTED),
+            .color(theme::palette().text_muted),
     ]
     .spacing(2);
 
     let address = column![
-        text("远程地址").size(BODY_SIZE).color(TEXT_MUTED),
+        text("远程地址")
+            .size(BODY_SIZE)
+            .color(theme::palette().text_muted),
         iced::widget::text_input("mac-studio.local", &app.address)
             .on_input(Message::AddressChanged)
             .padding([10.0, CONTROL_PADDING_X])
@@ -146,7 +167,9 @@ fn form(app: &ArdViewer) -> Element<'_, Message> {
     ]
     .spacing(5);
     let password = column![
-        text("密码").size(BODY_SIZE).color(TEXT_MUTED),
+        text("密码")
+            .size(BODY_SIZE)
+            .color(theme::palette().text_muted),
         iced::widget::text_input("••••••••••••", &app.password)
             .on_input(Message::PasswordChanged)
             .secure(true)
@@ -174,45 +197,53 @@ fn form(app: &ArdViewer) -> Element<'_, Message> {
     let advanced = container(
         column![
             row![
-                text("高级选项").size(BODY_SIZE).color(TEXT).width(Fill),
-                icon(Icon::ChevronDown, 14.0, TEXT_MUTED)
+                text("高级选项")
+                    .size(BODY_SIZE)
+                    .color(theme::palette().text)
+                    .width(Fill),
+                icon(Icon::ChevronDown, 14.0, theme::palette().text_muted)
             ]
             .align_y(Alignment::Center),
             container(space().height(1))
                 .width(Fill)
-                .style(theme::panel(crate::theme::BORDER)),
+                .style(theme::panel(theme::palette().border)),
             text("端口  3283        像素格式  自动        编码  自适应")
                 .size(CAPTION_SIZE)
-                .color(TEXT_MUTED),
+                .color(theme::palette().text_muted),
         ]
         .spacing(9),
     )
     .height(106)
     .padding(12)
     .width(Fill)
-    .style(theme::bordered_panel(SURFACE, CARD_RADIUS));
+    .style(theme::bordered_panel(theme::palette().surface, CARD_RADIUS));
 
     let security = container(
         row![
-            icon(Icon::Shield, ICON_SIZE, TEXT_WARM),
+            icon(Icon::Shield, ICON_SIZE, theme::palette().text_warm),
             text("密码使用操作系统密钥库加密保存，不写入配置文件。")
                 .size(CAPTION_SIZE)
-                .color(TEXT_MUTED)
+                .color(theme::palette().text_muted)
         ]
         .spacing(8)
-        .align_y(Alignment::Center),
+        .align_y(Alignment::Center)
+        .height(Fill),
     )
     .height(42)
     .padding(10)
     .width(Fill)
-    .style(theme::bordered_panel(SURFACE_ACTIVE, CONTROL_RADIUS));
+    .align_y(Alignment::Center)
+    .style(theme::bordered_panel(
+        theme::palette().surface_active,
+        CONTROL_RADIUS,
+    ));
 
     let actions = row![
         secondary("导出快捷方式", Message::ExportShortcuts)
             .width(132)
             .height(CONTROL_HEIGHT),
         space().width(Fill),
-        secondary("取消", Message::Cancel)
+        secondary("保存", Message::SaveDevice)
             .width(76)
             .height(CONTROL_HEIGHT),
         primary("连接", Message::Connect)
@@ -238,7 +269,7 @@ fn form(app: &ArdViewer) -> Element<'_, Message> {
 
     container(body)
         .padding(iced::Padding {
-            top: CONTENT_PADDING_Y,
+            top: TITLEBAR_HEIGHT,
             right: CONTENT_PADDING_X,
             bottom: CONTENT_PADDING_BOTTOM,
             left: CONTENT_PADDING_X,
@@ -246,8 +277,8 @@ fn form(app: &ArdViewer) -> Element<'_, Message> {
         .height(Fill)
         .width(Fill)
         .style(theme::shaped_panel(
-            BACKGROUND,
-            iced::border::bottom_right(WINDOW_RADIUS),
+            theme::palette().background,
+            iced::border::right(if maximized { 0.0 } else { WINDOW_RADIUS }),
         ))
         .into()
 }

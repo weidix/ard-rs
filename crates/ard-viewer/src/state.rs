@@ -3,6 +3,31 @@ use iced::Size;
 use crate::icons::Icon;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemePreference {
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "跟随系统",
+            Self::Light => "浅色",
+            Self::Dark => "深色",
+        }
+    }
+}
+
+impl std::fmt::Display for ThemePreference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowKind {
     Connection,
     Settings,

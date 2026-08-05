@@ -1,29 +1,36 @@
 use ard_rs::ArdVideoQuality;
-use iced::widget::{checkbox, column, container, pick_list, row, space, text};
+use iced::widget::{checkbox, column, container, pick_list, row, space, stack, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::icons::{Icon, icon};
-use crate::state::SettingsSection;
+use crate::state::{SettingsSection, ThemePreference};
 use crate::theme::{
-    self, BACKGROUND, BODY_SIZE, BORDER, CAPTION_SIZE, CARD_RADIUS, CONTENT_PADDING_X,
-    CONTROL_HEIGHT, ICON_SIZE, SURFACE, SURFACE_ACTIVE, TEXT, TEXT_DIM, TEXT_MUTED, TITLE_SIZE,
-    WINDOW_RADIUS,
+    self, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTENT_PADDING_X, CONTROL_HEIGHT, ICON_SIZE,
+    TITLE_SIZE, WINDOW_RADIUS,
 };
-use crate::widgets::{card, muted, secondary, secondary_with_icon, window_titlebar};
+use crate::widgets::{card, muted, secondary, secondary_with_icon, window_chrome};
 use crate::{ArdViewer, Message};
 
 pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
-    column![
-        window_titlebar(window_id, "配置", "ARD Viewer 偏好设置", None, 52),
-        row![sidebar(app), content(app)].width(Fill).height(Fill),
+    let maximized = app.is_window_maximized(window_id);
+    stack![
+        row![sidebar(app, maximized), content(app, maximized)]
+            .width(Fill)
+            .height(Fill),
+        window_chrome(window_id),
     ]
     .width(Fill)
     .height(Fill)
     .into()
 }
 
-fn sidebar(app: &ArdViewer) -> Element<'_, Message> {
-    let mut nav = column![text("设置").size(CAPTION_SIZE).color(TEXT_MUTED)].spacing(6);
+fn sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
+    let mut nav = column![
+        text("设置")
+            .size(CAPTION_SIZE)
+            .color(theme::palette().text_muted)
+    ]
+    .spacing(6);
     for section in SettingsSection::ALL {
         let selected = section == app.settings_section;
         nav = nav.push(
@@ -32,7 +39,11 @@ fn sidebar(app: &ArdViewer) -> Element<'_, Message> {
                     container(icon(
                         section.icon(),
                         ICON_SIZE,
-                        if selected { TEXT } else { TEXT_MUTED }
+                        if selected {
+                            theme::palette().text
+                        } else {
+                            theme::palette().text_muted
+                        }
                     ))
                     .width(20)
                     .height(Fill)
@@ -55,20 +66,29 @@ fn sidebar(app: &ArdViewer) -> Element<'_, Message> {
     container(nav)
         .width(210)
         .height(Fill)
-        .padding(12)
+        .padding(iced::Padding {
+            top: if cfg!(target_os = "macos") {
+                44.0
+            } else {
+                12.0
+            },
+            right: 12.0,
+            bottom: 12.0,
+            left: 12.0,
+        })
         .style(theme::shaped_panel(
-            SURFACE,
-            iced::border::bottom_left(WINDOW_RADIUS),
+            theme::palette().surface,
+            iced::border::left(if maximized { 0.0 } else { WINDOW_RADIUS }),
         ))
         .into()
 }
 
-fn content(app: &ArdViewer) -> Element<'_, Message> {
+fn content(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let progress =
         app.settings_transition * app.settings_transition * (3.0 - 2.0 * app.settings_transition);
     let offset = 12.0 * (1.0 - progress);
     let section: Element<'_, Message> = match app.settings_section {
-        SettingsSection::General => generic_section(app, "常规"),
+        SettingsSection::General => general(app),
         SettingsSection::Display => display(app),
         SettingsSection::KeyMapping => key_mapping(app),
         SettingsSection::Security => generic_section(app, "安全"),
@@ -84,24 +104,72 @@ fn content(app: &ArdViewer) -> Element<'_, Message> {
         .width(Fill)
         .height(Fill)
         .style(theme::shaped_panel(
-            BACKGROUND,
-            iced::border::bottom_right(WINDOW_RADIUS),
+            theme::palette().background,
+            iced::border::right(if maximized { 0.0 } else { WINDOW_RADIUS }),
         ))
         .into()
+}
+
+fn general(app: &ArdViewer) -> Element<'_, Message> {
+    let active_theme = if app.effective_dark() {
+        "当前使用深色外观"
+    } else {
+        "当前使用浅色外观"
+    };
+
+    column![
+        text("常规").size(TITLE_SIZE).color(theme::palette().text),
+        muted("配置应用的通用行为。"),
+        card(
+            "外观",
+            column![
+                row![
+                    text("主题模式").size(BODY_SIZE).width(150),
+                    pick_list(
+                        ThemePreference::ALL,
+                        Some(app.theme_preference),
+                        Message::ThemePreferenceChanged,
+                    )
+                    .width(180)
+                    .padding([10, 12])
+                    .text_size(BODY_SIZE)
+                    .style(theme::pick_list)
+                    .menu_style(theme::pick_list_menu),
+                ]
+                .align_y(Alignment::Center),
+                text(active_theme)
+                    .size(CAPTION_SIZE)
+                    .color(theme::palette().text_muted),
+                checkbox(app.show_performance_hud)
+                    .label("显示会话性能信息")
+                    .on_toggle(Message::PerformanceHudChanged)
+                    .size(16)
+                    .text_size(BODY_SIZE)
+                    .style(theme::checkbox),
+            ]
+            .spacing(12),
+        ),
+    ]
+    .spacing(13)
+    .into()
 }
 
 fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
     let presets = ["macOS 默认", "Windows 默认", "Linux 默认"];
     let heading = column![
-        text("按键映射").size(TITLE_SIZE).color(TEXT),
+        text("按键映射")
+            .size(TITLE_SIZE)
+            .color(theme::palette().text),
         text("配置本地按键如何发送到远程设备。")
             .size(CAPTION_SIZE)
-            .color(TEXT_MUTED),
+            .color(theme::palette().text_muted),
     ]
     .spacing(2);
     let controls = row![
         column![
-            text("预设").size(BODY_SIZE).color(TEXT_MUTED),
+            text("预设")
+                .size(BODY_SIZE)
+                .color(theme::palette().text_muted),
             pick_list(presets, Some(app.key_profile.as_str()), |value| {
                 Message::KeyProfileChanged(value.to_owned())
             })
@@ -127,15 +195,15 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
             row![
                 text("本地按键")
                     .size(CAPTION_SIZE)
-                    .color(TEXT_MUTED)
+                    .color(theme::palette().text_muted)
                     .width(170),
                 text("远程动作")
                     .size(CAPTION_SIZE)
-                    .color(TEXT_MUTED)
+                    .color(theme::palette().text_muted)
                     .width(220),
                 text("作用域")
                     .size(CAPTION_SIZE)
-                    .color(TEXT_MUTED)
+                    .color(theme::palette().text_muted)
                     .width(160),
                 text("").width(44),
             ]
@@ -146,7 +214,7 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
         .width(Fill)
         .align_y(Alignment::Center)
         .style(theme::shaped_panel(
-            SURFACE_ACTIVE,
+            theme::palette().surface_active,
             iced::border::top(CARD_RADIUS),
         )),
     ]
@@ -157,20 +225,33 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
                 container(space())
                     .height(1)
                     .width(Fill)
-                    .style(theme::panel(BORDER)),
+                    .style(theme::panel(theme::palette().border)),
             )
             .push(
                 container(
                     row![
-                        text(mapping.local).size(BODY_SIZE).color(TEXT).width(170),
-                        text(mapping.remote).size(BODY_SIZE).color(TEXT).width(220),
-                        text(mapping.scope).size(BODY_SIZE).color(TEXT).width(160),
+                        text(mapping.local)
+                            .size(BODY_SIZE)
+                            .color(theme::palette().text)
+                            .width(170),
+                        text(mapping.remote)
+                            .size(BODY_SIZE)
+                            .color(theme::palette().text)
+                            .width(220),
+                        text(mapping.scope)
+                            .size(BODY_SIZE)
+                            .color(theme::palette().text)
+                            .width(160),
                         iced::widget::button(
-                            container(icon(Icon::MoreHorizontal, ICON_SIZE, TEXT_MUTED))
-                                .width(Fill)
-                                .height(Fill)
-                                .center_x(Fill)
-                                .center_y(Fill)
+                            container(icon(
+                                Icon::MoreHorizontal,
+                                ICON_SIZE,
+                                theme::palette().text_muted
+                            ))
+                            .width(Fill)
+                            .height(Fill)
+                            .center_x(Fill)
+                            .center_y(Fill)
                         )
                         .padding(0)
                         .width(44)
@@ -184,25 +265,31 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
                 .padding([0, 10])
                 .width(Fill)
                 .align_y(Alignment::Center)
-                .style(theme::panel(SURFACE)),
+                .style(theme::panel(theme::palette().surface)),
             );
     }
     let table = container(table)
         .width(Fill)
-        .style(theme::bordered_panel(SURFACE, CARD_RADIUS));
+        .style(theme::bordered_panel(theme::palette().surface, CARD_RADIUS));
     let add = row![
         secondary_with_icon(Icon::Plus, "添加映射", Message::AddMapping)
             .width(112)
             .height(CONTROL_HEIGHT),
-        container(text("拖动可调整优先级").size(CAPTION_SIZE).color(TEXT_DIM))
-            .height(CONTROL_HEIGHT)
-            .center_y(CONTROL_HEIGHT),
+        container(
+            text("拖动可调整优先级")
+                .size(CAPTION_SIZE)
+                .color(theme::palette().text_dim)
+        )
+        .height(CONTROL_HEIGHT)
+        .center_y(CONTROL_HEIGHT),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
     let common = container(
         column![
-            text("常用选项").size(BODY_SIZE).color(TEXT),
+            text("常用选项")
+                .size(BODY_SIZE)
+                .color(theme::palette().text),
             checkbox(app.auto_adapt_keyboard)
                 .label("自动适配远程键盘布局")
                 .on_toggle(Message::AutoAdaptChanged)
@@ -221,7 +308,7 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
     .height(110)
     .padding(12)
     .width(Fill)
-    .style(theme::bordered_panel(SURFACE, CARD_RADIUS));
+    .style(theme::bordered_panel(theme::palette().surface, CARD_RADIUS));
 
     column![heading, controls, table, add, common, space().height(Fill)]
         .spacing(13)
@@ -233,7 +320,9 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
 fn display(app: &ArdViewer) -> Element<'_, Message> {
     const QUALITIES: [&str; 5] = ["低", "中", "高", "自适应", "完整"];
     column![
-        text("显示与性能").size(TITLE_SIZE).color(TEXT),
+        text("显示与性能")
+            .size(TITLE_SIZE)
+            .color(theme::palette().text),
         muted("设置远程画面的质量和性能。"),
         card(
             "远程画面",
@@ -283,7 +372,7 @@ fn display(app: &ArdViewer) -> Element<'_, Message> {
 
 fn generic_section<'a>(app: &'a ArdViewer, title: &'static str) -> Element<'a, Message> {
     column![
-        text(title).size(TITLE_SIZE).color(TEXT),
+        text(title).size(TITLE_SIZE).color(theme::palette().text),
         muted(app.settings_section.subtitle()),
         card(
             "共享设置",

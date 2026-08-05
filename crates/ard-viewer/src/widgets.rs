@@ -1,12 +1,9 @@
-use iced::widget::{button, column, container, mouse_area, row, space, text};
+use iced::widget::{button, column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::Message;
 use crate::icons::{Icon, icon};
-use crate::theme::{
-    self, ACCENT_TEXT, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTROL_HEIGHT, ICON_SIZE, SURFACE,
-    TEXT, TEXT_MUTED, WINDOW_RADIUS, WINDOW_TITLE_SIZE,
-};
+use crate::theme::{self, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTROL_HEIGHT, ICON_SIZE};
 
 fn centered_label<'a>(
     label: impl Into<String>,
@@ -30,24 +27,64 @@ fn centered_icon(kind: Icon, size: f32, color: iced::Color) -> Element<'static, 
         .into()
 }
 
-pub fn window_titlebar<'a>(
+pub fn window_chrome(window_id: window::Id) -> Element<'static, Message> {
+    window_chrome_with_drag_height(window_id, 32.0)
+}
+
+pub fn window_chrome_with_drag_height(
     window_id: window::Id,
-    title: &'a str,
-    subtitle: &'a str,
-    action: Option<(Icon, Message)>,
-    height: u16,
-) -> Element<'a, Message> {
+    drag_height: f32,
+) -> Element<'static, Message> {
+    stack![
+        window_drag_region_with_height(window_id, drag_height),
+        window_platform_controls(window_id),
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+pub fn window_drag_region(window_id: window::Id) -> Element<'static, Message> {
+    window_drag_region_with_height(window_id, 32.0)
+}
+
+fn window_drag_region_with_height(window_id: window::Id, height: f32) -> Element<'static, Message> {
+    let leading_controls_width = if cfg!(target_os = "macos") { 72.0 } else { 8.0 };
+    let trailing_controls_width = if cfg!(target_os = "windows") {
+        138.0
+    } else if cfg!(target_os = "macos") {
+        0.0
+    } else {
+        110.0
+    };
+
+    let drag_handle = mouse_area(container(space()).width(Fill).height(height))
+        .on_press(Message::DragWindow(window_id))
+        .on_double_click(Message::ToggleMaximizeWindow(window_id));
+
+    container(
+        row![
+            space().width(leading_controls_width),
+            drag_handle,
+            space().width(trailing_controls_width),
+        ]
+        .height(height)
+        .align_y(Alignment::Start),
+    )
+    .width(Fill)
+    .height(Fill)
+    .align_y(Alignment::Start)
+    .into()
+}
+
+pub fn window_platform_controls(window_id: window::Id) -> Element<'static, Message> {
     #[cfg(target_os = "macos")]
-    let native_controls: Element<'a, Message> = space().width(52).into();
-    #[cfg(target_os = "windows")]
-    let native_controls: Element<'a, Message> = space().width(14).into();
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let native_controls: Element<'a, Message> = space().width(0).into();
+    let _ = window_id;
 
     #[cfg(target_os = "macos")]
-    let platform_buttons: Element<'a, Message> = space().width(1).into();
+    let platform_buttons: Element<'static, Message> = space().width(1).into();
     #[cfg(target_os = "windows")]
-    let platform_buttons: Element<'a, Message> = row![
+    let platform_buttons: Element<'static, Message> = row![
         titlebar_control(Icon::Minimize, Message::MinimizeWindow(window_id), false),
         titlebar_control(
             Icon::Maximize,
@@ -58,7 +95,7 @@ pub fn window_titlebar<'a>(
     ]
     .into();
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let platform_buttons: Element<'a, Message> = row![
+    let platform_buttons: Element<'static, Message> = row![
         titlebar_control(Icon::Minimize, Message::MinimizeWindow(window_id), false),
         titlebar_control(
             Icon::Maximize,
@@ -69,42 +106,13 @@ pub fn window_titlebar<'a>(
     ]
     .spacing(4)
     .into();
-    let platform_controls = container(platform_buttons)
-        .height(Fill)
-        .align_y(Alignment::Start);
-    let titles = container(
-        column![
-            text(title).size(WINDOW_TITLE_SIZE).color(TEXT),
-            text(subtitle).size(CAPTION_SIZE).color(TEXT_MUTED),
-        ]
-        .spacing(0),
-    )
-    .height(CONTROL_HEIGHT)
-    .width(Fill)
-    .align_y(Alignment::Start);
-    let action: Element<'a, Message> = match action {
-        Some((kind, message)) => icon_button(kind, message).into(),
-        None => space().width(1).into(),
-    };
-    mouse_area(
-        container(
-            row![native_controls, titles, action, platform_controls]
-                .spacing(10)
-                .height(Fill)
-                .align_y(Alignment::Center),
-        )
-        .height(u32::from(height))
+
+    container(platform_buttons)
         .width(Fill)
-        .padding([0, if cfg!(target_os = "windows") { 0 } else { 14 }])
-        .align_y(Alignment::Center)
-        .style(theme::shaped_panel(
-            SURFACE,
-            iced::border::top(WINDOW_RADIUS),
-        )),
-    )
-    .on_press(Message::DragWindow(window_id))
-    .on_double_click(Message::ToggleMaximizeWindow(window_id))
-    .into()
+        .height(Fill)
+        .align_x(Alignment::End)
+        .align_y(Alignment::Start)
+        .into()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -113,7 +121,7 @@ fn titlebar_control<'a>(
     message: Message,
     close: bool,
 ) -> iced::widget::Button<'a, Message> {
-    button(centered_icon(kind, 10.0, TEXT))
+    button(centered_icon(kind, 10.0, theme::palette().text))
         .width(if cfg!(target_os = "windows") { 46 } else { 34 })
         .height(if cfg!(target_os = "windows") { 32 } else { 28 })
         .padding(0)
@@ -142,14 +150,16 @@ fn titlebar_control_style(
 }
 
 pub fn muted<'a>(value: impl Into<String>) -> iced::widget::Text<'a> {
-    text(value.into()).color(TEXT_MUTED).size(CAPTION_SIZE)
+    text(value.into())
+        .color(theme::palette().text_muted)
+        .size(CAPTION_SIZE)
 }
 
 pub fn secondary<'a>(
     label: impl Into<String>,
     message: Message,
 ) -> iced::widget::Button<'a, Message> {
-    button(centered_label(label, BODY_SIZE, TEXT))
+    button(centered_label(label, BODY_SIZE, theme::palette().text))
         .height(CONTROL_HEIGHT)
         .padding(0)
         .style(theme::secondary_button)
@@ -164,7 +174,7 @@ pub fn secondary_with_icon<'a>(
     button(
         container(
             row![
-                icon(kind, ICON_SIZE, TEXT),
+                icon(kind, ICON_SIZE, theme::palette().text),
                 text(label.into()).size(BODY_SIZE)
             ]
             .spacing(8)
@@ -185,15 +195,19 @@ pub fn primary<'a>(
     label: impl Into<String>,
     message: Message,
 ) -> iced::widget::Button<'a, Message> {
-    button(centered_label(label, BODY_SIZE, ACCENT_TEXT))
-        .height(CONTROL_HEIGHT)
-        .padding(0)
-        .style(theme::primary_button)
-        .on_press(message)
+    button(centered_label(
+        label,
+        BODY_SIZE,
+        theme::palette().accent_text,
+    ))
+    .height(CONTROL_HEIGHT)
+    .padding(0)
+    .style(theme::primary_button)
+    .on_press(message)
 }
 
 pub fn icon_button(kind: Icon, message: Message) -> iced::widget::Button<'static, Message> {
-    button(centered_icon(kind, ICON_SIZE, TEXT))
+    button(centered_icon(kind, ICON_SIZE, theme::palette().text))
         .width(CONTROL_HEIGHT)
         .height(CONTROL_HEIGHT)
         .padding(0)
@@ -201,27 +215,16 @@ pub fn icon_button(kind: Icon, message: Message) -> iced::widget::Button<'static
         .on_press(message)
 }
 
-pub fn icon_toggle_button(
-    kind: Icon,
-    selected: bool,
-    message: Message,
-) -> iced::widget::Button<'static, Message> {
-    button(centered_icon(
-        kind,
-        ICON_SIZE,
-        if selected { TEXT } else { TEXT_MUTED },
-    ))
-    .width(CONTROL_HEIGHT)
-    .height(CONTROL_HEIGHT)
-    .padding(0)
-    .style(theme::toggle_button(selected))
-    .on_press(message)
-}
-
 pub fn card<'a>(title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(column![text(title).color(TEXT).size(BODY_SIZE), body.into()].spacing(10))
-        .width(Fill)
-        .padding(16)
-        .style(theme::bordered_panel(SURFACE, CARD_RADIUS))
-        .into()
+    container(
+        column![
+            text(title).color(theme::palette().text).size(BODY_SIZE),
+            body.into()
+        ]
+        .spacing(10),
+    )
+    .width(Fill)
+    .padding(16)
+    .style(theme::bordered_panel(theme::palette().surface, CARD_RADIUS))
+    .into()
 }

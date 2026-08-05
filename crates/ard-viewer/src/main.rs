@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod icons;
 mod state;
@@ -6,18 +6,23 @@ mod theme;
 mod views;
 mod widgets;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use ard_rs::ArdVideoQuality;
 use iced::widget::{column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, Subscription, Task, Theme, window};
 
-use state::{DeviceState, KeyMapping, SavedDevice, SettingsSection, WindowKind};
+use state::{DeviceState, KeyMapping, SavedDevice, SettingsSection, ThemePreference, WindowKind};
+
+const SESSION_TOOLBAR_WIDTH: f32 = 286.0;
+const SESSION_TOOLBAR_COLLAPSED_WIDTH: f32 = 44.0;
+const SETTINGS_WINDOW_OFFSET: f32 = 32.0;
 
 #[derive(Debug)]
 struct ArdViewer {
     windows: BTreeMap<window::Id, WindowKind>,
+    maximized_windows: BTreeSet<window::Id>,
     devices: Vec<SavedDevice>,
     selected_device: usize,
     previous_selected_device: usize,
@@ -35,6 +40,8 @@ struct ArdViewer {
     auto_adapt_keyboard: bool,
     capture_system_shortcuts: bool,
     show_performance_hud: bool,
+    theme_preference: ThemePreference,
+    system_dark: bool,
     mappings: Vec<KeyMapping>,
     session_zoom: f32,
     session_fullscreen: bool,
@@ -42,6 +49,11 @@ struct ArdViewer {
     session_toolbar_progress: f32,
     session_toolbar_pinned: bool,
     session_toolbar_last_interaction: Instant,
+    session_toolbar_x: Option<f32>,
+    session_toolbar_window_width: f32,
+    session_toolbar_pointer_x: f32,
+    session_toolbar_drag_offset: f32,
+    session_toolbar_dragging: bool,
     pending_close: Option<window::Id>,
     close_modal_target_visible: bool,
     close_modal_progress: f32,
@@ -54,6 +66,9 @@ struct ArdViewer {
 enum Message {
     WindowOpened(WindowKind, window::Id),
     WindowClosed(window::Id),
+    WindowEvent(window::Id, window::Event),
+    WindowMaximizedChanged(window::Id, bool),
+    InitialSystemTheme(iced::theme::Mode),
     CloseRequested(window::Id),
     CancelClose,
     ConfirmClose,
@@ -70,7 +85,7 @@ enum Message {
     PasswordChanged(String),
     RememberPasswordChanged(bool),
     RememberDeviceChanged(bool),
-    Cancel,
+    SaveDevice,
     Connect,
     ManageDevices,
     ExportShortcuts,
@@ -81,6 +96,8 @@ enum Message {
     AutoAdaptChanged(bool),
     CaptureShortcutsChanged(bool),
     PerformanceHudChanged(bool),
+    ThemePreferenceChanged(ThemePreference),
+    SystemThemeChanged(iced::theme::Mode),
     CopyPreset,
     ResetMappings,
     AddMapping,
@@ -92,6 +109,9 @@ enum Message {
     ShowSessionToolbar,
     HideSessionToolbar,
     SessionToolbarInteraction,
+    SessionToolbarPointerMoved(iced::Point),
+    SessionToolbarDragStarted,
+    SessionToolbarDragEnded,
     ToggleSessionToolbarPin,
 }
 
@@ -126,6 +146,7 @@ impl ArdViewer {
         ];
         let app = Self {
             windows: BTreeMap::new(),
+            maximized_windows: BTreeSet::new(),
             address: "mac-studio.local".into(),
             devices,
             selected_device: 0,
@@ -143,6 +164,8 @@ impl ArdViewer {
             auto_adapt_keyboard: true,
             capture_system_shortcuts: false,
             show_performance_hud: true,
+            theme_preference: ThemePreference::System,
+            system_dark: false,
             mappings: default_mappings(),
             session_zoom: 1.0,
             session_fullscreen: false,
@@ -150,6 +173,11 @@ impl ArdViewer {
             session_toolbar_progress: 1.0,
             session_toolbar_pinned: false,
             session_toolbar_last_interaction: Instant::now(),
+            session_toolbar_x: None,
+            session_toolbar_window_width: WindowKind::Session.size().width,
+            session_toolbar_pointer_x: WindowKind::Session.size().width / 2.0,
+            session_toolbar_drag_offset: 0.0,
+            session_toolbar_dragging: false,
             pending_close: None,
             close_modal_target_visible: false,
             close_modal_progress: 0.0,
@@ -157,7 +185,8 @@ impl ArdViewer {
             ui_time: 0.0,
             status: String::new(),
         };
-        (app, open_window(WindowKind::Connection))
+        theme::set_dark(app.effective_dark());
+        (app, iced::system::theme().map(Message::InitialSystemTheme))
     }
 
     fn title(&self, id: window::Id) -> String {
@@ -174,8 +203,12 @@ impl ArdViewer {
         match message {
             Message::WindowOpened(kind, id) => {
                 self.windows.insert(id, kind);
+                if kind == WindowKind::Session {
+                    return disable_implicit_titlebar_drag(id);
+                }
             }
             Message::WindowClosed(id) => {
+                self.maximized_windows.remove(&id);
                 if self.pending_close == Some(id) {
                     self.pending_close = None;
                 }
@@ -184,11 +217,36 @@ impl ArdViewer {
                     return iced::exit();
                 }
             }
+            Message::WindowEvent(id, window::Event::Resized(size)) => {
+                if self.windows.get(&id) == Some(&WindowKind::Session) {
+                    self.session_toolbar_window_width = size.width;
+                    self.clamp_session_toolbar_position();
+                }
+                return window::is_maximized(id)
+                    .map(move |maximized| Message::WindowMaximizedChanged(id, maximized));
+            }
+            Message::WindowEvent(_, _) => {}
+            Message::WindowMaximizedChanged(id, maximized) => {
+                if maximized {
+                    self.maximized_windows.insert(id);
+                } else {
+                    self.maximized_windows.remove(&id);
+                }
+            }
+            Message::InitialSystemTheme(mode) => {
+                self.system_dark = mode == iced::theme::Mode::Dark;
+                theme::set_dark(self.effective_dark());
+                return open_window(WindowKind::Connection);
+            }
             Message::CloseRequested(id) => {
+                if self.windows.get(&id) == Some(&WindowKind::Settings) {
+                    return window::close(id);
+                }
                 if self.windows.contains_key(&id) {
                     self.pending_close = Some(id);
                     self.close_modal_target_visible = true;
                     self.close_modal_progress = 0.0;
+                    return reveal_and_focus(id);
                 }
             }
             Message::CancelClose => {
@@ -206,17 +264,42 @@ impl ArdViewer {
             }
             #[cfg(not(target_os = "macos"))]
             Message::CloseWindow(id) => {
+                if self.windows.get(&id) == Some(&WindowKind::Settings) {
+                    return window::close(id);
+                }
                 self.pending_close = Some(id);
                 self.close_modal_target_visible = true;
                 self.close_modal_progress = 0.0;
+                return reveal_and_focus(id);
             }
             Message::DragWindow(id) => return window::drag(id),
             #[cfg(not(target_os = "macos"))]
             Message::MinimizeWindow(id) => return window::minimize(id, true),
-            Message::ToggleMaximizeWindow(id) => return window::toggle_maximize(id),
+            Message::ToggleMaximizeWindow(id) => {
+                let maximized = !self.maximized_windows.contains(&id);
+                if maximized {
+                    self.maximized_windows.insert(id);
+                } else {
+                    self.maximized_windows.remove(&id);
+                }
+                return window::maximize(id, maximized);
+            }
             Message::OpenSettings => {
                 if let Some(id) = self.window_id(WindowKind::Settings) {
                     return window::gain_focus(id);
+                }
+                if let Some(id) = self.window_id(WindowKind::Connection) {
+                    return window::position(id).then(|position| {
+                        open_window_at(
+                            WindowKind::Settings,
+                            position.map_or(window::Position::Centered, |position| {
+                                window::Position::Specific(iced::Point::new(
+                                    position.x + SETTINGS_WINDOW_OFFSET,
+                                    position.y + SETTINGS_WINDOW_OFFSET,
+                                ))
+                            }),
+                        )
+                    });
                 }
                 return open_window(WindowKind::Settings);
             }
@@ -235,7 +318,30 @@ impl ArdViewer {
             Message::PasswordChanged(value) => self.password = value,
             Message::RememberPasswordChanged(value) => self.remember_password = value,
             Message::RememberDeviceChanged(value) => self.remember_device = value,
-            Message::Cancel => self.status.clear(),
+            Message::SaveDevice => {
+                let address = self.address.trim();
+                if address.is_empty() {
+                    self.status = "请输入设备地址".into();
+                } else if let Some(index) = self
+                    .devices
+                    .iter()
+                    .position(|device| device.address.eq_ignore_ascii_case(address))
+                {
+                    self.selected_device = index;
+                    self.status = "设备已保存".into();
+                } else {
+                    let name = address.trim_end_matches(":5900").to_owned();
+                    self.devices.push(SavedDevice {
+                        name,
+                        address: address.to_owned(),
+                        state: DeviceState::Saved,
+                    });
+                    self.previous_selected_device = self.selected_device;
+                    self.selected_device = self.devices.len() - 1;
+                    self.device_transition = 0.0;
+                    self.status = "设备已保存".into();
+                }
+            }
             Message::SettingsSectionSelected(section) => {
                 if section != self.settings_section {
                     self.settings_section = section;
@@ -248,6 +354,16 @@ impl ArdViewer {
             Message::AutoAdaptChanged(value) => self.auto_adapt_keyboard = value,
             Message::CaptureShortcutsChanged(value) => self.capture_system_shortcuts = value,
             Message::PerformanceHudChanged(value) => self.show_performance_hud = value,
+            Message::ThemePreferenceChanged(preference) => {
+                self.theme_preference = preference;
+                theme::set_dark(self.effective_dark());
+            }
+            Message::SystemThemeChanged(mode) => {
+                self.system_dark = mode == iced::theme::Mode::Dark;
+                if self.theme_preference == ThemePreference::System {
+                    theme::set_dark(self.system_dark);
+                }
+            }
             Message::ResetMappings => self.mappings = default_mappings(),
             Message::ToggleFullscreen => {
                 self.touch_session_toolbar();
@@ -293,6 +409,7 @@ impl ArdViewer {
             Message::SessionToolbarTick(now) => {
                 if self.session_toolbar_visible
                     && !self.session_toolbar_pinned
+                    && !self.session_toolbar_dragging
                     && now.duration_since(self.session_toolbar_last_interaction)
                         >= Duration::from_secs(4)
                 {
@@ -335,7 +452,32 @@ impl ArdViewer {
             Message::ShowSessionToolbar | Message::SessionToolbarInteraction => {
                 self.touch_session_toolbar();
             }
-            Message::HideSessionToolbar => self.session_toolbar_visible = false,
+            Message::SessionToolbarPointerMoved(point) => {
+                self.session_toolbar_pointer_x = point.x;
+                if self.session_toolbar_dragging {
+                    self.session_toolbar_x = Some(point.x - self.session_toolbar_drag_offset);
+                    self.clamp_session_toolbar_position();
+                    self.touch_session_toolbar();
+                }
+            }
+            Message::SessionToolbarDragStarted => {
+                let current_x = self
+                    .session_toolbar_x
+                    .unwrap_or(self.session_toolbar_window_width / 2.0);
+                self.session_toolbar_drag_offset = self.session_toolbar_pointer_x - current_x;
+                self.session_toolbar_dragging = true;
+                self.touch_session_toolbar();
+            }
+            Message::SessionToolbarDragEnded => {
+                if self.session_toolbar_dragging {
+                    self.session_toolbar_dragging = false;
+                    self.touch_session_toolbar();
+                }
+            }
+            Message::HideSessionToolbar => {
+                self.session_toolbar_visible = false;
+                self.session_toolbar_dragging = false;
+            }
             Message::ToggleSessionToolbarPin => {
                 self.session_toolbar_pinned = !self.session_toolbar_pinned;
                 self.touch_session_toolbar();
@@ -345,6 +487,7 @@ impl ArdViewer {
     }
 
     fn view(&self, id: window::Id) -> Element<'_, Message> {
+        theme::set_dark(self.effective_dark());
         let Some(kind) = self.windows.get(&id).copied() else {
             return iced::widget::space().into();
         };
@@ -367,6 +510,8 @@ impl ArdViewer {
         let mut subscriptions = vec![
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
+            window::events().map(|(id, event)| Message::WindowEvent(id, event)),
+            iced::system::theme_changes().map(Message::SystemThemeChanged),
         ];
         let session_open = self.window_id(WindowKind::Session).is_some();
         if session_open {
@@ -404,6 +549,28 @@ impl ArdViewer {
         self.session_toolbar_visible = true;
         self.session_toolbar_last_interaction = Instant::now();
     }
+
+    fn is_window_maximized(&self, id: window::Id) -> bool {
+        self.maximized_windows.contains(&id)
+    }
+
+    fn effective_dark(&self) -> bool {
+        match self.theme_preference {
+            ThemePreference::System => self.system_dark,
+            ThemePreference::Light => false,
+            ThemePreference::Dark => true,
+        }
+    }
+
+    fn clamp_session_toolbar_position(&mut self) {
+        const TOOLBAR_HALF_WIDTH: f32 = SESSION_TOOLBAR_WIDTH / 2.0;
+        if let Some(x) = self.session_toolbar_x.as_mut() {
+            *x = x.clamp(
+                TOOLBAR_HALF_WIDTH,
+                (self.session_toolbar_window_width - TOOLBAR_HALF_WIDTH).max(TOOLBAR_HALF_WIDTH),
+            );
+        }
+    }
 }
 
 fn close_confirmation<'a>(
@@ -417,8 +584,12 @@ fn close_confirmation<'a>(
         WindowKind::Session => ("关闭远程会话？", "当前远程连接将会断开。"),
     };
     let progress = smoothstep(0.0, 1.0, progress);
-    let text_color = theme::mix(iced::Color::TRANSPARENT, theme::TEXT, progress);
-    let muted_color = theme::mix(iced::Color::TRANSPARENT, theme::TEXT_MUTED, progress);
+    let text_color = theme::mix(iced::Color::TRANSPARENT, theme::palette().text, progress);
+    let muted_color = theme::mix(
+        iced::Color::TRANSPARENT,
+        theme::palette().text_muted,
+        progress,
+    );
     let dialog = container(
         column![
             text(title).size(theme::TITLE_SIZE).color(text_color),
@@ -461,13 +632,17 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 }
 
 fn open_window(kind: WindowKind) -> Task<Message> {
+    open_window_at(kind, window::Position::Centered)
+}
+
+fn open_window_at(kind: WindowKind, position: window::Position) -> Task<Message> {
     let size = kind.size();
     let (_, task) = window::open(window::Settings {
         size,
         min_size: Some(size),
-        position: window::Position::Centered,
+        position,
         decorations: cfg!(target_os = "macos"),
-        transparent: true,
+        transparent: false,
         resizable: true,
         closeable: true,
         minimizable: true,
@@ -476,6 +651,57 @@ fn open_window(kind: WindowKind) -> Task<Message> {
         ..window::Settings::default()
     });
     task.map(move |id| Message::WindowOpened(kind, id))
+}
+
+fn reveal_and_focus(id: window::Id) -> Task<Message> {
+    Task::batch([window::minimize(id, false), window::gain_focus(id)])
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn disable_implicit_titlebar_drag(id: window::Id) -> Task<Message> {
+    window::run(id, |window| {
+        use iced::window::raw_window_handle::RawWindowHandle;
+        use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
+        use objc2::sel;
+
+        extern "C" fn prevent_implicit_drag(_view: &AnyObject, _selector: Sel) -> Bool {
+            Bool::NO
+        }
+
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return;
+        };
+
+        // winit supplies its live content view on the AppKit main thread.
+        let view = unsafe { &*handle.ns_view.as_ptr().cast::<AnyObject>() };
+        let class = AnyClass::get("ArdSessionView").unwrap_or_else(|| {
+            let mut builder = ClassBuilder::new("ArdSessionView", view.class())
+                .expect("ARD session view class should only be registered once");
+            unsafe {
+                builder.add_method(
+                    sel!(mouseDownCanMoveWindow),
+                    prevent_implicit_drag as extern "C" fn(_, _) -> _,
+                );
+            }
+            builder.register()
+        });
+
+        // The subclass adds no state and only overrides AppKit's implicit
+        // titlebar hit-test. NSWindow remains movable for `window::drag`.
+        unsafe {
+            AnyObject::set_class(view, class);
+        }
+    })
+    .discard()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn disable_implicit_titlebar_drag(_id: window::Id) -> Task<Message> {
+    Task::none()
 }
 
 #[cfg(target_os = "macos")]
@@ -558,9 +784,24 @@ mod tests {
         let (app, _task) = ArdViewer::new();
         assert_eq!(app.settings_section, SettingsSection::KeyMapping);
         assert_eq!(app.quality, ArdVideoQuality::Adaptive);
+        assert_eq!(app.theme_preference, ThemePreference::System);
         assert!(app.session_toolbar_visible);
         assert!(!app.session_toolbar_pinned);
         assert_eq!(app.pending_close, None);
+    }
+
+    #[test]
+    fn save_device_adds_the_current_address_and_selects_it() {
+        let (mut app, _task) = ArdViewer::new();
+        app.address = "new-host.local:5900".into();
+        let previous_len = app.devices.len();
+
+        let _task = app.update(Message::SaveDevice);
+
+        assert_eq!(app.devices.len(), previous_len + 1);
+        assert_eq!(app.selected_device, previous_len);
+        assert_eq!(app.devices[previous_len].name, "new-host.local");
+        assert_eq!(app.devices[previous_len].state, DeviceState::Saved);
     }
 
     #[test]
@@ -575,6 +816,18 @@ mod tests {
         let _task = app.update(Message::CancelClose);
         assert_eq!(app.pending_close, None);
         assert!(app.windows.contains_key(&id));
+    }
+
+    #[test]
+    fn settings_close_request_skips_confirmation() {
+        let (mut app, _task) = ArdViewer::new();
+        let id = window::Id::unique();
+        app.windows.insert(id, WindowKind::Settings);
+
+        let _task = app.update(Message::CloseRequested(id));
+
+        assert_eq!(app.pending_close, None);
+        assert!(!app.close_modal_target_visible);
     }
 
     #[test]
@@ -593,6 +846,94 @@ mod tests {
         app.session_toolbar_last_interaction = now - Duration::from_secs(5);
         let _task = app.update(Message::SessionToolbarTick(now));
         assert!(app.session_toolbar_visible);
+    }
+
+    #[test]
+    fn session_toolbar_hide_animation_reaches_the_collapsed_state() {
+        let (mut app, _task) = ArdViewer::new();
+        let start = app.animation_clock;
+
+        let _task = app.update(Message::HideSessionToolbar);
+        for step in 1..=60 {
+            let _task = app.update(Message::AnimationTick(
+                start + Duration::from_millis(16 * step),
+            ));
+        }
+
+        assert!(!app.session_toolbar_visible);
+        assert!(app.session_toolbar_progress < 0.001);
+    }
+
+    #[test]
+    fn session_toolbar_can_be_dragged_horizontally_and_stays_in_bounds() {
+        let (mut app, _task) = ArdViewer::new();
+        let id = window::Id::unique();
+        app.windows.insert(id, WindowKind::Session);
+
+        let _task = app.update(Message::SessionToolbarDragStarted);
+        let _task = app.update(Message::SessionToolbarPointerMoved(iced::Point::new(
+            900.0, 20.0,
+        )));
+        assert_eq!(app.session_toolbar_x, Some(900.0));
+
+        let _task = app.update(Message::WindowEvent(
+            id,
+            window::Event::Resized(iced::Size::new(600.0, 500.0)),
+        ));
+        assert_eq!(app.session_toolbar_x, Some(457.0));
+
+        let _task = app.update(Message::SessionToolbarDragEnded);
+        assert!(!app.session_toolbar_dragging);
+    }
+
+    #[test]
+    fn collapsed_and_expanded_toolbar_handles_share_the_same_axis() {
+        let (mut app, _task) = ArdViewer::new();
+        app.session_toolbar_x = Some(215.0);
+        let window_id = window::Id::unique();
+        let mut expanded = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Session.size(),
+            views::session(&app, window_id),
+        );
+        let collapse_x = expanded
+            .find(iced::widget::Id::new("session-toolbar-collapse-handle"))
+            .expect("collapse handle should be present")
+            .visible_bounds()
+            .expect("collapse handle should be visible")
+            .center_x();
+        drop(expanded);
+
+        app.session_toolbar_visible = false;
+        app.session_toolbar_progress = 0.0;
+        let mut collapsed = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Session.size(),
+            views::session(&app, window_id),
+        );
+        let expand_x = collapsed
+            .find(iced::widget::Id::new("session-toolbar-expand-handle"))
+            .expect("expand handle should be present")
+            .visible_bounds()
+            .expect("expand handle should be visible")
+            .center_x();
+
+        assert!(
+            (collapse_x - expand_x).abs() < f32::EPSILON,
+            "collapse: {collapse_x}, expand: {expand_x}"
+        );
+    }
+
+    #[test]
+    fn maximized_window_state_is_tracked_for_square_outer_corners() {
+        let (mut app, _task) = ArdViewer::new();
+        let id = window::Id::unique();
+
+        let _task = app.update(Message::WindowMaximizedChanged(id, true));
+        assert!(app.is_window_maximized(id));
+
+        let _task = app.update(Message::WindowMaximizedChanged(id, false));
+        assert!(!app.is_window_maximized(id));
     }
 
     #[test]
@@ -620,9 +961,23 @@ mod tests {
     }
 
     #[test]
+    fn theme_preference_can_follow_or_override_the_system() {
+        let (mut app, _task) = ArdViewer::new();
+
+        let _task = app.update(Message::SystemThemeChanged(iced::theme::Mode::Dark));
+        assert!(app.effective_dark());
+
+        let _task = app.update(Message::ThemePreferenceChanged(ThemePreference::Light));
+        assert!(!app.effective_dark());
+
+        let _task = app.update(Message::SystemThemeChanged(iced::theme::Mode::Light));
+        let _task = app.update(Message::ThemePreferenceChanged(ThemePreference::Dark));
+        assert!(app.effective_dark());
+    }
+
+    #[test]
     #[ignore = "writes visual QA snapshots to /tmp"]
     fn render_visual_qa_snapshots() -> Result<(), iced_test::Error> {
-        let (app, _task) = ArdViewer::new();
         let settings = iced::Settings {
             fonts: vec![
                 include_bytes!("../assets/Inter-Variable.ttf")
@@ -632,26 +987,36 @@ mod tests {
             default_font: iced::Font::with_name("Inter"),
             ..iced::Settings::default()
         };
-        for (name, size, view) in [
-            (
-                "connection",
-                WindowKind::Connection.size(),
-                views::connection(&app, window::Id::unique()),
-            ),
-            (
-                "settings",
-                WindowKind::Settings.size(),
-                views::settings(&app, window::Id::unique()),
-            ),
-            (
-                "session",
-                WindowKind::Session.size(),
-                views::session(&app, window::Id::unique()),
-            ),
+        for (mode, preference) in [
+            ("light", ThemePreference::Light),
+            ("dark", ThemePreference::Dark),
         ] {
-            let mut ui = iced_test::Simulator::with_size(settings.clone(), size, view);
-            let snapshot = ui.snapshot(&theme::app_theme())?;
-            assert!(snapshot.matches_image(format!("/tmp/ard-viewer-{name}"))?);
+            let (mut app, _task) = ArdViewer::new();
+            app.theme_preference = preference;
+            app.settings_section = SettingsSection::General;
+            theme::set_dark(app.effective_dark());
+
+            for (name, size, view) in [
+                (
+                    "connection",
+                    WindowKind::Connection.size(),
+                    views::connection(&app, window::Id::unique()),
+                ),
+                (
+                    "settings",
+                    WindowKind::Settings.size(),
+                    views::settings(&app, window::Id::unique()),
+                ),
+                (
+                    "session",
+                    WindowKind::Session.size(),
+                    views::session(&app, window::Id::unique()),
+                ),
+            ] {
+                let mut ui = iced_test::Simulator::with_size(settings.clone(), size, view);
+                let snapshot = ui.snapshot(&theme::app_theme())?;
+                assert!(snapshot.matches_image(format!("/tmp/ard-viewer-{mode}-{name}"))?);
+            }
         }
         Ok(())
     }

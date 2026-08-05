@@ -9,5 +9,8 @@ license = "MIT OR Apache-2.0"
 ard_rs = { package = "ard-core", path = "../ard-core" }
 iced = { version = "0.14.0", default-features = false, features = ["crisp", "linux-theme-detection", "svg", "tokio", "wayland", "wgpu", "x11"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+
 [dev-dependencies]
 iced_test = "0.14.0"
