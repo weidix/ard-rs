@@ -107,20 +107,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "ard-rs"
+name = "ard-core"
 version = "0.1.0"
 dependencies = [
  "aes",
- "arboard",
- "bytemuck",
  "flate2",
  "getrandom 0.3.4",
  "md-5",
- "naga",
  "num-bigint",
- "pollster",
  "sha1",
  "subtle",
+]
+
+[[package]]
+name = "ard-viewer"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "ard-core",
+ "bytemuck",
+ "naga",
+ "pollster",
  "wgpu",
  "winit",
 ]

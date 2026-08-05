@@ -100,9 +100,9 @@ fn dispatcher_routes_mvs_framebuffer_update_across_fragments() {
     );
     assert!(
         framebuffer
-            .rgba()
+            .pixels()
             .chunks_exact(4)
-            .all(|pixel| pixel == [255, 255, 255, 255])
+            .all(|pixel| pixel == [255, 255, 255, 0])
     );
 }
 

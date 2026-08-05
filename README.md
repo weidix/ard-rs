@@ -3,6 +3,12 @@
 Pure Rust, platform-independent parsing and framebuffer decoding for Apple
 Remote Desktop (ARD) screen sharing.
 
+This repository is a Cargo workspace with two packages. `ard-core` contains
+the protocol client, authentication, codecs, input messages, native RFB
+framebuffer bytes, and reconnect support without a GUI dependency.
+`ard-viewer` contains the current native viewer and is the only package that
+depends on windowing, GPU, and clipboard backends.
+
 ## Native GPU viewer
 
 `ard-viewer` is an interactive desktop viewer for macOS, Windows, and Linux.
@@ -10,9 +16,9 @@ It connects directly to the ARD TCP service and supports mouse, keyboard,
 clipboard, and IME text input.
 
 ```sh
-cargo build --release --features viewer --bin ard-viewer
+cargo build -p ard-viewer --release --bin ard-viewer
 ARD_PASSWORD='screen-sharing-password' \
-  cargo run --release --features viewer --bin ard-viewer -- \
+  cargo run -p ard-viewer --release --bin ard-viewer -- \
   192.168.1.20:5900 username
 ```
 
@@ -60,10 +66,11 @@ numpad keys use layout-independent symbols. The viewer sends and receives
 UTF-8 clipboard text, including committed IME text, on all supported desktop
 platforms.
 
-The full, high, medium, and low profiles use the CPU RGBA decoder for Raw,
-Zlib, ZRLE, and Apple's three sub-zlib encodings, then upload complete snapshots
-to the same GPU presentation texture. Pending full-frame snapshots are
-coalesced so a slow window cannot grow latency or memory without bound.
+The full, high, medium, and low profiles use the CPU decoder for Raw, Zlib,
+ZRLE, and Apple's three sub-zlib encodings. `ard-core` retains the negotiated
+RFB pixel bytes; the viewer converts them at its presentation boundary before
+uploading complete snapshots to the GPU texture. Pending full-frame snapshots
+are coalesced so a slow window cannot grow latency or memory without bound.
 
 Reverse-engineering notes are in
 [`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md). A step-by-step playbook
@@ -120,12 +127,12 @@ on a VNC library or a native operating-system library.
   copy-replay, differential DCT, JPEG chrominance Huffman, and
   explicit/sequential cache records
 - independent persistent zlib state for every Apple stream
-- RGBA framebuffer updates with checked dimensions, allocations, runs, and
-  palette indexes
+- native RFB framebuffer updates with checked dimensions, allocations, runs,
+  and palette indexes
 - client keyboard, pointer, and UTF-8 clipboard message generation
 - optional interactive native GUI with direct TCP authentication,
   server-driven encrypted session streaming, selectable quality, GPU-native
-  MVS tile/DCT output, RGBA upload, mouse/keyboard/IME input, bidirectional
+  MVS tile/DCT output, viewer-side RGBA upload, mouse/keyboard/IME input, bidirectional
   clipboard synchronization, live FPS/traffic metrics, and
   Metal/D3D12/Vulkan presentation
 
@@ -151,23 +158,23 @@ and the exact remaining work.
 
 Core runtime dependencies are Rust-only crates: `flate2` with its
 `rust_backend`, RustCrypto AES/digest primitives, `num-bigint`, and `subtle`.
-The optional `viewer` feature adds winit, wgpu, and arboard for the operating
-system's normal window, GPU, and clipboard backends. Project code retains
-`#![forbid(unsafe_code)]`.
+The separate `ard-viewer` package adds winit, wgpu, and arboard for the
+operating system's normal window, GPU, and clipboard backends. Project code
+retains `#![forbid(unsafe_code)]`.
 
 ## Verification
 
 ```sh
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets --features viewer
-cargo clippy --all-targets --features viewer -- -D warnings
-cargo check --target aarch64-unknown-linux-musl
-cargo check --target x86_64-unknown-linux-musl
-cargo check --target x86_64-pc-windows-gnu
-cargo check --target wasm32-wasip1
-cargo check --target x86_64-unknown-linux-musl --features viewer --bin ard-viewer
-cargo check --target x86_64-pc-windows-gnu --features viewer --bin ard-viewer
+cargo test -p ard-core --all-targets
+cargo clippy -p ard-core --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check -p ard-core --target aarch64-unknown-linux-musl
+cargo check -p ard-core --target x86_64-unknown-linux-musl
+cargo check -p ard-core --target x86_64-pc-windows-gnu
+cargo check -p ard-core --target wasm32-wasip1
+cargo check -p ard-viewer --target x86_64-unknown-linux-musl --bin ard-viewer
+cargo check -p ard-viewer --target x86_64-pc-windows-gnu --bin ard-viewer
 ```
 
 The test suite includes the exact ARD banner and security offer captured from

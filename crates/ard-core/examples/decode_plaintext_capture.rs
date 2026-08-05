@@ -30,18 +30,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
     if dispatcher.buffered_bytes() != 0 {
         return Err(io::Error::other("capture ended with an incomplete ARD message").into());
     }
-    if framebuffer
-        .rgba()
-        .chunks_exact(4)
-        .any(|pixel| pixel[3] == 0)
-    {
-        return Err(io::Error::other("capture does not contain a complete framebuffer").into());
-    }
-
     let mut ppm = BufWriter::new(File::create(&output)?);
     write!(ppm, "P6\n{width} {height}\n255\n")?;
-    for pixel in framebuffer.rgba().chunks_exact(4) {
-        ppm.write_all(&pixel[..3])?;
+    for pixel in framebuffer.pixels().chunks_exact(4) {
+        ppm.write_all(&[pixel[2], pixel[1], pixel[0]])?;
     }
     ppm.flush()?;
     println!(

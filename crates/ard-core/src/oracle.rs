@@ -59,6 +59,9 @@ pub struct EncryptedTransportOracle {
     /// test client does not.
     pub expect_security_selection: bool,
     pub max_client_messages: usize,
+    /// Test-only interoperability hook: close the session after this many
+    /// server frames have been sent.
+    pub close_after_frames: Option<usize>,
 }
 
 impl Default for EncryptedTransportOracle {
@@ -81,6 +84,7 @@ impl Default for EncryptedTransportOracle {
             require_encryption: true,
             expect_security_selection: true,
             max_client_messages: 64,
+            close_after_frames: None,
         }
     }
 }
@@ -237,6 +241,13 @@ impl EncryptedTransportOracle {
         stream.flush()?;
         report.server_to_client_records += 1;
         report.frames_sent += 1;
+
+        if self
+            .close_after_frames
+            .is_some_and(|limit| report.frames_sent >= limit)
+        {
+            return Ok(report);
+        }
 
         if let Some(text) = &self.server_clipboard_text {
             let mut clipboard = vec![3, 0, 0, 0];

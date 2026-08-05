@@ -15,11 +15,5 @@ directly as `.bin`; no duplicate hexadecimal form is maintained. Use
 Replay them without a live Screen Sharing connection:
 
 ```sh
-cargo test --test offline_capture
-```
-
-Decode the saved MVS frame into a viewable PPM image:
-
-```sh
-cargo run --example decode_offline_capture
+cargo test -p ard-core --test offline_capture
 ```

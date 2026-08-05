@@ -539,7 +539,7 @@ impl PixelFormat {
         }
     }
 
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         let _ = self.bytes_per_pixel()?;
         if !self.true_color {
             return Err(Error::Invalid("colour-map pixel formats are not supported"));
@@ -590,6 +590,29 @@ impl PixelFormat {
             ),
             255,
         ])
+    }
+
+    pub(crate) fn encode_pixel(self, rgba: [u8; 4], bytes: &mut [u8]) -> Result<()> {
+        let bpp = self.bytes_per_pixel()?;
+        if bytes.len() < bpp {
+            return Err(Error::NeedMore {
+                needed: bpp,
+                available: bytes.len(),
+            });
+        }
+        let scale = |value: u8, max: u16| (u32::from(value) * u32::from(max) + 127) / 255;
+        let value = (scale(rgba[0], self.red_max) << self.red_shift)
+            | (scale(rgba[1], self.green_max) << self.green_shift)
+            | (scale(rgba[2], self.blue_max) << self.blue_shift);
+        match (bpp, self.big_endian) {
+            (1, _) => bytes[0] = value as u8,
+            (2, true) => bytes[..2].copy_from_slice(&(value as u16).to_be_bytes()),
+            (2, false) => bytes[..2].copy_from_slice(&(value as u16).to_le_bytes()),
+            (4, true) => bytes[..4].copy_from_slice(&value.to_be_bytes()),
+            (4, false) => bytes[..4].copy_from_slice(&value.to_le_bytes()),
+            _ => unreachable!(),
+        }
+        Ok(())
     }
 }
 

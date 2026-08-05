@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use crate::{
     ArdEncryptionControl, ArdMessageDispatcher, ArdServerMessage, ArdVerifiedRecordStream,
-    ArdViewerInformation, Decoder, Framebuffer, PixelFormat, ProtocolVersion, SecurityType,
-    build_ard_auto_frame_update, build_ard_encryption_activation, build_ard_set_encryption_level,
-    build_ard_type30_client_exchange, build_client_cut_text, build_framebuffer_update_request,
-    build_key_event, build_pointer_event, build_set_encodings, build_set_pixel_format,
-    parse_ard_auth_challenge, parse_framebuffer_update, parse_security_types, parse_server_init,
-    unwrap_ard_session_material,
+    ArdViewerInformation, Decoder, Framebuffer, FramebufferFormat, PixelFormat, ProtocolVersion,
+    SecurityType, build_ard_auto_frame_update, build_ard_encryption_activation,
+    build_ard_set_encryption_level, build_ard_type30_client_exchange, build_client_cut_text,
+    build_framebuffer_update_request, build_key_event, build_pointer_event, build_set_encodings,
+    build_set_pixel_format, parse_ard_auth_challenge, parse_framebuffer_update,
+    parse_security_types, parse_server_init, unwrap_ard_session_material,
 };
 
 const MAX_KEY_BYTES: usize = 512;
@@ -35,6 +35,66 @@ pub enum ArdVideoQuality {
     #[default]
     Adaptive,
     Full,
+}
+
+/// Selects the RFB pixel representation exposed by [`ArdClient::framebuffer`].
+/// The core stores this representation as-is; presentation and texture
+/// conversion are outside the core package.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ArdFrameOutput {
+    /// Request and retain a caller-selected RFB pixel layout. The core does
+    /// not convert the resulting bytes to a presentation or texture format.
+    Native(PixelFormat),
+    /// Keep the server's advertised RFB pixel layout.
+    #[default]
+    ServerNative,
+}
+
+impl ArdFrameOutput {
+    fn pixel_format(self, server_native: PixelFormat) -> PixelFormat {
+        match self {
+            Self::Native(pixel_format) => pixel_format,
+            Self::ServerNative => server_native,
+        }
+    }
+
+    fn framebuffer_format(self, server_native: PixelFormat) -> FramebufferFormat {
+        match self {
+            Self::Native(pixel_format) => FramebufferFormat::Native(pixel_format),
+            Self::ServerNative => FramebufferFormat::Native(server_native),
+        }
+    }
+}
+
+/// Reconnection policy used by [`ArdClient::next_event`]. A zero-attempt
+/// policy keeps the historical fail-fast behavior while callers that need a
+/// long-lived session can opt into bounded automatic reconnects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArdReconnectPolicy {
+    pub max_attempts: usize,
+    pub delay: Duration,
+}
+
+impl ArdReconnectPolicy {
+    pub const fn disabled() -> Self {
+        Self {
+            max_attempts: 0,
+            delay: Duration::ZERO,
+        }
+    }
+
+    pub const fn new(max_attempts: usize, delay: Duration) -> Self {
+        Self {
+            max_attempts,
+            delay,
+        }
+    }
+}
+
+impl Default for ArdReconnectPolicy {
+    fn default() -> Self {
+        Self::disabled()
+    }
 }
 
 impl ArdVideoQuality {
@@ -59,18 +119,22 @@ impl ArdVideoQuality {
     }
 }
 
+#[derive(Clone)]
 pub struct ArdClientConfig {
     pub address: String,
     pub username: Vec<u8>,
     pub password: Vec<u8>,
     pub timeout: Duration,
     pub video_quality: ArdVideoQuality,
+    /// RFB pixel layout requested from the server and retained by the core.
+    pub output_format: ArdFrameOutput,
     /// Use Apple's server-driven update stream instead of serial
     /// request/response polling.
     pub automatic_updates: bool,
     /// Minimum interval between automatic updates. Zero is the native default
     /// and permits the server's maximum supported rate.
     pub frame_interval: Duration,
+    pub reconnect: ArdReconnectPolicy,
 }
 
 impl fmt::Debug for ArdClientConfig {
@@ -82,8 +146,10 @@ impl fmt::Debug for ArdClientConfig {
             .field("password", &"<redacted>")
             .field("timeout", &self.timeout)
             .field("video_quality", &self.video_quality)
+            .field("output_format", &self.output_format)
             .field("automatic_updates", &self.automatic_updates)
             .field("frame_interval", &self.frame_interval)
+            .field("reconnect", &self.reconnect)
             .finish()
     }
 }
@@ -100,9 +166,17 @@ impl ArdClientConfig {
             password: password.into(),
             timeout: Duration::from_secs(20),
             video_quality: ArdVideoQuality::Adaptive,
+            output_format: ArdFrameOutput::ServerNative,
             automatic_updates: true,
             frame_interval: Duration::ZERO,
+            reconnect: ArdReconnectPolicy::default(),
         }
+    }
+}
+
+impl Drop for ArdClientConfig {
+    fn drop(&mut self) {
+        self.password.fill(0);
     }
 }
 
@@ -137,6 +211,12 @@ impl From<crate::Error> for ArdClientError {
     }
 }
 
+impl ArdClientError {
+    fn is_io(&self) -> bool {
+        matches!(self, Self::Io(_))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArdFrameInfo {
     pub index: u64,
@@ -155,6 +235,9 @@ pub enum ArdClientEvent {
     Clipboard(String),
     Bell,
     StateChange,
+    /// The transport was recreated after a read-side disconnect. The next
+    /// call waits for the first frame from the new session.
+    Reconnected,
 }
 
 enum OutboundMessage {
@@ -308,6 +391,7 @@ pub struct ArdClient {
     automatic_frame_interval_ms: u32,
     automatic_updates_started: bool,
     pending_events: VecDeque<ArdClientEvent>,
+    reconnect_config: ArdClientConfig,
 }
 
 impl ArdClient {
@@ -315,6 +399,18 @@ impl ArdClient {
         let result = Self::connect_inner(&mut config);
         config.password.fill(0);
         result
+    }
+
+    /// Re-establishes the authenticated session using the original
+    /// connection configuration. The framebuffer, decoder, encryption
+    /// sequence and input writer are all replaced with a fresh session.
+    pub fn reconnect(&mut self) -> Result<(), ArdClientError> {
+        let mut config = self.reconnect_config.clone();
+        let result = Self::connect_inner(&mut config);
+        config.password.fill(0);
+        let replacement = result?;
+        *self = replacement;
+        Ok(())
     }
 
     fn connect_inner(config: &mut ArdClientConfig) -> Result<Self, ArdClientError> {
@@ -428,20 +524,33 @@ impl ArdClient {
             ));
         }
 
+        let requested_pixel_format = config.output_format.pixel_format(server_init.pixel_format);
         let (mut decoder, mut framebuffer) = if config.video_quality == ArdVideoQuality::Adaptive {
             (
-                Decoder::new_gpu_mvs(PixelFormat::XRGB8888)?,
-                Framebuffer::new_metadata(server_init.width, server_init.height)?,
+                Decoder::new_gpu_mvs(requested_pixel_format)?,
+                Framebuffer::new_metadata_with_format(
+                    server_init.width,
+                    server_init.height,
+                    config
+                        .output_format
+                        .framebuffer_format(requested_pixel_format),
+                )?,
             )
         } else {
             (
-                Decoder::new(PixelFormat::XRGB8888)?,
-                Framebuffer::new(server_init.width, server_init.height)?,
+                Decoder::new(requested_pixel_format)?,
+                Framebuffer::new_with_format(
+                    server_init.width,
+                    server_init.height,
+                    config
+                        .output_format
+                        .framebuffer_format(requested_pixel_format),
+                )?,
             )
         };
         stream.write_all(&[10, 0, 0, 1])?;
         stream.write_all(&viewer_information())?;
-        stream.write_all(&build_set_pixel_format(PixelFormat::XRGB8888)?)?;
+        stream.write_all(&build_set_pixel_format(requested_pixel_format)?)?;
         stream.write_all(&build_set_encodings(config.video_quality.encodings())?)?;
         stream.write_all(&build_ard_set_encryption_level(1, &[1])?)?;
         // This request lets servers serialize the 1103 control as the update
@@ -510,6 +619,7 @@ impl ArdClient {
             automatic_frame_interval_ms,
             automatic_updates_started: false,
             pending_events: VecDeque::new(),
+            reconnect_config: config.clone(),
         })
     }
 
@@ -553,6 +663,28 @@ impl ArdClient {
 
     /// Reads the next decoded session event.
     pub fn next_event(&mut self) -> Result<ArdClientEvent, ArdClientError> {
+        let policy = self.reconnect_config.reconnect;
+        let mut attempts = 0_usize;
+        loop {
+            match self.next_event_once() {
+                Ok(event) => return Ok(event),
+                Err(error) if error.is_io() && attempts < policy.max_attempts => {
+                    attempts += 1;
+                    if !policy.delay.is_zero() {
+                        thread::sleep(policy.delay);
+                    }
+                    match self.reconnect() {
+                        Ok(()) => return Ok(ArdClientEvent::Reconnected),
+                        Err(error) if error.is_io() && attempts < policy.max_attempts => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn next_event_once(&mut self) -> Result<ArdClientEvent, ArdClientError> {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(event);
         }
@@ -561,13 +693,7 @@ impl ArdClient {
             self.input.check_writer_error()?;
             let record_sequence = self.verified.sequence();
             let wire_bytes_for_record =
-                read_encrypted_record(&mut self.stream, &mut self.record_scratch).map_err(
-                    |error| {
-                        ArdClientError::Message(format!(
-                            "读取服务端加密记录 #{record_sequence} 失败：{error}"
-                        ))
-                    },
-                )?;
+                read_encrypted_record(&mut self.stream, &mut self.record_scratch)?;
             wire_bytes = wire_bytes.saturating_add(wire_bytes_for_record);
             let mut framebuffer_updates = 0_usize;
             let mut rectangle_count = 0_usize;

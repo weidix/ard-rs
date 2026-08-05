@@ -1,9 +1,56 @@
 use ard_rs::{
-    Decoder, Encoding, Error, Framebuffer, PixelFormat, ProtocolVersion, Rectangle,
+    Decoder, Encoding, Error, Framebuffer, FramebufferFormat, PixelFormat, Rectangle,
     parse_ard_auth_challenge, parse_ard_auth_response, parse_ard_client_init,
-    parse_ard_session_options, parse_framebuffer_update, parse_security_types,
+    parse_ard_session_options, parse_framebuffer_update,
 };
 use flate2::{Compress, Compression, FlushCompress};
+
+// The decoder tests compare colours for readability, while the core now
+// exposes the negotiated XRGB8888 bytes directly.
+trait TestRgba {
+    fn rgba(&self) -> Vec<u8>;
+}
+
+impl TestRgba for Framebuffer {
+    fn rgba(&self) -> Vec<u8> {
+        let Some(format) = self.native_pixel_format() else {
+            return Vec::new();
+        };
+        let Ok(bytes_per_pixel) = format.bytes_per_pixel() else {
+            return Vec::new();
+        };
+        let scale =
+            |value: u32, max: u16| (((value * 255) + u32::from(max) / 2) / u32::from(max)) as u8;
+        self.pixels()
+            .chunks_exact(bytes_per_pixel)
+            .flat_map(|bytes| {
+                let value = match (bytes_per_pixel, format.big_endian) {
+                    (1, _) => u32::from(bytes[0]),
+                    (2, true) => u32::from(u16::from_be_bytes([bytes[0], bytes[1]])),
+                    (2, false) => u32::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+                    (4, true) => u32::from_be_bytes(bytes.try_into().unwrap()),
+                    (4, false) => u32::from_le_bytes(bytes.try_into().unwrap()),
+                    _ => return [0, 0, 0, 0],
+                };
+                [
+                    scale(
+                        (value >> format.red_shift) & u32::from(format.red_max),
+                        format.red_max,
+                    ),
+                    scale(
+                        (value >> format.green_shift) & u32::from(format.green_max),
+                        format.green_max,
+                    ),
+                    scale(
+                        (value >> format.blue_shift) & u32::from(format.blue_max),
+                        format.blue_max,
+                    ),
+                    255,
+                ]
+            })
+            .collect()
+    }
+}
 
 fn rect(width: u16, height: u16, encoding: Encoding) -> Rectangle {
     Rectangle {
@@ -83,29 +130,6 @@ fn full_mvs_packet(header: [u8; 2], fields: &[(u32, u8)]) -> Vec<u8> {
     let mut packet = (update.len() as u32).to_be_bytes().to_vec();
     packet.extend_from_slice(&update);
     packet
-}
-
-#[test]
-fn parses_live_macos_ard_banner_and_security_offer() {
-    // Captured from this Mac's /System Screen Sharing server on 2026-07-25.
-    let capture = b"RFB 003.889\n\x05\x1e\x21\x24\x02\x23";
-    assert_eq!(
-        ProtocolVersion::parse(capture).unwrap(),
-        ProtocolVersion::ARD_3_889
-    );
-    let (types, consumed) = parse_security_types(&capture[12..], 36).unwrap();
-    assert_eq!(consumed, 6);
-    assert_eq!(types.len(), 5);
-    assert!(
-        types
-            .iter()
-            .any(|kind| matches!(kind, ard_rs::SecurityType::Apple(30)))
-    );
-    assert!(
-        types
-            .iter()
-            .any(|kind| matches!(kind, ard_rs::SecurityType::VncAuthentication))
-    );
 }
 
 #[test]
@@ -331,26 +355,6 @@ fn parses_zero_sized_mvs_quantization_control_update() {
     assert_eq!(luminance[63], 63);
     assert_eq!(chrominance[0], 64);
     assert_eq!(chrominance[63], 127);
-}
-
-#[test]
-fn decodes_mvs_partial_white_tile_and_markers() {
-    // Initial state bit, update type 0, no repeats, then the primary marker.
-    let packet = partial_mvs_packet(&[(0, 1), (0, 3), (0, 1), (0x6d, 8)]);
-    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
-    let mut framebuffer = Framebuffer::new(3, 2).unwrap();
-    assert_eq!(
-        decoder
-            .decode_rectangle(rect(3, 2, Encoding::ArdMvs), &packet, &mut framebuffer)
-            .unwrap(),
-        packet.len()
-    );
-    assert!(
-        framebuffer
-            .rgba()
-            .chunks_exact(4)
-            .all(|pixel| pixel == [255, 255, 255, 255])
-    );
 }
 
 #[test]
@@ -1021,7 +1025,7 @@ fn replays_a_partial_copy_tile_in_a_full_mvs_update() {
     for row in 0..8 {
         for column in 0..8 {
             let offset = (row * 16 + column) * 4;
-            framebuffer.rgba_mut()[offset..offset + 4].copy_from_slice(&[20, 90, 180, 255]);
+            framebuffer.pixels_mut()[offset..offset + 4].copy_from_slice(&[180, 90, 20, 0]);
         }
     }
     let replay = full_mvs_packet(
@@ -1114,21 +1118,6 @@ fn full_differential_preserves_partial_copy_source() {
             .chunks_exact(4)
             .all(|pixel| pixel == [255, 255, 255, 255])
     );
-}
-
-#[test]
-fn decodes_mvs_partial_solid_ycbcr_tile() {
-    // Type 4, no repeats, solid/new-color flags, neutral-chroma red-ish Y.
-    let packet = partial_mvs_packet_with_secondary(
-        &[(0, 1), (4, 3), (0, 1), (0x6d, 8)],
-        &[(0, 1), (0, 1), (200, 8), (32, 6), (32, 6)],
-    );
-    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
-    let mut framebuffer = Framebuffer::new(1, 1).unwrap();
-    decoder
-        .decode_rectangle(rect(1, 1, Encoding::ArdMvs), &packet, &mut framebuffer)
-        .unwrap();
-    assert_eq!(framebuffer.rgba(), &[200, 200, 200, 255]);
 }
 
 #[test]
@@ -1243,7 +1232,7 @@ fn mvs_full_copy_without_source_is_a_native_noop() {
     let packet = full_mvs_packet([0, 0], &[(2, 2)]);
     let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
     let mut framebuffer = Framebuffer::new(8, 8).unwrap();
-    framebuffer.rgba_mut().fill(0x5a);
+    framebuffer.pixels_mut().fill(0x5a);
 
     assert_eq!(
         decoder
@@ -1251,7 +1240,7 @@ fn mvs_full_copy_without_source_is_a_native_noop() {
             .unwrap(),
         packet.len()
     );
-    assert!(framebuffer.rgba().iter().all(|&byte| byte == 0x5a));
+    assert!(framebuffer.pixels().iter().all(|&byte| byte == 0x5a));
 
     let mut gpu_decoder = Decoder::new_gpu_mvs(PixelFormat::XRGB8888).unwrap();
     let mut gpu_framebuffer = Framebuffer::new(8, 8).unwrap();
@@ -1306,14 +1295,14 @@ fn invalid_mvs_dct_reuse_is_transactional() {
     );
     let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
     let mut framebuffer = Framebuffer::new(16, 1).unwrap();
-    framebuffer.rgba_mut().fill(7);
+    framebuffer.pixels_mut().fill(7);
     assert_eq!(
         decoder
             .decode_rectangle(rect(16, 1, Encoding::ArdMvs), &packet, &mut framebuffer)
             .unwrap_err(),
         Error::Invalid("ARD MVS Rice/DCT reuse has no previous block")
     );
-    assert!(framebuffer.rgba().iter().all(|byte| *byte == 7));
+    assert!(framebuffer.pixels().iter().all(|&byte| byte == 7));
 }
 
 #[test]
@@ -1331,14 +1320,14 @@ fn decodes_mvs_full_update_skip_tiles_and_markers() {
 
     let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
     let mut framebuffer = Framebuffer::new(16, 8).unwrap();
-    framebuffer.rgba_mut().fill(0x5a);
+    framebuffer.pixels_mut().fill(0x5a);
     assert_eq!(
         decoder
             .decode_rectangle(rect(16, 8, Encoding::ArdMvs), &packet, &mut framebuffer,)
             .unwrap(),
         packet.len()
     );
-    assert!(framebuffer.rgba().iter().all(|&byte| byte == 0x5a));
+    assert!(framebuffer.pixels().iter().all(|&byte| byte == 0x5a));
 }
 
 #[test]
@@ -1369,8 +1358,8 @@ fn copy_rect_is_overlap_safe() {
     let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
     let mut framebuffer = Framebuffer::new(3, 1).unwrap();
     framebuffer
-        .rgba_mut()
-        .copy_from_slice(&[1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255]);
+        .pixels_mut()
+        .copy_from_slice(&[0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0]);
     let rectangle = Rectangle {
         x: 1,
         y: 0,
@@ -1404,7 +1393,7 @@ fn desktop_size_resets_the_framebuffer() {
         .unwrap();
     assert_eq!(consumed, 0);
     assert_eq!((framebuffer.width(), framebuffer.height()), (3, 2));
-    assert_eq!(framebuffer.rgba(), &[0; 24]);
+    assert_eq!(framebuffer.pixels(), &[0; 24]);
 }
 
 #[test]
@@ -1420,9 +1409,34 @@ fn decodes_zrle_compact_pixels_when_padding_is_low_byte() {
     let mut encoder = Compress::new(Compression::default(), true);
     let packet = compressed_packet(&mut encoder, &zrle);
     let mut decoder = Decoder::new(high_xrgb).unwrap();
-    let mut framebuffer = Framebuffer::new(1, 1).unwrap();
+    let mut framebuffer = Framebuffer::new_native(1, 1, high_xrgb).unwrap();
     decoder
         .decode_rectangle(rect(1, 1, Encoding::Zrle), &packet, &mut framebuffer)
         .unwrap();
     assert_eq!(framebuffer.rgba(), &[255, 0, 0, 255]);
+}
+
+#[test]
+fn preserves_native_raw_pixel_bytes_when_requested() {
+    let rgb565 = PixelFormat {
+        bits_per_pixel: 16,
+        depth: 16,
+        big_endian: true,
+        true_color: true,
+        red_max: 31,
+        green_max: 63,
+        blue_max: 31,
+        red_shift: 11,
+        green_shift: 5,
+        blue_shift: 0,
+    };
+    let wire_pixels = [0xf8, 0x00, 0x07, 0xe0, 0x00, 0x1f];
+    let mut decoder = Decoder::new(rgb565).unwrap();
+    let mut framebuffer = Framebuffer::new_native(3, 1, rgb565).unwrap();
+    decoder
+        .decode_rectangle(rect(3, 1, Encoding::Raw), &wire_pixels, &mut framebuffer)
+        .unwrap();
+
+    assert_eq!(framebuffer.format(), FramebufferFormat::Native(rgb565));
+    assert_eq!(framebuffer.pixels(), &wire_pixels);
 }

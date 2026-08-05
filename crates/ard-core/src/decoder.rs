@@ -119,6 +119,7 @@ impl Decoder {
     ) -> Result<usize> {
         let encoding =
             Encoding::from_i32(rect.encoding).ok_or(Error::UnsupportedEncoding(rect.encoding))?;
+        framebuffer.validate_pixel_format(self.pixel_format)?;
         if encoding == Encoding::DesktopSize {
             framebuffer.resize(rect.width, rect.height)?;
             return Ok(0);
@@ -704,36 +705,15 @@ fn blit_pixels(
     bpp: usize,
     framebuffer: &mut Framebuffer,
 ) -> Result<()> {
-    if pixel_format == PixelFormat::XRGB8888 {
-        let source_row_bytes = usize::from(rect.width) * 4;
-        let destination_row_bytes = usize::from(framebuffer.width()) * 4;
-        let destination_x = usize::from(rect.x) * 4;
-        let destination_y = usize::from(rect.y);
-        let destination = framebuffer.rgba_mut();
-        for row in 0..usize::from(rect.height) {
-            let source_start = row * source_row_bytes;
-            let destination_start = (destination_y + row) * destination_row_bytes + destination_x;
-            let source_row = &bytes[source_start..source_start + source_row_bytes];
-            let destination_row =
-                &mut destination[destination_start..destination_start + source_row_bytes];
-            for (source, target) in source_row
-                .chunks_exact(4)
-                .zip(destination_row.chunks_exact_mut(4))
-            {
-                target[0] = source[2];
-                target[1] = source[1];
-                target[2] = source[0];
-                target[3] = 255;
-            }
-        }
-        return Ok(());
-    }
-
     for row in 0..rect.height {
         for column in 0..rect.width {
             let index = (usize::from(row) * usize::from(rect.width) + usize::from(column)) * bpp;
-            let rgba = pixel_format.decode_pixel(&bytes[index..index + bpp])?;
-            framebuffer.set_pixel(rect.x + column, rect.y + row, rgba);
+            framebuffer.set_pixel_bytes(
+                rect.x + column,
+                rect.y + row,
+                pixel_format,
+                &bytes[index..index + bpp],
+            )?;
         }
     }
     Ok(())

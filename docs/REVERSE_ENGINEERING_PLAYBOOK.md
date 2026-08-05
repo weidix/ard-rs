@@ -277,10 +277,10 @@ half-unit bias. Tests must cover positive and negative chroma and clamping to
 
 ## 10. Build a native macOS decoder oracle
 
-The repository contains:
+The core package contains:
 
 ```text
-examples/mvs_oracle_server.rs
+crates/ard-core/examples/mvs_oracle_server.rs
 ```
 
 It is a minimal pure-Rust ARD server that accepts an authentication response
@@ -295,7 +295,7 @@ Apple Silicon example:
 ```sh
 rustup target add aarch64-unknown-linux-musl
 
-cargo build --release \
+cargo build -p ard-core --release \
   --example mvs_oracle_server \
   --target aarch64-unknown-linux-musl
 ```
@@ -342,20 +342,20 @@ For every experiment, preserve:
 - rectangle dimensions;
 - whether Apple disconnected;
 - Apple's rendered result;
-- Rust RGBA output;
+- Rust-decoded framebuffer pixels;
 - exact pixel differences.
 
 ### Encrypted-transport oracle
 
 Once the MVS oracle path works, the modern encrypted transport can be
-validated the same way with `examples/encrypted_transport_oracle.rs`. It
+validated the same way with `crates/ard-core/examples/encrypted_transport_oracle.rs`. It
 completes type-30 authentication, advertises command `0x12` through the
 extended ServerInit bitfield, sends a real 1103 control rectangle, waits for
 the client's eight-byte activation, and then exchanges AES-CBC records
 carrying MVS rectangles. Build it exactly like the MVS oracle:
 
 ```sh
-cargo build --release \
+cargo build -p ard-core --release \
   --example encrypted_transport_oracle \
   --target aarch64-unknown-linux-musl
 ```
@@ -380,14 +380,14 @@ expected result often proves only that both copies make the same mistake.
 MVS tests are in:
 
 ```text
-tests/decoder.rs
+crates/ard-core/tests/decoder.rs
 ```
 
 Modern transport tests are in:
 
 ```text
-tests/auth.rs
-tests/encryption_transport.rs
+crates/ard-core/tests/auth.rs
+crates/ard-core/tests/encryption_transport.rs
 ```
 
 ## 12. Investigate a real connection
@@ -395,7 +395,7 @@ tests/encryption_transport.rs
 The transparent capture tool is:
 
 ```text
-examples/capture_proxy.rs
+crates/ard-core/examples/capture_proxy.rs
 ```
 
 Both authentication material and real desktop data are sensitive:
@@ -560,22 +560,22 @@ Run:
 
 ```sh
 cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo test -p ard-core --all-targets
+cargo clippy -p ard-core --all-targets -- -D warnings
 
-cargo check --target aarch64-unknown-linux-musl
-cargo check --target x86_64-unknown-linux-musl
-cargo check --target x86_64-pc-windows-gnu
-cargo check --target wasm32-wasip1
+cargo check -p ard-core --target aarch64-unknown-linux-musl
+cargo check -p ard-core --target x86_64-unknown-linux-musl
+cargo check -p ard-core --target x86_64-pc-windows-gnu
+cargo check -p ard-core --target wasm32-wasip1
 
-cargo tree
+cargo tree -p ard-core
 ```
 
 Audit for forbidden native paths:
 
 ```sh
 rg -n 'unsafe|extern "C"|#\\[link|libc|Security\\.framework|VideoToolbox|CommonCrypto' \
-  src tests examples Cargo.toml
+  crates/ard-core/src crates/ard-core/tests crates/ard-core/examples crates/ard-core/Cargo.toml
 ```
 
 Claim real-desktop decoding only after completing this loop:
@@ -586,8 +586,8 @@ real macOS server
 → Rust 1103 record decryption
 → Rust internal ARD message recovery
 → Rust image-encoding decode
-→ RGBA framebuffer
-→ PNG
+→ native RFB framebuffer bytes
+→ consumer-side RGBA/PNG
 → comparison with a native screenshot from the same session
 ```
 

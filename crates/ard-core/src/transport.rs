@@ -394,7 +394,6 @@ impl ArdVerifiedRecordStream {
     /// state or allocating a plaintext buffer. This is intentionally kept
     /// separate from [`Self::push`], whose public API remains transactional
     /// for arbitrary fragmented input.
-    #[cfg(feature = "viewer")]
     pub(crate) fn decode_record_in_place(&mut self, ciphertext: &mut Vec<u8>) -> Result<()> {
         self.decoder.decode_in_place(ciphertext)
     }

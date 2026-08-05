@@ -1,11 +1,9 @@
-#![cfg(feature = "viewer")]
-
 use std::net::TcpListener;
 use std::thread;
 
 use ard_rs::{
-    ArdClient, ArdClientConfig, ArdClientEvent, ArdVideoQuality, EncryptedTransportOracle,
-    MvsGpuTile,
+    ArdClient, ArdClientConfig, ArdClientEvent, ArdFrameOutput, ArdReconnectPolicy,
+    ArdVideoQuality, EncryptedTransportOracle, MvsGpuTile, PixelFormat,
 };
 
 #[test]
@@ -38,7 +36,7 @@ fn receive_only_client_delivers_gpu_mvs_tiles_without_cpu_frame_expansion() {
         (client.framebuffer().width(), client.framebuffer().height()),
         (64, 64)
     );
-    assert!(client.framebuffer().rgba().is_empty());
+    assert!(client.framebuffer().pixels().is_empty());
     let gpu_frames = client.take_gpu_mvs_frames();
     assert_eq!(gpu_frames.len(), 1);
     assert_eq!(gpu_frames[0].tiles.len(), 64);
@@ -70,7 +68,7 @@ fn receive_only_client_delivers_gpu_mvs_tiles_without_cpu_frame_expansion() {
 }
 
 #[test]
-fn full_quality_client_negotiates_lossless_zlib_and_updates_rgba() {
+fn full_quality_client_negotiates_lossless_zlib_and_updates_native_pixels() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -92,19 +90,90 @@ fn full_quality_client_negotiates_lossless_zlib_and_updates_rgba() {
     let first = client.next_frame().unwrap();
     assert_eq!(first.index, 1);
     assert_eq!(first.framebuffer_updates, 1);
-    assert_eq!(client.framebuffer().rgba().len(), 64 * 64 * 4);
-    assert_eq!(&client.framebuffer().rgba()[..4], &[255, 255, 255, 255]);
+    assert_eq!(client.framebuffer().pixels().len(), 64 * 64 * 4);
+    assert_eq!(&client.framebuffer().pixels()[..4], &[255, 255, 255, 0]);
     assert!(client.take_gpu_mvs_frames().is_empty());
 
     let second = client.next_frame().unwrap();
     assert_eq!(second.index, 2);
-    assert_eq!(&client.framebuffer().rgba()[..4], &[32, 96, 192, 255]);
+    assert_eq!(&client.framebuffer().pixels()[..4], &[192, 96, 32, 0]);
 
     drop(client);
     let report = server.join().unwrap();
     assert_eq!(report.viewer_encodings, [6, 16, -223]);
     assert_eq!(report.client_message_types, [3, 9]);
     assert_eq!(report.client_framebuffer_update_incremental, [false]);
+}
+
+#[test]
+fn client_can_retain_server_native_pixel_bytes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, peer) = listener.accept().unwrap();
+        EncryptedTransportOracle {
+            allowed_peer: Some(peer.ip()),
+            expect_security_selection: false,
+            ..EncryptedTransportOracle::default()
+        }
+        .run(stream, peer)
+        .unwrap()
+    });
+
+    let mut config =
+        ArdClientConfig::new(address.to_string(), b"viewer".to_vec(), b"oracle".to_vec());
+    config.video_quality = ArdVideoQuality::Full;
+    config.output_format = ArdFrameOutput::ServerNative;
+    let mut client = ArdClient::connect(config).unwrap();
+    client.next_frame().unwrap();
+
+    assert_eq!(
+        client.framebuffer().native_pixel_format(),
+        Some(PixelFormat::XRGB8888)
+    );
+    assert_eq!(client.framebuffer().pixels().len(), 64 * 64 * 4);
+    assert_eq!(&client.framebuffer().pixels()[..4], &[255, 255, 255, 0]);
+    drop(client);
+    server.join().unwrap();
+}
+
+#[test]
+fn client_reconnects_after_a_server_disconnect() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, peer) = listener.accept().unwrap();
+        let first = EncryptedTransportOracle {
+            allowed_peer: Some(peer.ip()),
+            expect_security_selection: false,
+            close_after_frames: Some(1),
+            ..EncryptedTransportOracle::default()
+        }
+        .run(stream, peer)
+        .unwrap();
+
+        let (stream, peer) = listener.accept().unwrap();
+        let second = EncryptedTransportOracle {
+            allowed_peer: Some(peer.ip()),
+            expect_security_selection: false,
+            ..EncryptedTransportOracle::default()
+        }
+        .run(stream, peer)
+        .unwrap();
+        (first, second)
+    });
+
+    let mut config =
+        ArdClientConfig::new(address.to_string(), b"viewer".to_vec(), b"oracle".to_vec());
+    config.reconnect = ArdReconnectPolicy::new(1, std::time::Duration::ZERO);
+    let mut client = ArdClient::connect(config).unwrap();
+    assert_eq!(client.next_frame().unwrap().index, 1);
+    assert_eq!(client.next_frame().unwrap().index, 1);
+
+    drop(client);
+    let (first, second) = server.join().unwrap();
+    assert_eq!(first.frames_sent, 1);
+    assert!(second.activation_received);
 }
 
 #[test]

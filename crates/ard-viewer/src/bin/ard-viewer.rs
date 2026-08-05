@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdKey, ArdNamedKey,
-    ArdVideoQuality, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
+    ArdReconnectPolicy, ArdVideoQuality, Framebuffer, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate,
+    keysym_for_key,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -2145,6 +2146,13 @@ fn start_receiver(
                     let _ = proxy.send_event(ViewerEvent::Clipboard(text));
                     continue;
                 }
+                Ok(ArdClientEvent::Reconnected) => {
+                    let _ = proxy.send_event(ViewerEvent::Connected {
+                        server_name: client.server_name().to_owned(),
+                        input: client.input(),
+                    });
+                    continue;
+                }
                 Ok(ArdClientEvent::Bell | ArdClientEvent::StateChange) => continue,
                 Err(error) => {
                     eprintln!("ARD 接收失败：{error}");
@@ -2188,12 +2196,13 @@ fn start_receiver(
             });
             if !has_gpu_frames {
                 let framebuffer = client.framebuffer();
-                if framebuffer.rgba().is_empty() {
+                let mut rgba = queued.rgba_pool.pop().unwrap_or_default();
+                if !framebuffer_to_rgba(framebuffer, &mut rgba) {
+                    if queued.rgba_pool.len() < MAX_RGBA_POOL {
+                        queued.rgba_pool.push(rgba);
+                    }
                     continue;
                 }
-                let mut rgba = queued.rgba_pool.pop().unwrap_or_default();
-                rgba.clear();
-                rgba.extend_from_slice(framebuffer.rgba());
                 let packet = FramePacket::from_rgba(
                     framebuffer.width(),
                     framebuffer.height(),
@@ -2212,6 +2221,61 @@ fn start_receiver(
             }
         }
     });
+}
+
+/// Converts core-owned RFB bytes into the presentation texture's RGBA8
+/// layout. This conversion deliberately lives in the viewer, outside
+/// `ard-core`'s protocol and framebuffer responsibilities.
+fn framebuffer_to_rgba(framebuffer: &Framebuffer, output: &mut Vec<u8>) -> bool {
+    let format = framebuffer.pixel_format();
+    let Ok(bytes_per_pixel) = format.bytes_per_pixel() else {
+        return false;
+    };
+    let pixel_count =
+        usize::from(framebuffer.width()).checked_mul(usize::from(framebuffer.height()));
+    let Some(pixel_count) = pixel_count else {
+        return false;
+    };
+    let Some(expected_len) = pixel_count.checked_mul(bytes_per_pixel) else {
+        return false;
+    };
+    if framebuffer.pixels().len() != expected_len
+        || !format.true_color
+        || format.red_max == 0
+        || format.green_max == 0
+        || format.blue_max == 0
+        || format.red_shift >= 32
+        || format.green_shift >= 32
+        || format.blue_shift >= 32
+    {
+        return false;
+    }
+    let Some(output_len) = pixel_count.checked_mul(4) else {
+        return false;
+    };
+    output.clear();
+    output.reserve(output_len);
+    for bytes in framebuffer.pixels().chunks_exact(bytes_per_pixel) {
+        let value = match (bytes_per_pixel, format.big_endian) {
+            (1, _) => u32::from(bytes[0]),
+            (2, true) => u32::from(u16::from_be_bytes([bytes[0], bytes[1]])),
+            (2, false) => u32::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+            (4, true) => u32::from_be_bytes(bytes.try_into().expect("pixel width checked")),
+            (4, false) => u32::from_le_bytes(bytes.try_into().expect("pixel width checked")),
+            _ => return false,
+        };
+        output.extend_from_slice(&[
+            scale_pixel_channel(value, format.red_shift, format.red_max),
+            scale_pixel_channel(value, format.green_shift, format.green_max),
+            scale_pixel_channel(value, format.blue_shift, format.blue_max),
+            255,
+        ]);
+    }
+    true
+}
+
+fn scale_pixel_channel(value: u32, shift: u8, max: u16) -> u8 {
+    ((((value >> shift) & u32::from(max)) * 255 + u32::from(max) / 2) / u32::from(max)) as u8
 }
 
 const VIEWER_USAGE: &str = "用法：ARD_PASSWORD='密码' ard-viewer [--quality low|medium|high|adaptive|full] [--frame-interval-ms 毫秒] 地址:5900 用户名";
@@ -2293,6 +2357,7 @@ fn main() {
     let mut config = ArdClientConfig::new(address, username.into_bytes(), password);
     config.video_quality = quality;
     config.frame_interval = frame_interval;
+    config.reconnect = ArdReconnectPolicy::new(5, Duration::from_secs(1));
     start_receiver(
         config,
         event_loop.create_proxy(),
@@ -2308,10 +2373,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ScrollAccumulator, TileSet, fitted_viewport, is_system_shortcut, mouse_button_bit,
-        pack_dirty_gpu_tiles, pack_gpu_tiles, parse_cli_args,
+        ScrollAccumulator, TileSet, fitted_viewport, framebuffer_to_rgba, is_system_shortcut,
+        mouse_button_bit, pack_dirty_gpu_tiles, pack_gpu_tiles, parse_cli_args,
     };
-    use ard_rs::{ArdVideoQuality, MvsGpuTile, MvsGpuTileUpdate};
+    use ard_rs::{ArdVideoQuality, Framebuffer, MvsGpuTile, MvsGpuTileUpdate, PixelFormat};
     use winit::dpi::PhysicalPosition;
     use winit::event::MouseButton;
     use winit::event::MouseScrollDelta;
@@ -2338,6 +2403,16 @@ mod tests {
         .unwrap();
         assert_eq!(quality, ArdVideoQuality::Adaptive);
         assert_eq!(interval, Duration::from_millis(16));
+    }
+
+    #[test]
+    fn viewer_converts_native_rfb_pixels_at_the_presentation_boundary() {
+        let mut framebuffer = Framebuffer::new_native(1, 1, PixelFormat::XRGB8888).unwrap();
+        framebuffer.pixels_mut().copy_from_slice(&[192, 96, 32, 0]);
+        let mut rgba = Vec::new();
+
+        assert!(framebuffer_to_rgba(&framebuffer, &mut rgba));
+        assert_eq!(rgba, [32, 96, 192, 255]);
     }
 
     #[test]

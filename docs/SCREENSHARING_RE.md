@@ -235,7 +235,7 @@ negative chroma values.
 
 ## Native decoder oracle
 
-An isolated pure-Rust one-shot server in `examples/mvs_oracle_server.rs` was
+An isolated pure-Rust one-shot server in `crates/ard-core/examples/mvs_oracle_server.rs` was
 cross-compiled for `aarch64-unknown-linux-musl` and run in a local Linux
 container so macOS would not reject a self-connection. Screen Sharing 6.1
 (760.4) completed the `RFB 003.889` handshake, sent `ClientInit` flags `0xc1`
@@ -513,7 +513,7 @@ desktop update.
 ### Encrypted-transport oracle
 
 `EncryptedTransportOracle` (library module `oracle`, CLI wrapper
-`examples/encrypted_transport_oracle.rs`) is a one-shot pure-Rust server that
+`crates/ard-core/examples/encrypted_transport_oracle.rs`) is a one-shot pure-Rust server that
 drives the whole modern path against a client:
 
 1. type-30 challenge (RFC 3526 group 2, server exponent 1) and server-side

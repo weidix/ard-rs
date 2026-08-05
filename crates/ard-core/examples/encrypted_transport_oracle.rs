@@ -8,7 +8,7 @@
 //! Usage:
 //!
 //! ```sh
-//! cargo run --release --example encrypted_transport_oracle \
+//! cargo run -p ard-core --release --example encrypted_transport_oracle \
 //!   -- 5999 0.0.0.0 192.168.65.1
 //! ```
 //!

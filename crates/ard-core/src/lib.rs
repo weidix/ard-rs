@@ -7,7 +7,6 @@
 //! version, security methods and framebuffer encodings.
 
 mod auth;
-#[cfg(feature = "viewer")]
 mod client;
 mod decoder;
 mod dispatcher;
@@ -21,15 +20,14 @@ mod transport;
 mod wire;
 
 pub use auth::{ArdType30ClientExchange, build_ard_type30_client_exchange};
-#[cfg(feature = "viewer")]
 pub use client::{
     ArdClient, ArdClientConfig, ArdClientError, ArdClientEvent, ArdClientInput, ArdFrameInfo,
-    ArdVideoQuality,
+    ArdFrameOutput, ArdReconnectPolicy, ArdVideoQuality,
 };
 pub use decoder::{DecodeLimits, Decoder};
 pub use dispatcher::{ArdMessageDispatcher, ArdServerMessage};
 pub use error::{Error, Result};
-pub use framebuffer::Framebuffer;
+pub use framebuffer::{Framebuffer, FramebufferFormat};
 pub use input::{
     ArdKey, ArdNamedKey, XK_ALT_LEFT, XK_ALT_RIGHT, XK_ARROW_DOWN, XK_ARROW_LEFT, XK_ARROW_RIGHT,
     XK_ARROW_UP, XK_BACKSPACE, XK_CAPS_LOCK, XK_CONTEXT_MENU, XK_CONTROL_LEFT, XK_CONTROL_RIGHT,

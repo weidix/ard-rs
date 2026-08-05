@@ -55,8 +55,8 @@ fn decodes_saved_native_oracle_mvs_frame_without_a_connection() {
     );
     assert!(
         framebuffer
-            .rgba()
+            .pixels()
             .chunks_exact(4)
-            .all(|pixel| pixel == [255, 255, 255, 255])
+            .all(|pixel| pixel == [255, 255, 255, 0])
     );
 }

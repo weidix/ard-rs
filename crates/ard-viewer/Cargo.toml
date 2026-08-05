@@ -1,0 +1,21 @@
+[package]
+name = "ard-viewer"
+version = "0.1.0"
+edition = "2024"
+description = "Native GUI viewer for Apple Remote Desktop sessions"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ard_rs = { package = "ard-core", path = "../ard-core" }
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+bytemuck = { version = "1.25.0" }
+pollster = { version = "0.4.0" }
+wgpu = { version = "30.0.0" }
+winit = { version = "0.30.13" }
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }
+
+[[bin]]
+name = "ard-viewer"
+path = "src/bin/ard-viewer.rs"
