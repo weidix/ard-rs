@@ -18,6 +18,16 @@ pub const ACCENT_TEXT: Color = Color::from_rgb8(9, 9, 10);
 pub const SUCCESS: Color = Color::from_rgb8(87, 158, 107);
 pub const WARNING: Color = TEXT_WARM;
 
+pub fn mix(from: Color, to: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    Color {
+        r: from.r + (to.r - from.r) * amount,
+        g: from.g + (to.g - from.g) * amount,
+        b: from.b + (to.b - from.b) * amount,
+        a: from.a + (to.a - from.a) * amount,
+    }
+}
+
 // Layout tokens. Keep geometry here so every window uses the same, predictable
 // control metrics instead of relying on each widget's intrinsic size.
 pub const WINDOW_RADIUS: f32 = 12.0;
@@ -26,7 +36,7 @@ pub const CONTROL_RADIUS: f32 = 8.0;
 pub const CHECKBOX_RADIUS: f32 = 4.0;
 
 pub const TITLE_SIZE: f32 = 15.0;
-pub const WINDOW_TITLE_SIZE: f32 = 13.0;
+pub const WINDOW_TITLE_SIZE: f32 = 12.0;
 pub const ICON_SIZE: f32 = 16.0;
 pub const BODY_SIZE: f32 = 11.0;
 pub const CAPTION_SIZE: f32 = 10.0;
@@ -99,8 +109,30 @@ pub fn bordered_panel(color: Color, radius: f32) -> impl Fn(&Theme) -> container
     }
 }
 
-pub fn modal_backdrop(_: &Theme) -> container::Style {
-    container::Style::default().background(Color::from_rgba8(0, 0, 0, 0.68))
+pub fn modal_backdrop(opacity: f32) -> impl Fn(&Theme) -> container::Style + Copy {
+    move |_| container::Style::default().background(Color::from_rgba(0.0, 0.0, 0.0, 0.68 * opacity))
+}
+
+pub fn modal_panel(progress: f32) -> impl Fn(&Theme) -> container::Style + Copy {
+    move |_| container::Style {
+        background: Some(Background::Color(mix(
+            Color::from_rgba8(22, 22, 24, 0.0),
+            SURFACE,
+            progress,
+        ))),
+        text_color: Some(TEXT),
+        border: Border {
+            color: mix(Color::TRANSPARENT, BORDER, progress),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.35 * progress),
+            offset: iced::Vector::new(0.0, 8.0 * progress),
+            blur_radius: 28.0 * progress,
+        },
+        snap: true,
+    }
 }
 
 pub fn toolbar_marker(_: &Theme, status: button::Status) -> button::Style {
@@ -249,20 +281,21 @@ pub fn nav_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::
     }
 }
 
-pub fn device_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+pub fn device_button(selection: f32) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
     move |_, status| {
-        let background =
-            if selected || matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                SURFACE_ACTIVE
-            } else {
-                SURFACE
-            };
+        let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let amount = if hover {
+            selection.max(0.72)
+        } else {
+            selection
+        };
         button::Style {
-            background: Some(Background::Color(background)),
-            text_color: if selected { TEXT } else { TEXT_MUTED },
+            background: Some(Background::Color(mix(SURFACE, SURFACE_ACTIVE, amount))),
+            text_color: mix(TEXT_MUTED, TEXT, amount),
             border: Border {
+                color: mix(Color::TRANSPARENT, BORDER, amount),
+                width: 1.0,
                 radius: CONTROL_RADIUS.into(),
-                ..Border::default()
             },
             ..button::Style::default()
         }

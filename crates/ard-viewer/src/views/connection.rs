@@ -38,6 +38,14 @@ fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
             || device.address.to_lowercase().contains(&query)
     }) {
         let selected = index == app.selected_device;
+        let selection = if selected {
+            app.device_transition
+        } else if index == app.previous_selected_device {
+            1.0 - app.device_transition
+        } else {
+            0.0
+        };
+        let selection = selection * selection * (3.0 - 2.0 * selection);
         let state = match device.state {
             crate::state::DeviceState::Online => "在线",
             crate::state::DeviceState::Saved => "已保存",
@@ -57,7 +65,7 @@ fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
                     device.address.trim_end_matches(":5900")
                 ))
                 .size(MICRO_SIZE)
-                .color(if selected { TEXT_WARM } else { TEXT_MUTED }),
+                .color(theme::mix(TEXT_MUTED, TEXT_WARM, selection)),
             ]
             .spacing(0)
             .width(Fill),
@@ -72,7 +80,7 @@ fn device_sidebar(app: &ArdViewer) -> Element<'_, Message> {
                 .height(58)
                 .width(Fill)
                 .padding(10)
-                .style(theme::device_button(selected))
+                .style(theme::device_button(selection))
                 .on_press(Message::DeviceSelected(index)),
         );
     }

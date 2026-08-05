@@ -64,6 +64,9 @@ fn sidebar(app: &ArdViewer) -> Element<'_, Message> {
 }
 
 fn content(app: &ArdViewer) -> Element<'_, Message> {
+    let progress =
+        app.settings_transition * app.settings_transition * (3.0 - 2.0 * app.settings_transition);
+    let offset = 12.0 * (1.0 - progress);
     let section: Element<'_, Message> = match app.settings_section {
         SettingsSection::General => generic_section(app, "常规"),
         SettingsSection::Display => display(app),
@@ -72,7 +75,12 @@ fn content(app: &ArdViewer) -> Element<'_, Message> {
         SettingsSection::About => generic_section(app, "关于"),
     };
     container(section)
-        .padding([22.0, CONTENT_PADDING_X])
+        .padding(iced::Padding {
+            top: 22.0 + offset,
+            right: CONTENT_PADDING_X,
+            bottom: 22.0 - offset,
+            left: CONTENT_PADDING_X,
+        })
         .width(Fill)
         .height(Fill)
         .style(theme::shaped_panel(

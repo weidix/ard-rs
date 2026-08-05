@@ -45,9 +45,9 @@ pub fn window_titlebar<'a>(
     let native_controls: Element<'a, Message> = space().width(0).into();
 
     #[cfg(target_os = "macos")]
-    let platform_controls: Element<'a, Message> = space().width(1).into();
+    let platform_buttons: Element<'a, Message> = space().width(1).into();
     #[cfg(target_os = "windows")]
-    let platform_controls: Element<'a, Message> = row![
+    let platform_buttons: Element<'a, Message> = row![
         titlebar_control(Icon::Minimize, Message::MinimizeWindow(window_id), false),
         titlebar_control(
             Icon::Maximize,
@@ -58,7 +58,7 @@ pub fn window_titlebar<'a>(
     ]
     .into();
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let platform_controls: Element<'a, Message> = row![
+    let platform_buttons: Element<'a, Message> = row![
         titlebar_control(Icon::Minimize, Message::MinimizeWindow(window_id), false),
         titlebar_control(
             Icon::Maximize,
@@ -69,6 +69,9 @@ pub fn window_titlebar<'a>(
     ]
     .spacing(4)
     .into();
+    let platform_controls = container(platform_buttons)
+        .height(Fill)
+        .align_y(Alignment::Start);
     let titles = container(
         column![
             text(title).size(WINDOW_TITLE_SIZE).color(TEXT),
@@ -87,6 +90,7 @@ pub fn window_titlebar<'a>(
         container(
             row![native_controls, titles, action, platform_controls]
                 .spacing(10)
+                .height(Fill)
                 .align_y(Alignment::Center),
         )
         .height(u32::from(height))

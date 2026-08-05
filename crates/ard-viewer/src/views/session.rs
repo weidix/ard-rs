@@ -1,3 +1,5 @@
+use std::f32::consts::TAU;
+
 use iced::widget::{button, column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Background, Border, Element, Fill, window};
 
@@ -33,11 +35,18 @@ fn remote_canvas(app: &ArdViewer) -> Element<'static, Message> {
         iced::border::bottom(WINDOW_RADIUS),
     ));
 
-    let controls: Element<'static, Message> = if app.session_toolbar_visible {
+    let toolbar_progress = app.session_toolbar_progress
+        * app.session_toolbar_progress
+        * (3.0 - 2.0 * app.session_toolbar_progress);
+    let controls: Element<'static, Message> = if toolbar_progress > 0.01 {
         container(
-            mouse_area(control_bar(app.session_toolbar_pinned))
-                .on_enter(Message::SessionToolbarInteraction)
-                .on_move(|_| Message::SessionToolbarInteraction),
+            container(
+                mouse_area(control_bar(app.session_toolbar_pinned))
+                    .on_enter(Message::SessionToolbarInteraction)
+                    .on_move(|_| Message::SessionToolbarInteraction),
+            )
+            .height(48.0 * toolbar_progress)
+            .clip(true),
         )
         .width(Fill)
         .height(Fill)
@@ -65,10 +74,14 @@ fn remote_canvas(app: &ArdViewer) -> Element<'static, Message> {
         .align_y(Alignment::Start)
         .into()
     };
+    let pulse = ((app.ui_time * TAU / 2.4).sin() + 1.0) * 0.5;
     let status = container(
         container(
             row![
-                dot(SUCCESS, 6.0),
+                dot(
+                    theme::mix(SUCCESS, iced::Color::from_rgb8(126, 196, 145), pulse),
+                    6.0 + pulse * 1.4
+                ),
                 text("RGBA · 自适应质量 · 60 fps")
                     .size(MICRO_SIZE)
                     .color(TEXT_MUTED)

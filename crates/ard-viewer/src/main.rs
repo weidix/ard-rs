@@ -20,6 +20,8 @@ struct ArdViewer {
     windows: BTreeMap<window::Id, WindowKind>,
     devices: Vec<SavedDevice>,
     selected_device: usize,
+    previous_selected_device: usize,
+    device_transition: f32,
     search: String,
     address: String,
     password: String,
@@ -28,6 +30,7 @@ struct ArdViewer {
     quality: ArdVideoQuality,
     frame_interval_ms: String,
     settings_section: SettingsSection,
+    settings_transition: f32,
     key_profile: String,
     auto_adapt_keyboard: bool,
     capture_system_shortcuts: bool,
@@ -36,9 +39,14 @@ struct ArdViewer {
     session_zoom: f32,
     session_fullscreen: bool,
     session_toolbar_visible: bool,
+    session_toolbar_progress: f32,
     session_toolbar_pinned: bool,
     session_toolbar_last_interaction: Instant,
     pending_close: Option<window::Id>,
+    close_modal_target_visible: bool,
+    close_modal_progress: f32,
+    animation_clock: Instant,
+    ui_time: f32,
     status: String,
 }
 
@@ -80,6 +88,7 @@ enum Message {
     SessionAction(SessionAction),
     ToggleFullscreen,
     SessionToolbarTick(Instant),
+    AnimationTick(Instant),
     ShowSessionToolbar,
     HideSessionToolbar,
     SessionToolbarInteraction,
@@ -120,6 +129,8 @@ impl ArdViewer {
             address: "mac-studio.local".into(),
             devices,
             selected_device: 0,
+            previous_selected_device: 0,
+            device_transition: 1.0,
             search: String::new(),
             password: "ard-password".into(),
             remember_password: true,
@@ -127,6 +138,7 @@ impl ArdViewer {
             quality: ArdVideoQuality::Adaptive,
             frame_interval_ms: "Server-driven".into(),
             settings_section: SettingsSection::KeyMapping,
+            settings_transition: 1.0,
             key_profile: "macOS 默认".into(),
             auto_adapt_keyboard: true,
             capture_system_shortcuts: false,
@@ -135,9 +147,14 @@ impl ArdViewer {
             session_zoom: 1.0,
             session_fullscreen: false,
             session_toolbar_visible: true,
+            session_toolbar_progress: 1.0,
             session_toolbar_pinned: false,
             session_toolbar_last_interaction: Instant::now(),
             pending_close: None,
+            close_modal_target_visible: false,
+            close_modal_progress: 0.0,
+            animation_clock: Instant::now(),
+            ui_time: 0.0,
             status: String::new(),
         };
         (app, open_window(WindowKind::Connection))
@@ -170,16 +187,29 @@ impl ArdViewer {
             Message::CloseRequested(id) => {
                 if self.windows.contains_key(&id) {
                     self.pending_close = Some(id);
+                    self.close_modal_target_visible = true;
+                    self.close_modal_progress = 0.0;
                 }
             }
-            Message::CancelClose => self.pending_close = None,
+            Message::CancelClose => {
+                self.close_modal_target_visible = false;
+                if self.close_modal_progress <= 0.001 {
+                    self.pending_close = None;
+                }
+            }
             Message::ConfirmClose => {
                 if let Some(id) = self.pending_close.take() {
+                    self.close_modal_target_visible = false;
+                    self.close_modal_progress = 0.0;
                     return window::close(id);
                 }
             }
             #[cfg(not(target_os = "macos"))]
-            Message::CloseWindow(id) => self.pending_close = Some(id),
+            Message::CloseWindow(id) => {
+                self.pending_close = Some(id);
+                self.close_modal_target_visible = true;
+                self.close_modal_progress = 0.0;
+            }
             Message::DragWindow(id) => return window::drag(id),
             #[cfg(not(target_os = "macos"))]
             Message::MinimizeWindow(id) => return window::minimize(id, true),
@@ -193,6 +223,10 @@ impl ArdViewer {
             Message::SearchChanged(value) => self.search = value,
             Message::DeviceSelected(index) => {
                 if let Some(device) = self.devices.get(index) {
+                    if index != self.selected_device {
+                        self.previous_selected_device = self.selected_device;
+                        self.device_transition = 0.0;
+                    }
                     self.selected_device = index;
                     self.address.clone_from(&device.address);
                 }
@@ -202,7 +236,12 @@ impl ArdViewer {
             Message::RememberPasswordChanged(value) => self.remember_password = value,
             Message::RememberDeviceChanged(value) => self.remember_device = value,
             Message::Cancel => self.status.clear(),
-            Message::SettingsSectionSelected(section) => self.settings_section = section,
+            Message::SettingsSectionSelected(section) => {
+                if section != self.settings_section {
+                    self.settings_section = section;
+                    self.settings_transition = 0.0;
+                }
+            }
             Message::QualityChanged(quality) => self.quality = quality,
             Message::FrameIntervalChanged(value) => self.frame_interval_ms = value,
             Message::KeyProfileChanged(value) => self.key_profile = value,
@@ -260,6 +299,39 @@ impl ArdViewer {
                     self.session_toolbar_visible = false;
                 }
             }
+            Message::AnimationTick(now) => {
+                let delta = now
+                    .saturating_duration_since(self.animation_clock)
+                    .as_secs_f32()
+                    .min(0.05);
+                self.animation_clock = now;
+                self.ui_time = (self.ui_time + delta) % 60.0;
+                self.device_transition = advance(self.device_transition, 1.0, delta, 8.5);
+                self.settings_transition = advance(self.settings_transition, 1.0, delta, 7.5);
+                self.session_toolbar_progress = advance(
+                    self.session_toolbar_progress,
+                    if self.session_toolbar_visible {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    delta,
+                    10.0,
+                );
+                self.close_modal_progress = advance(
+                    self.close_modal_progress,
+                    if self.close_modal_target_visible {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    delta,
+                    12.0,
+                );
+                if !self.close_modal_target_visible && self.close_modal_progress <= 0.001 {
+                    self.pending_close = None;
+                }
+            }
             Message::ShowSessionToolbar | Message::SessionToolbarInteraction => {
                 self.touch_session_toolbar();
             }
@@ -282,7 +354,7 @@ impl ArdViewer {
             WindowKind::Session => views::session(self, id),
         };
         if self.pending_close == Some(id) {
-            close_confirmation(content, kind)
+            close_confirmation(content, kind, self.close_modal_progress)
         } else {
             content
         }
@@ -292,11 +364,35 @@ impl ArdViewer {
         Some(theme::app_theme())
     }
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subscriptions = vec![
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
-            iced::time::every(Duration::from_millis(250)).map(Message::SessionToolbarTick),
-        ])
+        ];
+        let session_open = self.window_id(WindowKind::Session).is_some();
+        if session_open {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(250)).map(Message::SessionToolbarTick),
+            );
+        }
+        let toolbar_target = if self.session_toolbar_visible {
+            1.0
+        } else {
+            0.0
+        };
+        let modal_target = if self.close_modal_target_visible {
+            1.0
+        } else {
+            0.0
+        };
+        let transition_active = self.device_transition < 0.999
+            || self.settings_transition < 0.999
+            || (self.session_toolbar_progress - toolbar_target).abs() > 0.001
+            || (self.close_modal_progress - modal_target).abs() > 0.001;
+        if session_open || transition_active {
+            subscriptions
+                .push(iced::time::every(Duration::from_millis(16)).map(Message::AnimationTick));
+        }
+        Subscription::batch(subscriptions)
     }
     fn window_id(&self, kind: WindowKind) -> Option<window::Id> {
         self.windows
@@ -310,18 +406,23 @@ impl ArdViewer {
     }
 }
 
-fn close_confirmation<'a>(content: Element<'a, Message>, kind: WindowKind) -> Element<'a, Message> {
+fn close_confirmation<'a>(
+    content: Element<'a, Message>,
+    kind: WindowKind,
+    progress: f32,
+) -> Element<'a, Message> {
     let (title, description) = match kind {
         WindowKind::Connection => ("退出 ARD Viewer？", "打开的设置和远程会话也会一并关闭。"),
         WindowKind::Settings => ("关闭设置窗口？", "确认关闭当前设置窗口。"),
         WindowKind::Session => ("关闭远程会话？", "当前远程连接将会断开。"),
     };
+    let progress = smoothstep(0.0, 1.0, progress);
+    let text_color = theme::mix(iced::Color::TRANSPARENT, theme::TEXT, progress);
+    let muted_color = theme::mix(iced::Color::TRANSPARENT, theme::TEXT_MUTED, progress);
     let dialog = container(
         column![
-            text(title).size(theme::TITLE_SIZE).color(theme::TEXT),
-            text(description)
-                .size(theme::BODY_SIZE)
-                .color(theme::TEXT_MUTED),
+            text(title).size(theme::TITLE_SIZE).color(text_color),
+            text(description).size(theme::BODY_SIZE).color(muted_color),
             row![
                 space().width(Fill),
                 widgets::secondary("取消", Message::CancelClose).width(88),
@@ -334,17 +435,29 @@ fn close_confirmation<'a>(content: Element<'a, Message>, kind: WindowKind) -> El
     )
     .width(360)
     .padding(22)
-    .style(theme::bordered_panel(theme::SURFACE, 12.0));
+    .style(theme::modal_panel(progress));
     let overlay = mouse_area(
         container(dialog)
             .width(Fill)
             .height(Fill)
             .center_x(Fill)
             .center_y(Fill)
-            .style(theme::modal_backdrop),
+            .style(theme::modal_backdrop(progress)),
     )
     .on_press(Message::CancelClose);
     stack![content, overlay].width(Fill).height(Fill).into()
+}
+
+fn advance(current: f32, target: f32, delta_seconds: f32, speed: f32) -> f32 {
+    if (current - target).abs() <= 0.001 {
+        return target;
+    }
+    current + (target - current) * (1.0 - (-speed * delta_seconds).exp())
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let value = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
 }
 
 fn open_window(kind: WindowKind) -> Task<Message> {
@@ -480,6 +593,30 @@ mod tests {
         app.session_toolbar_last_interaction = now - Duration::from_secs(5);
         let _task = app.update(Message::SessionToolbarTick(now));
         assert!(app.session_toolbar_visible);
+    }
+
+    #[test]
+    fn ui_transitions_start_and_converge_smoothly() {
+        let (mut app, _task) = ArdViewer::new();
+        let now = Instant::now();
+        app.animation_clock = now;
+
+        let _task = app.update(Message::DeviceSelected(1));
+        let _task = app.update(Message::SettingsSectionSelected(SettingsSection::Display));
+        assert_eq!(app.device_transition, 0.0);
+        assert_eq!(app.settings_transition, 0.0);
+
+        let _task = app.update(Message::AnimationTick(now + Duration::from_millis(16)));
+        assert!(app.device_transition > 0.0 && app.device_transition < 1.0);
+        assert!(app.settings_transition > 0.0 && app.settings_transition < 1.0);
+
+        for step in 2..=120 {
+            let _task = app.update(Message::AnimationTick(
+                now + Duration::from_millis(16 * step),
+            ));
+        }
+        assert!(app.device_transition > 0.999);
+        assert!(app.settings_transition > 0.999);
     }
 
     #[test]
