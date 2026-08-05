@@ -5,9 +5,9 @@ Remote Desktop (ARD) screen sharing.
 
 ## Native GPU viewer
 
-`ard-viewer` is a receive-only desktop viewer for macOS, Windows, and Linux.
-It connects directly to the ARD TCP service; it does not include a relay,
-browser server, mouse input, or keyboard input.
+`ard-viewer` is an interactive desktop viewer for macOS, Windows, and Linux.
+It connects directly to the ARD TCP service and supports mouse, keyboard,
+clipboard, and IME text input.
 
 ```sh
 cargo build --release --features viewer --bin ard-viewer
@@ -51,6 +51,14 @@ TCP -> authenticated decrypt -> MVS tile/DCT parser
     -> GPU storage buffers -> compute IDCT/tile expansion
     -> GPU presentation texture -> Metal / D3D12 / Vulkan
 ```
+
+Input is normalized before it reaches the wire. Mouse coordinates are mapped
+from the letterboxed, DPI-scaled window to the remote framebuffer. Keyboard
+events use stable RFB/X11 keysyms: printable text follows the active host
+layout through Unicode input, while modifiers, navigation, function, and
+numpad keys use layout-independent symbols. The viewer sends and receives
+UTF-8 clipboard text, including committed IME text, on all supported desktop
+platforms.
 
 The full, high, medium, and low profiles use the CPU RGBA decoder for Raw,
 Zlib, ZRLE, and Apple's three sub-zlib encodings, then upload complete snapshots
@@ -114,9 +122,11 @@ on a VNC library or a native operating-system library.
 - independent persistent zlib state for every Apple stream
 - RGBA framebuffer updates with checked dimensions, allocations, runs, and
   palette indexes
-- optional receive-only native GUI with direct TCP authentication,
+- client keyboard, pointer, and UTF-8 clipboard message generation
+- optional interactive native GUI with direct TCP authentication,
   server-driven encrypted session streaming, selectable quality, GPU-native
-  MVS tile/DCT output, RGBA upload, live FPS/traffic metrics, and
+  MVS tile/DCT output, RGBA upload, mouse/keyboard/IME input, bidirectional
+  clipboard synchronization, live FPS/traffic metrics, and
   Metal/D3D12/Vulkan presentation
 
 Apple MVS (`1011`) is identified as a distinct codec and is never fed to a VNC
@@ -125,10 +135,11 @@ baseline, copy metadata, and 1–64999 DCT cache ring are decoded directly.
 
 ## Current end-to-end boundary
 
-The `0x21`, `0x12`, `1103`, type-30 computation, encrypted-record, and
-decrypted-payload dispatch layers are implemented and covered by focused
-tests, including in-process client↔oracle sessions that decode both adaptive
-MVS and full-quality persistent zlib frames from encrypted records. A Rust
+The `0x21`, `0x12`, `1103`, type-30 computation, encrypted-record,
+decrypted-payload dispatch, and bidirectional interaction layers are implemented
+and covered by focused tests, including in-process client↔oracle sessions that
+decode both adaptive MVS and full-quality persistent zlib frames from encrypted
+records while exercising keyboard, pointer, and clipboard messages. A Rust
 client has also completed a private live
 session against macOS `screensharingd` and decoded a fully covered framebuffer;
 the captured payload and pixels are deliberately not stored in this repository.
@@ -140,8 +151,8 @@ and the exact remaining work.
 
 Core runtime dependencies are Rust-only crates: `flate2` with its
 `rust_backend`, RustCrypto AES/digest primitives, `num-bigint`, and `subtle`.
-The optional `viewer` feature adds winit and wgpu, selecting the operating
-system's normal windowing and GPU backend. Project code retains
+The optional `viewer` feature adds winit, wgpu, and arboard for the operating
+system's normal window, GPU, and clipboard backends. Project code retains
 `#![forbid(unsafe_code)]`.
 
 ## Verification

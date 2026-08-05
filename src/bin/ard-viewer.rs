@@ -9,13 +9,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arboard::Clipboard;
 use ard_rs::{
-    ArdClient, ArdClientConfig, ArdVideoQuality, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate,
+    ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdKey, ArdNamedKey,
+    ArdVideoQuality, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{
+    ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
+};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const WINDOW_TITLE: &str = "ard-rs Viewer";
@@ -25,7 +30,11 @@ const MAX_RGBA_POOL: usize = 2;
 enum ViewerEvent {
     FrameReady,
     Status(String),
-    Connected(String),
+    Connected {
+        server_name: String,
+        input: ArdClientInput,
+    },
+    Clipboard(String),
 }
 
 struct FramePacket {
@@ -438,6 +447,61 @@ struct FrameMailbox {
 
 type SharedFrameMailbox = Arc<Mutex<FrameMailbox>>;
 
+struct ClipboardBridge {
+    clipboard: Clipboard,
+    local_snapshot: Option<String>,
+    remote_snapshot: Option<String>,
+    next_poll: Instant,
+}
+
+impl ClipboardBridge {
+    fn new() -> Result<Self, String> {
+        let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
+        let local_snapshot = clipboard.get_text().ok();
+        Ok(Self {
+            clipboard,
+            local_snapshot,
+            remote_snapshot: None,
+            next_poll: Instant::now(),
+        })
+    }
+
+    fn local_text(&mut self) -> Option<String> {
+        self.clipboard.get_text().ok()
+    }
+
+    fn apply_remote(&mut self, text: &str) -> Result<(), String> {
+        self.clipboard
+            .set_text(text)
+            .map_err(|error| error.to_string())?;
+        self.local_snapshot = Some(text.to_owned());
+        self.remote_snapshot = Some(text.to_owned());
+        Ok(())
+    }
+
+    fn poll_local(&mut self, input: Option<&ArdClientInput>) {
+        let now = Instant::now();
+        if now < self.next_poll {
+            return;
+        }
+        self.next_poll = now + Duration::from_millis(250);
+        let Some(text) = self.local_text() else {
+            return;
+        };
+        let changed = self.local_snapshot.as_deref() != Some(text.as_str());
+        let came_from_remote = self.remote_snapshot.as_deref() == Some(text.as_str());
+        self.local_snapshot = Some(text.clone());
+        if came_from_remote {
+            self.remote_snapshot = None;
+        } else if changed
+            && let Some(input) = input
+            && input.send_clipboard_text(&text).is_ok()
+        {
+            self.remote_snapshot = None;
+        }
+    }
+}
+
 struct ViewerApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -447,6 +511,17 @@ struct ViewerApp {
     redraw_pending: bool,
     status: String,
     server_name: Option<String>,
+    input: Option<ArdClientInput>,
+    clipboard: Option<ClipboardBridge>,
+    pending_clipboard: Option<String>,
+    button_mask: u8,
+    cursor_position: Option<(u16, u16)>,
+    pointer_inside: bool,
+    modifiers: ModifiersState,
+    pressed_keys: HashMap<PhysicalKey, u32>,
+    ime_suppressed_keys: HashSet<PhysicalKey>,
+    paste_suppressed_keys: HashSet<PhysicalKey>,
+    ime_active: bool,
 }
 
 struct PresentationMeter {
@@ -485,6 +560,17 @@ impl ViewerApp {
             redraw_pending: false,
             status: "正在连接…".to_owned(),
             server_name: None,
+            input: None,
+            clipboard: None,
+            pending_clipboard: None,
+            button_mask: 0,
+            cursor_position: None,
+            pointer_inside: false,
+            modifiers: ModifiersState::default(),
+            pressed_keys: HashMap::new(),
+            ime_suppressed_keys: HashSet::new(),
+            paste_suppressed_keys: HashSet::new(),
+            ime_active: false,
         }
     }
 
@@ -531,6 +617,19 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 return;
             }
         };
+        window.set_ime_allowed(true);
+        if self.clipboard.is_none() {
+            match ClipboardBridge::new() {
+                Ok(clipboard) => self.clipboard = Some(clipboard),
+                Err(error) => eprintln!("系统剪切板不可用：{error}"),
+            }
+        }
+        if let Some(text) = self.pending_clipboard.take()
+            && let Some(clipboard) = &mut self.clipboard
+            && let Err(error) = clipboard.apply_remote(&text)
+        {
+            eprintln!("写入系统剪切板失败：{error}");
+        }
         match pollster::block_on(Renderer::new(window.clone())) {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
@@ -555,10 +654,20 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
                 self.status = status;
                 self.update_title(None);
             }
-            ViewerEvent::Connected(server_name) => {
+            ViewerEvent::Connected { server_name, input } => {
                 self.server_name = Some(server_name);
+                self.input = Some(input);
                 self.status = "已连接，等待首帧…".to_owned();
                 self.update_title(None);
+            }
+            ViewerEvent::Clipboard(text) => {
+                if let Some(clipboard) = &mut self.clipboard {
+                    if let Err(error) = clipboard.apply_remote(&text) {
+                        eprintln!("写入系统剪切板失败：{error}");
+                    }
+                } else {
+                    self.pending_clipboard = Some(text);
+                }
             }
         }
     }
@@ -574,6 +683,14 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => self.release_input_state(),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. } => self.handle_keyboard_input(event),
+            WindowEvent::Ime(ime) => self.handle_ime_event(ime),
+            WindowEvent::CursorMoved { position, .. } => self.handle_cursor_moved(position),
+            WindowEvent::CursorLeft { .. } => self.pointer_inside = false,
+            WindowEvent::MouseInput { state, button, .. } => self.handle_mouse_input(state, button),
+            WindowEvent::MouseWheel { delta, phase, .. } => self.handle_mouse_wheel(delta, phase),
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size);
@@ -603,9 +720,205 @@ impl ApplicationHandler<ViewerEvent> for ViewerApp {
             _ => {}
         }
     }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(clipboard) = &mut self.clipboard {
+            clipboard.poll_local(self.input.as_ref());
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(250),
+        ));
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.release_input_state();
+        self.input = None;
+        self.clipboard = None;
+    }
 }
 
 impl ViewerApp {
+    fn remote_position(&self, position: PhysicalPosition<f64>) -> Option<(u16, u16)> {
+        self.renderer.as_ref()?.remote_position(position)
+    }
+
+    fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
+        let Some(remote) = self.remote_position(position) else {
+            self.pointer_inside = false;
+            return;
+        };
+        self.pointer_inside = true;
+        self.cursor_position = Some(remote);
+        if let Some(input) = &self.input {
+            let _ = input.try_send_pointer_event(self.button_mask, remote.0, remote.1);
+        }
+    }
+
+    fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        let Some(bit) = mouse_button_bit(button) else {
+            return;
+        };
+        let Some((x, y)) = self.cursor_position else {
+            return;
+        };
+        if state == ElementState::Pressed && !self.pointer_inside {
+            return;
+        }
+        match state {
+            ElementState::Pressed => self.button_mask |= bit,
+            ElementState::Released => self.button_mask &= !bit,
+        }
+        if let Some(input) = &self.input
+            && let Err(error) = input.send_pointer_event(self.button_mask, x, y)
+        {
+            eprintln!("发送鼠标事件失败：{error}");
+        }
+    }
+
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            return;
+        }
+        let (horizontal, vertical) = match delta {
+            MouseScrollDelta::LineDelta(horizontal, vertical) => {
+                (f64::from(horizontal), f64::from(vertical))
+            }
+            MouseScrollDelta::PixelDelta(position) => (position.x / 40.0, position.y / 40.0),
+        };
+        if vertical != 0.0 {
+            let button = if vertical.is_sign_negative() {
+                0x08
+            } else {
+                0x10
+            };
+            self.send_scroll_clicks(button, vertical.abs().round().clamp(1.0, 8.0) as usize);
+        }
+        if horizontal != 0.0 {
+            let button = if horizontal.is_sign_negative() {
+                0x20
+            } else {
+                0x40
+            };
+            self.send_scroll_clicks(button, horizontal.abs().round().clamp(1.0, 8.0) as usize);
+        }
+    }
+
+    fn send_scroll_clicks(&self, button: u8, count: usize) {
+        if !self.pointer_inside {
+            return;
+        }
+        let Some((x, y)) = self.cursor_position else {
+            return;
+        };
+        let Some(input) = &self.input else { return };
+        for _ in 0..count {
+            if let Err(error) = input.send_pointer_event(self.button_mask | button, x, y) {
+                eprintln!("发送滚轮事件失败：{error}");
+                return;
+            }
+            if let Err(error) = input.send_pointer_event(self.button_mask, x, y) {
+                eprintln!("发送滚轮释放事件失败：{error}");
+                return;
+            }
+        }
+    }
+
+    fn handle_keyboard_input(&mut self, event: KeyEvent) {
+        let physical_key = event.physical_key;
+        if event.state == ElementState::Pressed && is_paste_shortcut(&event, self.modifiers) {
+            self.paste_suppressed_keys.insert(physical_key);
+            self.send_local_clipboard();
+            return;
+        }
+        if event.state == ElementState::Released && self.paste_suppressed_keys.remove(&physical_key)
+        {
+            return;
+        }
+        if event.state == ElementState::Released && self.ime_suppressed_keys.remove(&physical_key) {
+            return;
+        }
+        if self.ime_active && is_textual_key(&event) {
+            if event.state == ElementState::Pressed {
+                self.ime_suppressed_keys.insert(physical_key);
+            }
+            return;
+        }
+        let keysym = match event.state {
+            ElementState::Pressed => key_event_keysym(&event),
+            ElementState::Released => self.pressed_keys.remove(&physical_key),
+        };
+        let Some(keysym) = keysym else { return };
+        if event.state == ElementState::Pressed {
+            self.pressed_keys.insert(physical_key, keysym);
+        }
+        if let Some(input) = &self.input
+            && let Err(error) = input.send_key_event(event.state == ElementState::Pressed, keysym)
+        {
+            eprintln!("发送键盘事件失败：{error}");
+        }
+    }
+
+    fn handle_ime_event(&mut self, event: Ime) {
+        match event {
+            Ime::Enabled => self.ime_active = true,
+            Ime::Preedit(text, _) => {
+                if !text.is_empty() {
+                    self.ime_active = true;
+                }
+            }
+            Ime::Commit(text) => {
+                self.ime_active = false;
+                let Some(input) = &self.input else { return };
+                for character in text.chars() {
+                    let Some(keysym) = keysym_for_key(ArdKey::Character(character)) else {
+                        continue;
+                    };
+                    if let Err(error) = input.send_key_event(true, keysym) {
+                        eprintln!("发送输入法按键失败：{error}");
+                        return;
+                    }
+                    if let Err(error) = input.send_key_event(false, keysym) {
+                        eprintln!("发送输入法按键释放失败：{error}");
+                        return;
+                    }
+                }
+            }
+            Ime::Disabled => self.ime_active = false,
+        }
+    }
+
+    fn send_local_clipboard(&mut self) {
+        let text = self
+            .clipboard
+            .as_mut()
+            .and_then(ClipboardBridge::local_text);
+        let Some(text) = text else { return };
+        if let Some(input) = &self.input
+            && let Err(error) = input.send_clipboard_text(&text)
+        {
+            eprintln!("发送剪切板失败：{error}");
+        }
+    }
+
+    fn release_input_state(&mut self) {
+        let pressed_keys = core::mem::take(&mut self.pressed_keys);
+        self.ime_suppressed_keys.clear();
+        self.paste_suppressed_keys.clear();
+        if let Some(input) = &self.input {
+            for keysym in pressed_keys.values().copied() {
+                let _ = input.send_key_event(false, keysym);
+            }
+        }
+        if self.button_mask != 0
+            && let Some((x, y)) = self.cursor_position
+            && let Some(input) = &self.input
+        {
+            let _ = input.send_pointer_event(0, x, y);
+        }
+        self.button_mask = 0;
+        self.pointer_inside = false;
+    }
+
     fn process_latest_frame(&mut self) {
         // A user event can be delivered before `resumed` has initialized the
         // renderer. Leave the mailbox flag set so `resumed` can consume the
@@ -1085,6 +1398,32 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
+    fn remote_position(&self, position: PhysicalPosition<f64>) -> Option<(u16, u16)> {
+        let decoded = self.decoded.as_ref()?;
+        let (viewport_x, viewport_y, viewport_width, viewport_height) = fitted_viewport(
+            self.config.width,
+            self.config.height,
+            decoded.width,
+            decoded.height,
+        );
+        let x = position.x as f32;
+        let y = position.y as f32;
+        if x < viewport_x
+            || y < viewport_y
+            || x >= viewport_x + viewport_width
+            || y >= viewport_y + viewport_height
+        {
+            return None;
+        }
+        let remote_x = (((x - viewport_x) / viewport_width) * decoded.width as f32)
+            .floor()
+            .clamp(0.0, decoded.width.saturating_sub(1) as f32) as u16;
+        let remote_y = (((y - viewport_y) / viewport_height) * decoded.height as f32)
+            .floor()
+            .clamp(0.0, decoded.height.saturating_sub(1) as f32) as u16;
+        Some((remote_x, remote_y))
+    }
+
     fn render(&mut self) -> RenderResult {
         let (output, reconfigure_after_present) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output) => (output, false),
@@ -1314,6 +1653,295 @@ fn fitted_viewport(
     )
 }
 
+fn mouse_button_bit(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(0x01),
+        MouseButton::Middle => Some(0x02),
+        MouseButton::Right => Some(0x04),
+        MouseButton::Back | MouseButton::Other(1) => Some(0x20),
+        MouseButton::Forward | MouseButton::Other(2) => Some(0x40),
+        MouseButton::Other(_) => None,
+    }
+}
+
+fn is_paste_shortcut(event: &KeyEvent, modifiers: ModifiersState) -> bool {
+    if matches!(event.logical_key, Key::Named(NamedKey::Paste)) {
+        return true;
+    }
+    if !modifiers.control_key() && !modifiers.super_key() {
+        return false;
+    }
+    if modifiers.alt_key() {
+        return false;
+    }
+    let Key::Character(text) = event.logical_key.as_ref() else {
+        return false;
+    };
+    text.chars()
+        .next()
+        .is_some_and(|character| character.eq_ignore_ascii_case(&'v'))
+}
+
+fn is_textual_key(event: &KeyEvent) -> bool {
+    matches!(
+        event.logical_key,
+        Key::Character(_) | Key::Dead(Some(_) | None)
+    )
+}
+
+fn key_event_keysym(event: &KeyEvent) -> Option<u32> {
+    match event.logical_key.as_ref() {
+        Key::Character(text) => text
+            .chars()
+            .next()
+            .and_then(|character| keysym_for_key(ArdKey::Character(character))),
+        Key::Named(key) => {
+            named_key_to_ard(key, event.location).and_then(|key| keysym_for_key(ArdKey::Named(key)))
+        }
+        Key::Dead(Some(character)) => keysym_for_key(ArdKey::Character(character)),
+        Key::Dead(None) | Key::Unidentified(_) => None,
+    }
+    .or_else(|| physical_key_to_keysym(event.physical_key))
+}
+
+fn named_key_to_ard(key: NamedKey, location: KeyLocation) -> Option<ArdNamedKey> {
+    let left = matches!(location, KeyLocation::Left | KeyLocation::Standard);
+    Some(match key {
+        NamedKey::Backspace => ArdNamedKey::Backspace,
+        NamedKey::Tab => ArdNamedKey::Tab,
+        NamedKey::Enter => ArdNamedKey::Enter,
+        NamedKey::Space => ArdNamedKey::Space,
+        NamedKey::Escape => ArdNamedKey::Escape,
+        NamedKey::Delete => ArdNamedKey::Delete,
+        NamedKey::Insert => ArdNamedKey::Insert,
+        NamedKey::Home => ArdNamedKey::Home,
+        NamedKey::End => ArdNamedKey::End,
+        NamedKey::PageUp => ArdNamedKey::PageUp,
+        NamedKey::PageDown => ArdNamedKey::PageDown,
+        NamedKey::ArrowLeft => ArdNamedKey::ArrowLeft,
+        NamedKey::ArrowUp => ArdNamedKey::ArrowUp,
+        NamedKey::ArrowRight => ArdNamedKey::ArrowRight,
+        NamedKey::ArrowDown => ArdNamedKey::ArrowDown,
+        NamedKey::Shift => {
+            if left {
+                ArdNamedKey::ShiftLeft
+            } else {
+                ArdNamedKey::ShiftRight
+            }
+        }
+        NamedKey::Control => {
+            if left {
+                ArdNamedKey::ControlLeft
+            } else {
+                ArdNamedKey::ControlRight
+            }
+        }
+        NamedKey::Alt | NamedKey::AltGraph => {
+            if left && !matches!(key, NamedKey::AltGraph) {
+                ArdNamedKey::AltLeft
+            } else {
+                ArdNamedKey::AltRight
+            }
+        }
+        NamedKey::Super => {
+            if left {
+                ArdNamedKey::SuperLeft
+            } else {
+                ArdNamedKey::SuperRight
+            }
+        }
+        NamedKey::Meta => {
+            if left {
+                ArdNamedKey::MetaLeft
+            } else {
+                ArdNamedKey::MetaRight
+            }
+        }
+        NamedKey::CapsLock => ArdNamedKey::CapsLock,
+        NamedKey::NumLock => ArdNamedKey::NumLock,
+        NamedKey::ScrollLock => ArdNamedKey::ScrollLock,
+        NamedKey::PrintScreen => ArdNamedKey::PrintScreen,
+        NamedKey::Pause => ArdNamedKey::Pause,
+        NamedKey::ContextMenu => ArdNamedKey::ContextMenu,
+        NamedKey::F1 => ArdNamedKey::Function(1),
+        NamedKey::F2 => ArdNamedKey::Function(2),
+        NamedKey::F3 => ArdNamedKey::Function(3),
+        NamedKey::F4 => ArdNamedKey::Function(4),
+        NamedKey::F5 => ArdNamedKey::Function(5),
+        NamedKey::F6 => ArdNamedKey::Function(6),
+        NamedKey::F7 => ArdNamedKey::Function(7),
+        NamedKey::F8 => ArdNamedKey::Function(8),
+        NamedKey::F9 => ArdNamedKey::Function(9),
+        NamedKey::F10 => ArdNamedKey::Function(10),
+        NamedKey::F11 => ArdNamedKey::Function(11),
+        NamedKey::F12 => ArdNamedKey::Function(12),
+        NamedKey::F13 => ArdNamedKey::Function(13),
+        NamedKey::F14 => ArdNamedKey::Function(14),
+        NamedKey::F15 => ArdNamedKey::Function(15),
+        NamedKey::F16 => ArdNamedKey::Function(16),
+        NamedKey::F17 => ArdNamedKey::Function(17),
+        NamedKey::F18 => ArdNamedKey::Function(18),
+        NamedKey::F19 => ArdNamedKey::Function(19),
+        NamedKey::F20 => ArdNamedKey::Function(20),
+        NamedKey::F21 => ArdNamedKey::Function(21),
+        NamedKey::F22 => ArdNamedKey::Function(22),
+        NamedKey::F23 => ArdNamedKey::Function(23),
+        NamedKey::F24 => ArdNamedKey::Function(24),
+        NamedKey::F25 => ArdNamedKey::Function(25),
+        NamedKey::F26 => ArdNamedKey::Function(26),
+        NamedKey::F27 => ArdNamedKey::Function(27),
+        NamedKey::F28 => ArdNamedKey::Function(28),
+        NamedKey::F29 => ArdNamedKey::Function(29),
+        NamedKey::F30 => ArdNamedKey::Function(30),
+        NamedKey::F31 => ArdNamedKey::Function(31),
+        NamedKey::F32 => ArdNamedKey::Function(32),
+        NamedKey::F33 => ArdNamedKey::Function(33),
+        NamedKey::F34 => ArdNamedKey::Function(34),
+        NamedKey::F35 => ArdNamedKey::Function(35),
+        _ => return None,
+    })
+}
+
+fn physical_key_to_keysym(key: PhysicalKey) -> Option<u32> {
+    let PhysicalKey::Code(code) = key else {
+        return None;
+    };
+    let neutral = match code {
+        KeyCode::Backquote => ArdKey::Character('`'),
+        KeyCode::Backslash | KeyCode::IntlBackslash | KeyCode::IntlRo | KeyCode::IntlYen => {
+            ArdKey::Character('\\')
+        }
+        KeyCode::BracketLeft => ArdKey::Character('['),
+        KeyCode::BracketRight => ArdKey::Character(']'),
+        KeyCode::Comma => ArdKey::Character(','),
+        KeyCode::Digit0 => ArdKey::Character('0'),
+        KeyCode::Digit1 => ArdKey::Character('1'),
+        KeyCode::Digit2 => ArdKey::Character('2'),
+        KeyCode::Digit3 => ArdKey::Character('3'),
+        KeyCode::Digit4 => ArdKey::Character('4'),
+        KeyCode::Digit5 => ArdKey::Character('5'),
+        KeyCode::Digit6 => ArdKey::Character('6'),
+        KeyCode::Digit7 => ArdKey::Character('7'),
+        KeyCode::Digit8 => ArdKey::Character('8'),
+        KeyCode::Digit9 => ArdKey::Character('9'),
+        KeyCode::Equal => ArdKey::Character('='),
+        KeyCode::KeyA => ArdKey::Character('a'),
+        KeyCode::KeyB => ArdKey::Character('b'),
+        KeyCode::KeyC => ArdKey::Character('c'),
+        KeyCode::KeyD => ArdKey::Character('d'),
+        KeyCode::KeyE => ArdKey::Character('e'),
+        KeyCode::KeyF => ArdKey::Character('f'),
+        KeyCode::KeyG => ArdKey::Character('g'),
+        KeyCode::KeyH => ArdKey::Character('h'),
+        KeyCode::KeyI => ArdKey::Character('i'),
+        KeyCode::KeyJ => ArdKey::Character('j'),
+        KeyCode::KeyK => ArdKey::Character('k'),
+        KeyCode::KeyL => ArdKey::Character('l'),
+        KeyCode::KeyM => ArdKey::Character('m'),
+        KeyCode::KeyN => ArdKey::Character('n'),
+        KeyCode::KeyO => ArdKey::Character('o'),
+        KeyCode::KeyP => ArdKey::Character('p'),
+        KeyCode::KeyQ => ArdKey::Character('q'),
+        KeyCode::KeyR => ArdKey::Character('r'),
+        KeyCode::KeyS => ArdKey::Character('s'),
+        KeyCode::KeyT => ArdKey::Character('t'),
+        KeyCode::KeyU => ArdKey::Character('u'),
+        KeyCode::KeyV => ArdKey::Character('v'),
+        KeyCode::KeyW => ArdKey::Character('w'),
+        KeyCode::KeyX => ArdKey::Character('x'),
+        KeyCode::KeyY => ArdKey::Character('y'),
+        KeyCode::KeyZ => ArdKey::Character('z'),
+        KeyCode::Minus => ArdKey::Character('-'),
+        KeyCode::Period => ArdKey::Character('.'),
+        KeyCode::Quote => ArdKey::Character('\''),
+        KeyCode::Semicolon => ArdKey::Character(';'),
+        KeyCode::Slash => ArdKey::Character('/'),
+        KeyCode::Space => ArdKey::Named(ArdNamedKey::Space),
+        KeyCode::Backspace => ArdKey::Named(ArdNamedKey::Backspace),
+        KeyCode::CapsLock => ArdKey::Named(ArdNamedKey::CapsLock),
+        KeyCode::ControlLeft => ArdKey::Named(ArdNamedKey::ControlLeft),
+        KeyCode::ControlRight => ArdKey::Named(ArdNamedKey::ControlRight),
+        KeyCode::AltLeft => ArdKey::Named(ArdNamedKey::AltLeft),
+        KeyCode::AltRight => ArdKey::Named(ArdNamedKey::AltRight),
+        KeyCode::ShiftLeft => ArdKey::Named(ArdNamedKey::ShiftLeft),
+        KeyCode::ShiftRight => ArdKey::Named(ArdNamedKey::ShiftRight),
+        KeyCode::SuperLeft => ArdKey::Named(ArdNamedKey::SuperLeft),
+        KeyCode::SuperRight => ArdKey::Named(ArdNamedKey::SuperRight),
+        KeyCode::Enter => ArdKey::Named(ArdNamedKey::Enter),
+        KeyCode::Tab => ArdKey::Named(ArdNamedKey::Tab),
+        KeyCode::Escape => ArdKey::Named(ArdNamedKey::Escape),
+        KeyCode::Delete => ArdKey::Named(ArdNamedKey::Delete),
+        KeyCode::End => ArdKey::Named(ArdNamedKey::End),
+        KeyCode::Home => ArdKey::Named(ArdNamedKey::Home),
+        KeyCode::Insert => ArdKey::Named(ArdNamedKey::Insert),
+        KeyCode::PageDown => ArdKey::Named(ArdNamedKey::PageDown),
+        KeyCode::PageUp => ArdKey::Named(ArdNamedKey::PageUp),
+        KeyCode::ArrowDown => ArdKey::Named(ArdNamedKey::ArrowDown),
+        KeyCode::ArrowLeft => ArdKey::Named(ArdNamedKey::ArrowLeft),
+        KeyCode::ArrowRight => ArdKey::Named(ArdNamedKey::ArrowRight),
+        KeyCode::ArrowUp => ArdKey::Named(ArdNamedKey::ArrowUp),
+        KeyCode::NumLock => ArdKey::Named(ArdNamedKey::NumLock),
+        KeyCode::PrintScreen => ArdKey::Named(ArdNamedKey::PrintScreen),
+        KeyCode::ScrollLock => ArdKey::Named(ArdNamedKey::ScrollLock),
+        KeyCode::Pause => ArdKey::Named(ArdNamedKey::Pause),
+        KeyCode::ContextMenu => ArdKey::Named(ArdNamedKey::ContextMenu),
+        KeyCode::F1 => ArdKey::Named(ArdNamedKey::Function(1)),
+        KeyCode::F2 => ArdKey::Named(ArdNamedKey::Function(2)),
+        KeyCode::F3 => ArdKey::Named(ArdNamedKey::Function(3)),
+        KeyCode::F4 => ArdKey::Named(ArdNamedKey::Function(4)),
+        KeyCode::F5 => ArdKey::Named(ArdNamedKey::Function(5)),
+        KeyCode::F6 => ArdKey::Named(ArdNamedKey::Function(6)),
+        KeyCode::F7 => ArdKey::Named(ArdNamedKey::Function(7)),
+        KeyCode::F8 => ArdKey::Named(ArdNamedKey::Function(8)),
+        KeyCode::F9 => ArdKey::Named(ArdNamedKey::Function(9)),
+        KeyCode::F10 => ArdKey::Named(ArdNamedKey::Function(10)),
+        KeyCode::F11 => ArdKey::Named(ArdNamedKey::Function(11)),
+        KeyCode::F12 => ArdKey::Named(ArdNamedKey::Function(12)),
+        KeyCode::F13 => ArdKey::Named(ArdNamedKey::Function(13)),
+        KeyCode::F14 => ArdKey::Named(ArdNamedKey::Function(14)),
+        KeyCode::F15 => ArdKey::Named(ArdNamedKey::Function(15)),
+        KeyCode::F16 => ArdKey::Named(ArdNamedKey::Function(16)),
+        KeyCode::F17 => ArdKey::Named(ArdNamedKey::Function(17)),
+        KeyCode::F18 => ArdKey::Named(ArdNamedKey::Function(18)),
+        KeyCode::F19 => ArdKey::Named(ArdNamedKey::Function(19)),
+        KeyCode::F20 => ArdKey::Named(ArdNamedKey::Function(20)),
+        KeyCode::F21 => ArdKey::Named(ArdNamedKey::Function(21)),
+        KeyCode::F22 => ArdKey::Named(ArdNamedKey::Function(22)),
+        KeyCode::F23 => ArdKey::Named(ArdNamedKey::Function(23)),
+        KeyCode::F24 => ArdKey::Named(ArdNamedKey::Function(24)),
+        KeyCode::F25 => ArdKey::Named(ArdNamedKey::Function(25)),
+        KeyCode::F26 => ArdKey::Named(ArdNamedKey::Function(26)),
+        KeyCode::F27 => ArdKey::Named(ArdNamedKey::Function(27)),
+        KeyCode::F28 => ArdKey::Named(ArdNamedKey::Function(28)),
+        KeyCode::F29 => ArdKey::Named(ArdNamedKey::Function(29)),
+        KeyCode::F30 => ArdKey::Named(ArdNamedKey::Function(30)),
+        KeyCode::F31 => ArdKey::Named(ArdNamedKey::Function(31)),
+        KeyCode::F32 => ArdKey::Named(ArdNamedKey::Function(32)),
+        KeyCode::F33 => ArdKey::Named(ArdNamedKey::Function(33)),
+        KeyCode::F34 => ArdKey::Named(ArdNamedKey::Function(34)),
+        KeyCode::F35 => ArdKey::Named(ArdNamedKey::Function(35)),
+        KeyCode::Numpad0 => ArdKey::Named(ArdNamedKey::Numpad(0)),
+        KeyCode::Numpad1 => ArdKey::Named(ArdNamedKey::Numpad(1)),
+        KeyCode::Numpad2 => ArdKey::Named(ArdNamedKey::Numpad(2)),
+        KeyCode::Numpad3 => ArdKey::Named(ArdNamedKey::Numpad(3)),
+        KeyCode::Numpad4 => ArdKey::Named(ArdNamedKey::Numpad(4)),
+        KeyCode::Numpad5 => ArdKey::Named(ArdNamedKey::Numpad(5)),
+        KeyCode::Numpad6 => ArdKey::Named(ArdNamedKey::Numpad(6)),
+        KeyCode::Numpad7 => ArdKey::Named(ArdNamedKey::Numpad(7)),
+        KeyCode::Numpad8 => ArdKey::Named(ArdNamedKey::Numpad(8)),
+        KeyCode::Numpad9 => ArdKey::Named(ArdNamedKey::Numpad(9)),
+        KeyCode::NumpadAdd => ArdKey::Named(ArdNamedKey::NumpadAdd),
+        KeyCode::NumpadSubtract => ArdKey::Named(ArdNamedKey::NumpadSubtract),
+        KeyCode::NumpadMultiply => ArdKey::Named(ArdNamedKey::NumpadMultiply),
+        KeyCode::NumpadDivide => ArdKey::Named(ArdNamedKey::NumpadDivide),
+        KeyCode::NumpadDecimal | KeyCode::NumpadComma => ArdKey::Named(ArdNamedKey::NumpadDecimal),
+        KeyCode::NumpadEnter => ArdKey::Named(ArdNamedKey::NumpadEnter),
+        KeyCode::NumpadEqual => ArdKey::Named(ArdNamedKey::NumpadEqual),
+        _ => return None,
+    };
+    keysym_for_key(neutral)
+}
+
 fn start_receiver(
     config: ArdClientConfig,
     proxy: EventLoopProxy<ViewerEvent>,
@@ -1331,11 +1959,19 @@ fn start_receiver(
                 return;
             }
         };
-        let _ = proxy.send_event(ViewerEvent::Connected(client.server_name().to_owned()));
+        let _ = proxy.send_event(ViewerEvent::Connected {
+            server_name: client.server_name().to_owned(),
+            input: client.input(),
+        });
         let mut rate_meter = RateMeter::new();
         loop {
-            let info = match client.next_frame() {
-                Ok(info) => info,
+            let info = match client.next_event() {
+                Ok(ArdClientEvent::Frame(info)) => info,
+                Ok(ArdClientEvent::Clipboard(text)) => {
+                    let _ = proxy.send_event(ViewerEvent::Clipboard(text));
+                    continue;
+                }
+                Ok(ArdClientEvent::Bell | ArdClientEvent::StateChange) => continue,
                 Err(error) => {
                     eprintln!("ARD 接收失败：{error}");
                     let _ = proxy.send_event(ViewerEvent::Status(format!("连接已断开：{error}")));

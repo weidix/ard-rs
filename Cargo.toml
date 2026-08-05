@@ -7,10 +7,18 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = []
-viewer = ["dep:bytemuck", "dep:getrandom", "dep:pollster", "dep:wgpu", "dep:winit"]
+viewer = [
+    "dep:arboard",
+    "dep:bytemuck",
+    "dep:getrandom",
+    "dep:pollster",
+    "dep:wgpu",
+    "dep:winit",
+]
 
 [dependencies]
 aes = { version = "0.8.4", default-features = false }
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"], optional = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 md-5 = { version = "0.10.6", default-features = false }
 num-bigint = { version = "0.4.6", default-features = false, features = ["std"] }

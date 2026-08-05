@@ -1,15 +1,20 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use crate::{
     ArdEncryptionControl, ArdMessageDispatcher, ArdServerMessage, ArdVerifiedRecordStream,
     ArdViewerInformation, Decoder, Framebuffer, PixelFormat, ProtocolVersion, SecurityType,
     build_ard_auto_frame_update, build_ard_encryption_activation, build_ard_set_encryption_level,
-    build_ard_type30_client_exchange, build_framebuffer_update_request, build_set_encodings,
-    build_set_pixel_format, parse_ard_auth_challenge, parse_framebuffer_update,
-    parse_security_types, parse_server_init, unwrap_ard_session_material,
+    build_ard_type30_client_exchange, build_client_cut_text, build_framebuffer_update_request,
+    build_key_event, build_pointer_event, build_set_encodings, build_set_pixel_format,
+    parse_ard_auth_challenge, parse_framebuffer_update, parse_security_types, parse_server_init,
+    unwrap_ard_session_material,
 };
 
 const MAX_KEY_BYTES: usize = 512;
@@ -17,6 +22,8 @@ const MAX_RECORD_BYTES: usize = u16::MAX as usize;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CUT_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_SERVER_NAME_BYTES: usize = 1024 * 1024;
+const MAX_INPUT_QUEUE: usize = 512;
+const MAX_OUTBOUND_PAYLOAD_BYTES: usize = 65_498;
 
 /// ARD image-quality profiles, matching the encoding families exposed by
 /// Apple Screen Sharing and Remote Desktop Manager.
@@ -141,14 +148,135 @@ pub struct ArdFrameInfo {
     pub wire_bytes: usize,
 }
 
-/// A connected, receive-only ARD session.
+/// An event delivered by a connected ARD session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArdClientEvent {
+    Frame(ArdFrameInfo),
+    Clipboard(String),
+    Bell,
+    StateChange,
+}
+
+enum OutboundMessage {
+    Payload(Vec<u8>),
+}
+
+/// A cloneable, serialized sender for client-side ARD interaction messages.
 ///
-/// The session never emits pointer or keyboard messages. MVS output is
-/// emitted as tile commands and DCT coefficients so a renderer can expand it
-/// on the GPU without materializing a CPU image frame.
+/// All messages share one encrypted-record encoder in a dedicated writer
+/// thread. This keeps the CBC chain and record sequence valid even when the
+/// GUI thread emits mouse events while the receiver thread is reading frames.
+#[derive(Clone)]
+pub struct ArdClientInput {
+    sender: SyncSender<OutboundMessage>,
+    writer_error: Arc<Mutex<Option<String>>>,
+}
+
+impl fmt::Debug for ArdClientInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArdClientInput")
+            .field("writer_error", &self.writer_error)
+            .finish()
+    }
+}
+
+impl ArdClientInput {
+    /// Queues one key press or release using an X11/RFB keysym.
+    pub fn send_key_event(&self, pressed: bool, keysym: u32) -> Result<(), ArdClientError> {
+        self.submit(OutboundMessage::Payload(
+            build_key_event(pressed, keysym).to_vec(),
+        ))
+    }
+
+    /// Queues one pointer position/button-mask update.
+    pub fn send_pointer_event(
+        &self,
+        button_mask: u8,
+        x: u16,
+        y: u16,
+    ) -> Result<(), ArdClientError> {
+        self.submit(OutboundMessage::Payload(
+            build_pointer_event(button_mask, x, y).to_vec(),
+        ))
+    }
+
+    /// Queues a pointer update without blocking the GUI event loop when the
+    /// network writer is temporarily behind. Button transitions should use
+    /// [`Self::send_pointer_event`] so they are never silently dropped.
+    pub fn try_send_pointer_event(
+        &self,
+        button_mask: u8,
+        x: u16,
+        y: u16,
+    ) -> Result<(), ArdClientError> {
+        self.try_submit(OutboundMessage::Payload(
+            build_pointer_event(button_mask, x, y).to_vec(),
+        ))
+    }
+
+    /// Queues a UTF-8 clipboard update for the remote desktop.
+    pub fn send_clipboard_text(&self, text: &str) -> Result<(), ArdClientError> {
+        if text.len() > MAX_CUT_TEXT_BYTES {
+            return Err(ArdClientError::Protocol(crate::Error::LimitExceeded(
+                "clipboard text",
+            )));
+        }
+        let message = build_client_cut_text(text.as_bytes())?;
+        // A standard RFB message may span encrypted records. Split only at
+        // record boundaries so large but bounded clipboard contents do not
+        // make the CBC writer reject the whole session.
+        for chunk in message.chunks(MAX_OUTBOUND_PAYLOAD_BYTES) {
+            self.submit(OutboundMessage::Payload(chunk.to_vec()))?;
+        }
+        Ok(())
+    }
+
+    fn submit(&self, message: OutboundMessage) -> Result<(), ArdClientError> {
+        self.check_writer_error()?;
+        self.sender
+            .send(message)
+            .map_err(|_| ArdClientError::Message("ARD input writer has stopped".to_owned()))
+    }
+
+    fn try_submit(&self, message: OutboundMessage) -> Result<(), ArdClientError> {
+        self.check_writer_error()?;
+        match self.sender.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(ArdClientError::Message(
+                "ARD input queue is full".to_owned(),
+            )),
+            Err(TrySendError::Disconnected(_)) => Err(ArdClientError::Message(
+                "ARD input writer has stopped".to_owned(),
+            )),
+        }
+    }
+
+    fn check_writer_error(&self) -> Result<(), ArdClientError> {
+        let error = self
+            .writer_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone());
+        if let Some(error) = error {
+            Err(ArdClientError::Message(error))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn send_payload(&self, payload: Vec<u8>) -> Result<(), ArdClientError> {
+        self.submit(OutboundMessage::Payload(payload))
+    }
+}
+
+/// A connected ARD session with framebuffer decoding and bidirectional input.
+///
+/// MVS output is emitted as tile commands and DCT coefficients so a renderer
+/// can expand it on the GPU without materializing a CPU image frame.
 pub struct ArdClient {
     stream: TcpStream,
-    encoder: crate::ArdSessionRecordEncoder,
+    input: ArdClientInput,
     verified: ArdVerifiedRecordStream,
     dispatcher: ArdMessageDispatcher,
     decoder: Decoder,
@@ -159,6 +287,7 @@ pub struct ArdClient {
     automatic_updates: bool,
     automatic_frame_interval_ms: u32,
     automatic_updates_started: bool,
+    pending_events: VecDeque<ArdClientEvent>,
 }
 
 impl ArdClient {
@@ -338,9 +467,18 @@ impl ArdClient {
         // disconnect.
         stream.set_read_timeout(None)?;
 
+        let writer_stream = stream.try_clone()?;
+        let (sender, receiver) = mpsc::sync_channel(MAX_INPUT_QUEUE);
+        let writer_error = Arc::new(Mutex::new(None));
+        let input = ArdClientInput {
+            sender,
+            writer_error: writer_error.clone(),
+        };
+        spawn_input_writer(writer_stream, encoder, receiver, writer_error);
+
         Ok(Self {
             stream,
-            encoder,
+            input,
             verified,
             dispatcher: ArdMessageDispatcher::new(MAX_MESSAGE_BYTES, MAX_CUT_TEXT_BYTES)?,
             decoder,
@@ -351,6 +489,7 @@ impl ArdClient {
             automatic_updates: config.automatic_updates,
             automatic_frame_interval_ms,
             automatic_updates_started: false,
+            pending_events: VecDeque::new(),
         })
     }
 
@@ -362,6 +501,28 @@ impl ArdClient {
         &self.server_name
     }
 
+    /// Returns a cloneable handle for GUI or application input dispatch.
+    pub fn input(&self) -> ArdClientInput {
+        self.input.clone()
+    }
+
+    pub fn send_key_event(&self, pressed: bool, keysym: u32) -> Result<(), ArdClientError> {
+        self.input.send_key_event(pressed, keysym)
+    }
+
+    pub fn send_pointer_event(
+        &self,
+        button_mask: u8,
+        x: u16,
+        y: u16,
+    ) -> Result<(), ArdClientError> {
+        self.input.send_pointer_event(button_mask, x, y)
+    }
+
+    pub fn send_clipboard_text(&self, text: &str) -> Result<(), ArdClientError> {
+        self.input.send_clipboard_text(text)
+    }
+
     pub fn take_gpu_mvs_frames(&mut self) -> Vec<crate::MvsGpuFrame> {
         self.decoder.take_gpu_mvs_frames()
     }
@@ -370,9 +531,14 @@ impl ArdClient {
         self.decoder.drain_gpu_mvs_frames(visit);
     }
 
-    pub fn next_frame(&mut self) -> Result<ArdFrameInfo, ArdClientError> {
+    /// Reads the next decoded session event.
+    pub fn next_event(&mut self) -> Result<ArdClientEvent, ArdClientError> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(event);
+        }
         let mut wire_bytes = 0_usize;
         loop {
+            self.input.check_writer_error()?;
             let record_sequence = self.verified.sequence();
             let wire_bytes_for_record =
                 read_encrypted_record(&mut self.stream, &mut self.record_scratch).map_err(
@@ -409,55 +575,104 @@ impl ArdClient {
                         self.dispatcher.buffered_bytes(),
                     ))
                 })?;
+            let mut batch_events = Vec::new();
+            let mut frame_event_position = None;
             for message in messages {
-                if let ArdServerMessage::FramebufferUpdate {
-                    rectangle_count: rectangles,
-                    bytes,
-                } = message
-                {
-                    framebuffer_updates = framebuffer_updates.saturating_add(1);
-                    rectangle_count = rectangle_count.saturating_add(rectangles);
-                    payload_bytes = payload_bytes.saturating_add(bytes);
+                match message {
+                    ArdServerMessage::FramebufferUpdate {
+                        rectangle_count: rectangles,
+                        bytes,
+                    } => {
+                        if frame_event_position.is_none() {
+                            frame_event_position = Some(batch_events.len());
+                        }
+                        framebuffer_updates = framebuffer_updates.saturating_add(1);
+                        rectangle_count = rectangle_count.saturating_add(rectangles);
+                        payload_bytes = payload_bytes.saturating_add(bytes);
+                    }
+                    ArdServerMessage::ServerCutText(text) => {
+                        batch_events.push(ArdClientEvent::Clipboard(text));
+                    }
+                    ArdServerMessage::Bell => batch_events.push(ArdClientEvent::Bell),
+                    ArdServerMessage::StateChange => batch_events.push(ArdClientEvent::StateChange),
+                    ArdServerMessage::EncryptionControl(_) => {}
                 }
             }
-            if framebuffer_updates == 0 {
-                continue;
-            }
-
-            self.frame_index = self.frame_index.wrapping_add(framebuffer_updates as u64);
-            if self.automatic_updates && !self.automatic_updates_started {
-                let request = build_ard_auto_frame_update(
-                    self.automatic_frame_interval_ms,
-                    0,
-                    0,
-                    self.framebuffer.width(),
-                    self.framebuffer.height(),
+            if let Some(frame_event_position) = frame_event_position {
+                self.frame_index = self.frame_index.wrapping_add(framebuffer_updates as u64);
+                if self.automatic_updates && !self.automatic_updates_started {
+                    let request = build_ard_auto_frame_update(
+                        self.automatic_frame_interval_ms,
+                        0,
+                        0,
+                        self.framebuffer.width(),
+                        self.framebuffer.height(),
+                    );
+                    self.input.send_payload(request.to_vec())?;
+                    self.automatic_updates_started = true;
+                } else if !self.automatic_updates {
+                    let request = build_framebuffer_update_request(
+                        true,
+                        0,
+                        0,
+                        self.framebuffer.width(),
+                        self.framebuffer.height(),
+                    );
+                    self.input.send_payload(request.to_vec())?;
+                }
+                batch_events.insert(
+                    frame_event_position,
+                    ArdClientEvent::Frame(ArdFrameInfo {
+                        index: self.frame_index,
+                        framebuffer_updates,
+                        rectangle_count,
+                        payload_bytes,
+                        wire_bytes,
+                    }),
                 );
-                self.stream
-                    .write_all(&self.encoder.encode_wire(&request)?)?;
-                self.stream.flush()?;
-                self.automatic_updates_started = true;
-            } else if !self.automatic_updates {
-                let request = build_framebuffer_update_request(
-                    true,
-                    0,
-                    0,
-                    self.framebuffer.width(),
-                    self.framebuffer.height(),
-                );
-                self.stream
-                    .write_all(&self.encoder.encode_wire(&request)?)?;
-                self.stream.flush()?;
             }
-            return Ok(ArdFrameInfo {
-                index: self.frame_index,
-                framebuffer_updates,
-                rectangle_count,
-                payload_bytes,
-                wire_bytes,
-            });
+            self.pending_events.extend(batch_events);
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(event);
+            }
         }
     }
+
+    /// Compatibility helper that skips non-frame events. New callers should
+    /// use [`Self::next_event`] to receive clipboard and bell notifications.
+    pub fn next_frame(&mut self) -> Result<ArdFrameInfo, ArdClientError> {
+        loop {
+            if let ArdClientEvent::Frame(frame) = self.next_event()? {
+                return Ok(frame);
+            }
+        }
+    }
+}
+
+fn spawn_input_writer(
+    mut stream: TcpStream,
+    mut encoder: crate::ArdSessionRecordEncoder,
+    receiver: Receiver<OutboundMessage>,
+    writer_error: Arc<Mutex<Option<String>>>,
+) {
+    thread::spawn(move || {
+        while let Ok(OutboundMessage::Payload(payload)) = receiver.recv() {
+            let result = encoder
+                .encode_wire(&payload)
+                .map_err(ArdClientError::from)
+                .and_then(|wire| {
+                    stream.write_all(&wire)?;
+                    stream.flush()?;
+                    Ok(())
+                });
+            if let Err(error) = result {
+                if let Ok(mut current) = writer_error.lock() {
+                    *current = Some(format!("ARD input writer failed: {error}"));
+                }
+                break;
+            }
+        }
+    });
 }
 
 fn read_exact_vector(stream: &mut TcpStream, len: usize) -> io::Result<Vec<u8>> {

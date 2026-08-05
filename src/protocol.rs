@@ -779,6 +779,51 @@ pub fn build_set_encodings(encodings: &[i32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Builds the standard RFB client `KeyEvent` message.
+///
+/// The keysym is an X11/RFB keysym, not a platform scan code. Keeping that
+/// distinction at the protocol boundary is what lets the viewer use the same
+/// wire representation on macOS, Windows, and Linux.
+pub fn build_key_event(pressed: bool, keysym: u32) -> [u8; 8] {
+    let mut out = [0; 8];
+    out[0] = 4;
+    out[1] = u8::from(pressed);
+    out[4..].copy_from_slice(&keysym.to_be_bytes());
+    out
+}
+
+/// Builds the standard RFB client `PointerEvent` message.
+///
+/// The button mask uses the RFB convention: bit 0/1/2 are left/middle/right,
+/// bits 3/4 are wheel up/down, and bits 5/6 are the commonly implemented
+/// horizontal/back-forward extensions.
+pub fn build_pointer_event(button_mask: u8, x: u16, y: u16) -> [u8; 6] {
+    let mut out = [0; 6];
+    out[0] = 5;
+    out[1] = button_mask;
+    out[2..4].copy_from_slice(&x.to_be_bytes());
+    out[4..6].copy_from_slice(&y.to_be_bytes());
+    out
+}
+
+/// Builds the standard RFB client `ClientCutText` clipboard message.
+pub fn build_client_cut_text(text: &[u8]) -> Result<Vec<u8>> {
+    let length = u32::try_from(text.len()).map_err(|_| Error::LimitExceeded("clipboard text"))?;
+    let capacity = 8_usize
+        .checked_add(text.len())
+        .ok_or(Error::LimitExceeded("clipboard text"))?;
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(&[6, 0, 0, 0]);
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(text);
+    Ok(out)
+}
+
+/// Builds a UTF-8 RFB clipboard message.
+pub fn build_clipboard_text(text: &str) -> Result<Vec<u8>> {
+    build_client_cut_text(text.as_bytes())
+}
+
 pub fn build_framebuffer_update_request(
     incremental: bool,
     x: u16,

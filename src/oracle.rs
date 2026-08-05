@@ -45,6 +45,9 @@ pub struct EncryptedTransportOracle {
     pub command_support: [u8; 16],
     pub session_value: [u8; 16],
     pub initial_chaining_value: [u8; 16],
+    /// Optional server-to-client clipboard payload used by interoperability
+    /// tests. The normal oracle leaves the clipboard stream disabled.
+    pub server_clipboard_text: Option<Vec<u8>>,
     /// Reject peers other than this address. Defaults to loopback.
     pub allowed_peer: Option<IpAddr>,
     /// Fail when the client does not send the `0x12` proposal. Set to false
@@ -73,6 +76,7 @@ impl Default for EncryptedTransportOracle {
             command_support,
             session_value: [0x42; 16],
             initial_chaining_value: [0x24; 16],
+            server_clipboard_text: None,
             allowed_peer: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             require_encryption: true,
             expect_security_selection: true,
@@ -233,6 +237,20 @@ impl EncryptedTransportOracle {
         stream.flush()?;
         report.server_to_client_records += 1;
         report.frames_sent += 1;
+
+        if let Some(text) = &self.server_clipboard_text {
+            let mut clipboard = vec![3, 0, 0, 0];
+            clipboard.extend_from_slice(
+                &u32::try_from(text.len())
+                    .map_err(|_| io::Error::other("clipboard test payload is too large"))?
+                    .to_be_bytes(),
+            );
+            clipboard.extend_from_slice(text);
+            let record = encoder.encode_wire(&clipboard).map_err(io::Error::other)?;
+            stream.write_all(&record)?;
+            stream.flush()?;
+            report.server_to_client_records += 1;
+        }
 
         // Read encrypted client records until EOF, responding to update
         // requests with the remaining frames.
