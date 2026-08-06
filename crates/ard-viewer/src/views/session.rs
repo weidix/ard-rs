@@ -18,6 +18,11 @@ pub(crate) const SESSION_TITLEBAR_HEIGHT: f32 = 32.0;
 
 pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.session_fullscreen || app.is_window_maximized(window_id);
+    let toolbar_top_padding = if app.session_fullscreen {
+        0.0
+    } else {
+        SESSION_TITLEBAR_HEIGHT
+    };
     let endpoint = app
         .remote_endpoint()
         .unwrap_or_else(|_| app.address.trim().to_owned());
@@ -26,19 +31,31 @@ pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     } else {
         Some(format!("用户 {}", app.username.trim()))
     };
-    stack![
-        remote_canvas(
-            app,
-            maximized,
-            app.effective_dark(),
-            app.session_toolbar_x,
-            app.session_toolbar_window_width,
-        ),
-        window_chrome_with_title(window_id, SESSION_TITLEBAR_HEIGHT, endpoint, detail),
-    ]
-    .width(Fill)
-    .height(Fill)
-    .into()
+    let canvas = remote_canvas(
+        app,
+        maximized,
+        app.effective_dark(),
+        app.session_toolbar_x,
+        app.session_toolbar_window_width,
+        toolbar_top_padding,
+    );
+    if app.session_fullscreen {
+        canvas
+    } else {
+        stack![
+            canvas,
+            container(window_chrome_with_title(
+                window_id,
+                SESSION_TITLEBAR_HEIGHT,
+                endpoint,
+                detail,
+            ))
+            .id("session-window-chrome"),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into()
+    }
 }
 
 fn remote_canvas(
@@ -47,6 +64,7 @@ fn remote_canvas(
     is_dark: bool,
     toolbar_x: Option<f32>,
     window_width: f32,
+    toolbar_top_padding: f32,
 ) -> Element<'_, Message> {
     let desktop: Element<'_, Message> = if let Some(runtime) = &app.session_runtime {
         container(session_renderer::remote_display(
@@ -115,7 +133,7 @@ fn remote_canvas(
         container(positioned)
             .width(Fill)
             .height(Fill)
-            .padding([SESSION_TITLEBAR_HEIGHT, 0.0])
+            .padding([toolbar_top_padding, 0.0])
             .align_y(Alignment::Start),
     )
     .on_move(Message::SessionToolbarPointerMoved)

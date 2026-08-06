@@ -1729,6 +1729,28 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_session_removes_titlebar_overlay_and_top_inset() {
+        let (mut app, _task) = ArdViewer::new();
+        app.session_fullscreen = true;
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Session.size(),
+            views::session(&app, window::Id::unique()),
+        );
+
+        assert!(
+            ui.find(iced::widget::Id::new("session-window-chrome"))
+                .is_err()
+        );
+        let toolbar = ui
+            .find(iced::widget::Id::new("session-toolbar-collapse-handle"))
+            .expect("fullscreen toolbar should be present")
+            .visible_bounds()
+            .expect("fullscreen toolbar should be visible");
+        assert!(toolbar.y < views::SESSION_TITLEBAR_HEIGHT + 50.0);
+    }
+
+    #[test]
     fn ui_transitions_start_and_converge_smoothly() {
         let (mut app, _task) = ArdViewer::new();
         app.devices = vec![

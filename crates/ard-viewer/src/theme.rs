@@ -492,11 +492,7 @@ pub fn pick_list(_: &Theme, status: iced_pick_list::Status) -> iced_pick_list::S
                 Color::TRANSPARENT
             },
             width: if opened { 1.0 } else { 0.0 },
-            radius: if opened {
-                border::top(CONTROL_RADIUS)
-            } else {
-                CONTROL_RADIUS.into()
-            },
+            radius: CONTROL_RADIUS.into(),
         },
     }
 }
@@ -507,7 +503,7 @@ pub fn pick_list_menu(_: &Theme) -> menu::Style {
         border: Border {
             color: mix(palette().border, palette().text, 0.20),
             width: 1.0,
-            radius: border::bottom(CONTROL_RADIUS),
+            radius: CONTROL_RADIUS.into(),
         },
         text_color: palette().text,
         selected_text_color: palette().text,
