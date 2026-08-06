@@ -22,6 +22,7 @@ use crate::state::{DeviceState, SavedDevice, ThemePreference};
 
 #[cfg(not(test))]
 const CREDENTIAL_FILE: &str = "credentials.json";
+pub const DEFAULT_SCROLL_MULTIPLIER: f32 = 5.0;
 
 #[cfg(not(test))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +54,7 @@ pub struct AppConfig {
     pub auto_adapt_keyboard: bool,
     pub capture_system_shortcuts: bool,
     pub reverse_scroll: bool,
+    pub scroll_multiplier: f32,
     pub show_performance_hud: bool,
     pub theme: String,
     pub language: String,
@@ -73,6 +75,7 @@ impl Default for AppConfig {
             auto_adapt_keyboard: true,
             capture_system_shortcuts: false,
             reverse_scroll: false,
+            scroll_multiplier: DEFAULT_SCROLL_MULTIPLIER,
             show_performance_hud: true,
             theme: "system".into(),
             language: "zh-CN".into(),

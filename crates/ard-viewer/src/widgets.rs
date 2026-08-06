@@ -1,9 +1,9 @@
-use iced::widget::{button, column, container, mouse_area, row, space, stack, text};
+use iced::widget::{button, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::Message;
 use crate::icons::{Icon, icon};
-use crate::theme::{self, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTROL_HEIGHT, ICON_SIZE};
+use crate::theme::{self, BODY_SIZE, CAPTION_SIZE, CONTROL_HEIGHT, ICON_SIZE};
 
 fn centered_label<'a>(
     label: impl Into<String>,
@@ -226,18 +226,4 @@ pub fn icon_button(kind: Icon, message: Message) -> iced::widget::Button<'static
         .padding(0)
         .style(theme::secondary_button)
         .on_press(message)
-}
-
-pub fn card<'a>(title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(
-        column![
-            text(title).color(theme::palette().text).size(BODY_SIZE),
-            body.into()
-        ]
-        .spacing(10),
-    )
-    .width(Fill)
-    .padding(16)
-    .style(theme::bordered_panel(theme::palette().surface, CARD_RADIUS))
-    .into()
 }

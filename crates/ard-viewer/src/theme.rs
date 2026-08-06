@@ -84,7 +84,6 @@ pub fn mix(from: Color, to: Color, amount: f32) -> Color {
 // Layout tokens. Keep geometry here so every window uses the same, predictable
 // control metrics instead of relying on each widget's intrinsic size.
 pub const WINDOW_RADIUS: f32 = 12.0;
-pub const CARD_RADIUS: f32 = 9.0;
 pub const CONTROL_RADIUS: f32 = 8.0;
 pub const CHECKBOX_RADIUS: f32 = 4.0;
 

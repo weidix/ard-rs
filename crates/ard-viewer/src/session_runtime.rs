@@ -1342,6 +1342,19 @@ pub fn reverse_scroll_delta(delta: ScrollDelta) -> ScrollDelta {
     }
 }
 
+pub fn scale_scroll_delta(delta: ScrollDelta, multiplier: f32) -> ScrollDelta {
+    match delta {
+        ScrollDelta::Lines { x, y } => ScrollDelta::Lines {
+            x: x * multiplier,
+            y: y * multiplier,
+        },
+        ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels {
+            x: x * multiplier,
+            y: y * multiplier,
+        },
+    }
+}
+
 fn take_scroll(value: &mut f64) -> i32 {
     let clicks = value
         .trunc()
@@ -1692,6 +1705,18 @@ mod tests {
         assert_eq!(
             reverse_scroll_delta(ScrollDelta::Pixels { x: -4.0, y: 5.0 }),
             ScrollDelta::Pixels { x: 4.0, y: -5.0 }
+        );
+    }
+
+    #[test]
+    fn scroll_delta_can_be_scaled_on_both_axes() {
+        assert_eq!(
+            scale_scroll_delta(ScrollDelta::Lines { x: 2.0, y: -3.0 }, 3.0),
+            ScrollDelta::Lines { x: 6.0, y: -9.0 }
+        );
+        assert_eq!(
+            scale_scroll_delta(ScrollDelta::Pixels { x: -4.0, y: 5.0 }, 2.0),
+            ScrollDelta::Pixels { x: -8.0, y: 10.0 }
         );
     }
 

@@ -93,8 +93,12 @@ impl Language {
             "显示会话性能信息" => "Show session performance information",
             "输入控制" => "Input controls",
             "反转滚轮方向" => "Reverse scroll direction",
+            "滚动倍数" => "Scroll multiplier",
             "同时反转垂直和水平滚动方向。" => {
                 "Reverse both vertical and horizontal scrolling."
+            }
+            "提高远程界面的滚轮滚动速度。" => {
+                "Increase the wheel scrolling speed in the remote view."
             }
             "配置本地按键如何发送到远程设备。" => {
                 "Configure how local keys are sent to the remote device."
