@@ -1,6 +1,6 @@
 use ard_rs::ArdVideoQuality;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, space, stack, text,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, space, stack, text,
 };
 use iced::{Alignment, Element, Fill, window};
 
@@ -16,7 +16,7 @@ const TITLEBAR_HEIGHT: f32 = 44.0;
 
 pub fn connection(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.is_window_maximized(window_id);
-    stack![
+    let content: Element<'_, Message> = stack![
         row![device_sidebar(app, maximized), form(app, maximized)]
             .height(Fill)
             .width(Fill),
@@ -33,17 +33,28 @@ pub fn connection(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message
     ]
     .height(Fill)
     .width(Fill)
-    .into()
+    .into();
+
+    if let Some(index) = app.device_context_menu {
+        stack![content, device_context_menu(app, index)]
+            .height(Fill)
+            .width(Fill)
+            .into()
+    } else {
+        content
+    }
 }
 
 fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let query = app.search.trim().to_lowercase();
     let mut devices = column![].spacing(2);
+    let mut visible_devices = 0;
     for (index, device) in app.devices.iter().enumerate().filter(|(_, device)| {
         query.is_empty()
             || device.name.to_lowercase().contains(&query)
             || device.address.to_lowercase().contains(&query)
     }) {
+        visible_devices += 1;
         let selected = index == app.selected_device;
         let selection = if selected {
             app.device_transition
@@ -87,13 +98,15 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         ]
         .spacing(10)
         .align_y(Alignment::Center);
+        let item = button(content)
+            .height(42)
+            .width(Fill)
+            .padding([5, 8])
+            .style(theme::device_button(selection))
+            .on_press(Message::DeviceSelected(index));
         devices = devices.push(
-            button(content)
-                .height(42)
-                .width(Fill)
-                .padding([5, 8])
-                .style(theme::device_button(selection))
-                .on_press(Message::DeviceSelected(index)),
+            mouse_area(container(item).id(format!("history-device-{index}")))
+                .on_right_press(Message::OpenDeviceContextMenu(index)),
         );
     }
 
@@ -131,16 +144,24 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             theme::palette().surface,
             CONTROL_RADIUS
         )),
-        if app.devices.is_empty() {
+        if visible_devices == 0 {
             container(
                 column![
                     icon(Icon::Monitor, 24.0, theme::palette().text_dim),
-                    text("暂无历史连接")
-                        .size(BODY_SIZE)
-                        .color(theme::palette().text_muted),
-                    text("连接成功后会显示在这里")
-                        .size(CAPTION_SIZE)
-                        .color(theme::palette().text_dim),
+                    text(if app.devices.is_empty() {
+                        "暂无历史连接"
+                    } else {
+                        "未找到匹配记录"
+                    })
+                    .size(BODY_SIZE)
+                    .color(theme::palette().text_muted),
+                    text(if app.devices.is_empty() {
+                        "连接成功后会显示在这里"
+                    } else {
+                        "请尝试其他关键词"
+                    })
+                    .size(CAPTION_SIZE)
+                    .color(theme::palette().text_dim),
                 ]
                 .spacing(6)
                 .align_x(Alignment::Center),
@@ -151,9 +172,6 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         } else {
             container(scrollable(devices)).height(Fill).width(Fill)
         },
-        secondary("移除所选记录", Message::ManageDevices)
-            .width(Fill)
-            .height(CONTROL_HEIGHT),
     ]
     .spacing(8)
     .height(Fill);
@@ -172,6 +190,98 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             iced::border::left(if maximized { 0.0 } else { WINDOW_RADIUS }),
         ))
         .into()
+}
+
+fn device_context_menu(app: &ArdViewer, index: usize) -> Element<'_, Message> {
+    const MENU_WIDTH: f32 = 172.0;
+    const MENU_HEIGHT: f32 = 180.0;
+    const VIEWPORT_MARGIN: f32 = 8.0;
+
+    let Some(device) = app.devices.get(index) else {
+        return space().into();
+    };
+    let menu_left = app.device_context_menu_position.x.clamp(
+        VIEWPORT_MARGIN,
+        (app.connection_window_size.width - MENU_WIDTH - VIEWPORT_MARGIN).max(VIEWPORT_MARGIN),
+    );
+    let menu_top = app.device_context_menu_position.y.clamp(
+        VIEWPORT_MARGIN,
+        (app.connection_window_size.height - MENU_HEIGHT - VIEWPORT_MARGIN).max(VIEWPORT_MARGIN),
+    );
+
+    let menu = container(
+        column![
+            container(
+                column![
+                    text(&device.name)
+                        .size(BODY_SIZE)
+                        .color(theme::palette().text),
+                    text(device.address.trim_end_matches(":5900"))
+                        .size(MICRO_SIZE)
+                        .color(theme::palette().text_muted),
+                ]
+                .spacing(2),
+            )
+            .padding([5, 8]),
+            context_action(Icon::Monitor, "连接", Message::Connect, false),
+            context_action(
+                Icon::Clipboard,
+                "复制地址",
+                Message::CopyDeviceAddress(index),
+                false,
+            ),
+            context_action(
+                Icon::User,
+                "复制用户名",
+                Message::CopyDeviceUsername(index),
+                false,
+            ),
+            context_action(Icon::Trash, "删除记录", Message::RemoveDevice(index), true),
+        ]
+        .spacing(2),
+    )
+    .width(MENU_WIDTH)
+    .padding(6)
+    .style(theme::context_menu_panel);
+
+    let backdrop = mouse_area(container(space()).width(Fill).height(Fill))
+        .on_press(Message::CloseDeviceContextMenu)
+        .on_right_press(Message::CloseDeviceContextMenu);
+    let positioned = column![
+        space().height(menu_top),
+        row![space().width(menu_left), menu, space().width(Fill)],
+        space().height(Fill),
+    ]
+    .width(Fill)
+    .height(Fill);
+
+    stack![backdrop, positioned].width(Fill).height(Fill).into()
+}
+
+fn context_action<'a>(
+    kind: Icon,
+    label: &'a str,
+    message: Message,
+    destructive: bool,
+) -> iced::widget::Button<'a, Message> {
+    let color = if destructive {
+        theme::palette().warning
+    } else {
+        theme::palette().text
+    };
+    button(
+        row![
+            icon(kind, 14.0, color),
+            text(label).size(BODY_SIZE).color(color)
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center),
+    )
+    .height(30)
+    .width(Fill)
+    .padding([0, 8])
+    .style(theme::context_menu_button(destructive))
+    .on_press(message)
 }
 
 fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {

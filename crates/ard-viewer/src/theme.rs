@@ -437,6 +437,53 @@ pub fn device_button(selection: f32) -> impl Fn(&Theme, button::Status) -> butto
     }
 }
 
+pub fn context_menu_panel(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(palette().surface_active)),
+        text_color: Some(palette().text),
+        border: Border {
+            color: palette().border,
+            width: 1.0,
+            radius: CONTROL_RADIUS.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.38),
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 18.0,
+        },
+        snap: true,
+    }
+}
+
+pub fn context_menu_button(
+    destructive: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |_, status| {
+        let active = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: active.then_some(Background::Color(mix(
+                palette().surface_active,
+                if destructive {
+                    palette().warning
+                } else {
+                    palette().text
+                },
+                if destructive { 0.12 } else { 0.08 },
+            ))),
+            text_color: if destructive {
+                palette().warning
+            } else {
+                palette().text
+            },
+            border: Border {
+                radius: 5.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
 pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(

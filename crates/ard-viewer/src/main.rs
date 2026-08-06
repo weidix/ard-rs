@@ -37,6 +37,10 @@ struct ArdViewer {
     selected_device: usize,
     previous_selected_device: usize,
     device_transition: f32,
+    device_context_menu: Option<usize>,
+    connection_cursor_position: iced::Point,
+    device_context_menu_position: iced::Point,
+    connection_window_size: iced::Size,
     search: String,
     address: String,
     port: String,
@@ -105,6 +109,11 @@ enum Message {
     OpenSettings,
     SearchChanged(String),
     DeviceSelected(usize),
+    OpenDeviceContextMenu(usize),
+    CloseDeviceContextMenu,
+    CopyDeviceAddress(usize),
+    CopyDeviceUsername(usize),
+    RemoveDevice(usize),
     AddressChanged(String),
     PortChanged(String),
     UsernameChanged(String),
@@ -114,7 +123,6 @@ enum Message {
     RememberDeviceChanged(bool),
     SaveDevice,
     Connect,
-    ManageDevices,
     ExportShortcuts,
     SettingsSectionSelected(SettingsSection),
     QualityChanged(ArdVideoQuality),
@@ -161,24 +169,12 @@ impl ArdViewer {
     fn new() -> (Self, Task<Message>) {
         let cached = config::AppConfig::load();
         let devices = config::devices_from_cache(&cached);
-        let address = if cached.last_address.is_empty() {
-            devices
-                .first()
-                .map_or_else(String::new, |device| device.address.clone())
-        } else {
-            cached.last_address.clone()
-        };
+        let (address, username) = initial_connection_identity(&cached, &devices);
         let (address, port) = split_endpoint(&address);
         let endpoint = format_endpoint(&address, &port);
-        let username = if cached.last_username.is_empty() {
-            devices
-                .first()
-                .map_or_else(String::new, |device| device.username.clone())
-        } else {
-            cached.last_username.clone()
-        };
-        let has_saved_password =
-            cached.remember_password && config::load_password(&endpoint, &username).is_some();
+        let has_saved_password = !address.is_empty()
+            && cached.remember_password
+            && config::load_password(&endpoint, &username).is_some();
         let mappings = profile_mappings(&cached.key_profile);
         let app = Self {
             windows: BTreeMap::new(),
@@ -190,6 +186,10 @@ impl ArdViewer {
             selected_device: 0,
             previous_selected_device: 0,
             device_transition: 1.0,
+            device_context_menu: None,
+            connection_cursor_position: iced::Point::ORIGIN,
+            device_context_menu_position: iced::Point::ORIGIN,
+            connection_window_size: WindowKind::Connection.size(),
             search: String::new(),
             password: String::new(),
             password_visible: false,
@@ -283,6 +283,8 @@ impl ArdViewer {
                     self.session_toolbar_window_width = size.width;
                     self.session_window_size = size;
                     self.clamp_session_toolbar_position();
+                } else if self.windows.get(&id) == Some(&WindowKind::Connection) {
+                    self.connection_window_size = size;
                 }
                 return window::is_maximized(id)
                     .map(move |maximized| Message::WindowMaximizedChanged(id, maximized));
@@ -365,22 +367,37 @@ impl ArdViewer {
                 }
                 return open_window(WindowKind::Settings);
             }
-            Message::SearchChanged(value) => self.search = value,
+            Message::SearchChanged(value) => {
+                self.search = value;
+                self.device_context_menu = None;
+            }
             Message::DeviceSelected(index) => {
+                self.device_context_menu = None;
+                self.select_device(index);
+            }
+            Message::OpenDeviceContextMenu(index) => {
+                self.select_device(index);
+                self.device_context_menu_position = self.connection_cursor_position;
+                self.device_context_menu = (index < self.devices.len()).then_some(index);
+            }
+            Message::CloseDeviceContextMenu => self.device_context_menu = None,
+            Message::CopyDeviceAddress(index) => {
+                self.device_context_menu = None;
                 if let Some(device) = self.devices.get(index) {
-                    if index != self.selected_device {
-                        self.previous_selected_device = self.selected_device;
-                        self.device_transition = 0.0;
-                    }
-                    self.selected_device = index;
-                    (self.address, self.port) = split_endpoint(&device.address);
-                    self.username.clone_from(&device.username);
-                    self.password.clear();
-                    self.has_saved_password = self.remember_password && {
-                        let endpoint = format_endpoint(&self.address, &self.port);
-                        config::load_password(&endpoint, &self.username).is_some()
-                    };
+                    self.status = "已复制设备地址".into();
+                    return iced::clipboard::write(device.address.clone()).discard();
                 }
+            }
+            Message::CopyDeviceUsername(index) => {
+                self.device_context_menu = None;
+                if let Some(device) = self.devices.get(index) {
+                    self.status = "已复制用户名".into();
+                    return iced::clipboard::write(device.username.clone()).discard();
+                }
+            }
+            Message::RemoveDevice(index) => {
+                self.device_context_menu = None;
+                self.remove_device(index);
             }
             Message::AddressChanged(value) => {
                 let (address, port) = split_endpoint(&value);
@@ -529,6 +546,7 @@ impl ArdViewer {
                 }
             }
             Message::Connect => {
+                self.device_context_menu = None;
                 if self.address.trim().is_empty() || self.username.trim().is_empty() {
                     self.status = "请输入设备地址和用户名".into();
                 } else if self.remote_endpoint().is_err() {
@@ -557,26 +575,6 @@ impl ArdViewer {
                         return window::gain_focus(id);
                     }
                     return open_window(WindowKind::Session);
-                }
-            }
-            Message::ManageDevices => {
-                if !self.devices.is_empty() {
-                    let removed = self
-                        .devices
-                        .remove(self.selected_device.min(self.devices.len() - 1));
-                    if let Err(error) =
-                        config::save_password(&removed.address, &removed.username, None)
-                    {
-                        self.status = format!("移除系统密钥库密码失败：{error}");
-                    }
-                    self.selected_device = self
-                        .selected_device
-                        .min(self.devices.len().saturating_sub(1));
-                    self.previous_selected_device = self.selected_device;
-                    if !self.status.starts_with("移除系统密钥库密码失败") {
-                        self.status = "已移除所选历史连接".into();
-                    }
-                    self.persist_config();
                 }
             }
             Message::ExportShortcuts => self.export_shortcuts(),
@@ -719,6 +717,12 @@ impl ArdViewer {
                 return read_clipboard_text();
             }
             Message::SessionRawEvent(id, event, event_status) => {
+                if self.windows.get(&id) == Some(&WindowKind::Connection)
+                    && let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = &event
+                {
+                    self.connection_cursor_position = *position;
+                    return Task::none();
+                }
                 return self.handle_session_raw_event(id, event, event_status);
             }
             Message::ClipboardRead(contents) => {
@@ -868,6 +872,7 @@ impl ArdViewer {
     }
 
     fn persist_config(&mut self) {
+        let has_history = !self.devices.is_empty();
         let cached = config::AppConfig {
             devices: self
                 .devices
@@ -878,10 +883,17 @@ impl ArdViewer {
                     username: device.username.clone(),
                 })
                 .collect(),
-            last_address: self
-                .remote_endpoint()
-                .unwrap_or_else(|_| self.address.trim().to_owned()),
-            last_username: self.username.trim().to_owned(),
+            last_address: if has_history {
+                self.remote_endpoint()
+                    .unwrap_or_else(|_| self.address.trim().to_owned())
+            } else {
+                String::new()
+            },
+            last_username: if has_history {
+                self.username.trim().to_owned()
+            } else {
+                String::new()
+            },
             remember_password: self.remember_password,
             remember_device: self.remember_device,
             quality: config::quality_to_cache(self.quality).into(),
@@ -911,6 +923,56 @@ impl ArdViewer {
         } else {
             self.has_saved_password = password.is_some();
         }
+    }
+
+    fn select_device(&mut self, index: usize) {
+        let Some(device) = self.devices.get(index) else {
+            return;
+        };
+        if index != self.selected_device {
+            self.previous_selected_device = self.selected_device;
+            self.device_transition = 0.0;
+        }
+        self.selected_device = index;
+        (self.address, self.port) = split_endpoint(&device.address);
+        self.username.clone_from(&device.username);
+        self.password.clear();
+        self.has_saved_password = self.remember_password
+            && config::load_password(&format_endpoint(&self.address, &self.port), &self.username)
+                .is_some();
+    }
+
+    fn remove_device(&mut self, index: usize) {
+        if index >= self.devices.len() {
+            return;
+        }
+        let removed_selected = index == self.selected_device;
+        let removed = self.devices.remove(index);
+        if let Err(error) = config::save_password(&removed.address, &removed.username, None) {
+            self.status = format!("移除系统密钥库密码失败：{error}");
+        }
+        if index < self.selected_device {
+            self.selected_device -= 1;
+        } else {
+            self.selected_device = self
+                .selected_device
+                .min(self.devices.len().saturating_sub(1));
+        }
+        self.previous_selected_device = self.selected_device;
+        if self.devices.is_empty() {
+            self.selected_device = 0;
+            self.previous_selected_device = 0;
+            self.address.clear();
+            self.username.clear();
+            self.password.clear();
+            self.has_saved_password = false;
+        } else if removed_selected {
+            self.select_device(self.selected_device);
+        }
+        if !self.status.starts_with("移除系统密钥库密码失败") {
+            self.status = "已删除历史连接".into();
+        }
+        self.persist_config();
     }
 
     fn start_session(&mut self, password: String) {
@@ -1119,6 +1181,26 @@ impl ArdViewer {
             Err(error) => format!("导出失败：{error}"),
         };
     }
+}
+
+fn initial_connection_identity(
+    cached: &config::AppConfig,
+    devices: &[SavedDevice],
+) -> (String, String) {
+    let Some(first_device) = devices.first() else {
+        return (String::new(), String::new());
+    };
+    let address = if cached.last_address.is_empty() {
+        first_device.address.clone()
+    } else {
+        cached.last_address.clone()
+    };
+    let username = if cached.last_username.is_empty() {
+        first_device.username.clone()
+    } else {
+        cached.last_username.clone()
+    };
+    (address, username)
 }
 
 fn split_endpoint(value: &str) -> (String, String) {
@@ -1425,6 +1507,40 @@ mod tests {
     }
 
     #[test]
+    fn stale_identity_cache_is_ignored_without_history() {
+        let cached = config::AppConfig {
+            last_address: "stale.local:5901".into(),
+            last_username: "stale-user".into(),
+            ..config::AppConfig::default()
+        };
+
+        assert_eq!(
+            initial_connection_identity(&cached, &[]),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn cached_identity_is_restored_when_history_exists() {
+        let cached = config::AppConfig {
+            last_address: "last.local:5901".into(),
+            last_username: "last-user".into(),
+            ..config::AppConfig::default()
+        };
+        let devices = vec![SavedDevice {
+            name: "Saved".into(),
+            address: "saved.local:5900".into(),
+            username: "saved-user".into(),
+            state: DeviceState::Saved,
+        }];
+
+        assert_eq!(
+            initial_connection_identity(&cached, &devices),
+            ("last.local:5901".into(), "last-user".into())
+        );
+    }
+
+    #[test]
     fn password_visibility_can_be_toggled() {
         let (mut app, _task) = ArdViewer::new();
         app.password = "top-secret".into();
@@ -1576,6 +1692,132 @@ mod tests {
         assert_eq!(app.selected_device, previous_len);
         assert_eq!(app.devices[previous_len].name, "new-host.local");
         assert_eq!(app.devices[previous_len].state, DeviceState::Saved);
+    }
+
+    #[test]
+    fn device_context_menu_selects_its_record() {
+        let (mut app, _task) = ArdViewer::new();
+        app.devices = vec![
+            SavedDevice {
+                name: "First".into(),
+                address: "first.local:5900".into(),
+                username: "one".into(),
+                state: DeviceState::Saved,
+            },
+            SavedDevice {
+                name: "Second".into(),
+                address: "second.local:5901".into(),
+                username: "two".into(),
+                state: DeviceState::Saved,
+            },
+        ];
+        let window_id = window::Id::unique();
+        app.windows.insert(window_id, WindowKind::Connection);
+        let _task = app.update(Message::SessionRawEvent(
+            window_id,
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: iced::Point::new(318.0, 246.0),
+            }),
+            iced::event::Status::Ignored,
+        ));
+
+        let _task = app.update(Message::OpenDeviceContextMenu(1));
+
+        assert_eq!(app.device_context_menu, Some(1));
+        assert_eq!(
+            app.device_context_menu_position,
+            iced::Point::new(318.0, 246.0)
+        );
+        assert_eq!(app.selected_device, 1);
+        assert_eq!(app.address, "second.local");
+        assert_eq!(app.port, "5901");
+        assert_eq!(app.username, "two");
+    }
+
+    #[test]
+    fn right_clicking_history_record_opens_its_context_menu() {
+        let (mut app, _task) = ArdViewer::new();
+        app.devices = vec![SavedDevice {
+            name: "History".into(),
+            address: "history.local:5900".into(),
+            username: "viewer".into(),
+            state: DeviceState::Saved,
+        }];
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Connection.size(),
+            views::connection(&app, window::Id::unique()),
+        );
+        let bounds = ui
+            .find(iced::widget::Id::new("history-device-0"))
+            .expect("history record should be present")
+            .visible_bounds()
+            .expect("history record should be visible");
+        ui.point_at(bounds.center());
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+            iced::mouse::Button::Right,
+        ))]);
+
+        assert!(
+            ui.into_messages()
+                .any(|message| matches!(message, Message::OpenDeviceContextMenu(0)))
+        );
+    }
+
+    #[test]
+    fn context_menu_delete_removes_the_requested_record() {
+        let (mut app, _task) = ArdViewer::new();
+        app.devices = vec![
+            SavedDevice {
+                name: "Keep".into(),
+                address: "keep.local:5900".into(),
+                username: "one".into(),
+                state: DeviceState::Saved,
+            },
+            SavedDevice {
+                name: "Delete".into(),
+                address: "delete.local:5900".into(),
+                username: "two".into(),
+                state: DeviceState::Saved,
+            },
+        ];
+        app.device_context_menu = Some(1);
+
+        let _task = app.update(Message::RemoveDevice(1));
+
+        assert_eq!(app.devices.len(), 1);
+        assert_eq!(app.devices[0].name, "Keep");
+        assert_eq!(app.device_context_menu, None);
+        assert_eq!(app.status, "已删除历史连接");
+    }
+
+    #[test]
+    fn deleting_an_earlier_record_keeps_the_same_device_selected() {
+        let (mut app, _task) = ArdViewer::new();
+        app.devices = vec![
+            SavedDevice {
+                name: "Earlier".into(),
+                address: "earlier.local:5900".into(),
+                username: "one".into(),
+                state: DeviceState::Saved,
+            },
+            SavedDevice {
+                name: "Selected".into(),
+                address: "selected.local:5900".into(),
+                username: "two".into(),
+                state: DeviceState::Saved,
+            },
+        ];
+        app.selected_device = 1;
+        app.address = "selected.local".into();
+        app.port = "5900".into();
+        app.username = "two".into();
+
+        let _task = app.update(Message::RemoveDevice(0));
+
+        assert_eq!(app.selected_device, 0);
+        assert_eq!(app.devices[app.selected_device].name, "Selected");
+        assert_eq!(app.address, "selected.local");
     }
 
     #[test]
@@ -1884,9 +2126,27 @@ mod tests {
                 let snapshot = ui.snapshot(&theme::app_theme())?;
                 assert!(
                     snapshot
-                        .matches_image(format!("/tmp/ard-viewer-capabilities-v2-{mode}-{name}"))?
+                        .matches_image(format!("/tmp/ard-viewer-capabilities-v3-{mode}-{name}"))?
                 );
             }
+
+            app.devices = vec![SavedDevice {
+                name: "studio-mac".into(),
+                address: "studio-mac.local:5900".into(),
+                username: "viewer".into(),
+                state: DeviceState::RecentlyUsed,
+            }];
+            app.device_context_menu = Some(0);
+            app.device_context_menu_position = iced::Point::new(224.0, 128.0);
+            let mut ui = iced_test::Simulator::with_size(
+                settings.clone(),
+                WindowKind::Connection.size(),
+                views::connection(&app, window::Id::unique()),
+            );
+            let snapshot = ui.snapshot(&theme::app_theme())?;
+            assert!(snapshot.matches_image(format!(
+                "/tmp/ard-viewer-capabilities-v3-{mode}-connection-menu"
+            ))?);
         }
         Ok(())
     }
