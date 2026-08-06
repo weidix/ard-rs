@@ -17,7 +17,7 @@ pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> 
         row![sidebar(app, maximized), content(app, maximized)]
             .width(Fill)
             .height(Fill),
-        window_chrome_with_title(window_id, 32.0, "设置", None),
+        window_chrome_with_title(window_id, 32.0, app.language.tr("设置"), None),
     ]
     .width(Fill)
     .height(Fill)
@@ -26,7 +26,7 @@ pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> 
 
 fn sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let mut nav = column![
-        text("偏好设置")
+        text(app.language.tr("偏好设置"))
             .size(CAPTION_SIZE)
             .color(theme::palette().text_muted)
     ]
@@ -49,7 +49,7 @@ fn sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
                     .height(Fill)
                     .center_x(20)
                     .center_y(Fill),
-                    text(section.label()).size(BODY_SIZE),
+                    text(section.label(app.language)).size(BODY_SIZE),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center)
@@ -88,7 +88,7 @@ fn content(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         SettingsSection::Display => display(app),
         SettingsSection::KeyMapping => key_mapping(app),
         SettingsSection::Security => security(app),
-        SettingsSection::About => about(),
+        SettingsSection::About => about(app),
     };
     container(section)
         .padding(iced::Padding {
@@ -108,25 +108,40 @@ fn content(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
 
 fn general(app: &ArdViewer) -> Element<'_, Message> {
     let active_theme = if app.effective_dark() {
-        "当前使用深色外观"
+        app.language.tr("当前使用深色外观")
     } else {
-        "当前使用浅色外观"
+        app.language.tr("当前使用浅色外观")
     };
 
     column![
-        text("常规").size(TITLE_SIZE).color(theme::palette().text),
-        muted("配置应用的通用行为。"),
+        text(app.language.tr("常规"))
+            .size(TITLE_SIZE)
+            .color(theme::palette().text),
+        muted(app.language.tr("配置应用的通用行为。")),
         card(
-            "外观",
+            app.language.tr("外观"),
             column![
                 row![
-                    text("主题模式").size(BODY_SIZE).width(150),
+                    text(app.language.tr("主题模式")).size(BODY_SIZE).width(150),
                     pick_list(
                         Some(app.theme_preference),
                         ThemePreference::ALL,
-                        ToString::to_string,
+                        move |value| value.label(app.language).to_owned(),
                     )
                     .on_select(Message::ThemePreferenceChanged)
+                    .width(180)
+                    .padding([10, 12])
+                    .text_size(BODY_SIZE)
+                    .style(theme::pick_list)
+                    .menu_style(theme::pick_list_menu),
+                ]
+                .align_y(Alignment::Center),
+                row![
+                    text(app.language.tr("语言")).size(BODY_SIZE).width(150),
+                    pick_list(Some(app.language), crate::i18n::Language::ALL, |value| {
+                        value.label().to_owned()
+                    })
+                    .on_select(Message::LanguageChanged)
                     .width(180)
                     .padding([10, 12])
                     .text_size(BODY_SIZE)
@@ -138,13 +153,26 @@ fn general(app: &ArdViewer) -> Element<'_, Message> {
                     .size(CAPTION_SIZE)
                     .color(theme::palette().text_muted),
                 checkbox(app.show_performance_hud)
-                    .label("显示会话性能信息")
+                    .label(app.language.tr("显示会话性能信息"))
                     .on_toggle(Message::PerformanceHudChanged)
                     .size(16)
                     .text_size(BODY_SIZE)
                     .style(theme::checkbox),
             ]
             .spacing(12),
+        ),
+        card(
+            app.language.tr("输入控制"),
+            column![
+                checkbox(app.reverse_scroll)
+                    .label(app.language.tr("反转滚轮方向"))
+                    .on_toggle(Message::ReverseScrollChanged)
+                    .size(16)
+                    .text_size(BODY_SIZE)
+                    .style(theme::checkbox),
+                muted(app.language.tr("同时反转垂直和水平滚动方向。")),
+            ]
+            .spacing(8),
         ),
     ]
     .spacing(13)
@@ -154,21 +182,21 @@ fn general(app: &ArdViewer) -> Element<'_, Message> {
 fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
     let presets = ["macOS 默认", "Windows 默认", "Linux 默认"];
     let heading = column![
-        text("按键映射")
+        text(app.language.tr("按键映射"))
             .size(TITLE_SIZE)
             .color(theme::palette().text),
-        text("配置本地按键如何发送到远程设备。")
+        text(app.language.tr("配置本地按键如何发送到远程设备。"))
             .size(CAPTION_SIZE)
             .color(theme::palette().text_muted),
     ]
     .spacing(2);
     let controls = row![
         column![
-            text("预设")
+            text(app.language.tr("预设"))
                 .size(BODY_SIZE)
                 .color(theme::palette().text_muted),
             pick_list(Some(app.key_profile.as_str()), presets, |value| {
-                (*value).to_owned()
+                app.language.tr(value).to_owned()
             })
             .on_select(|value| Message::KeyProfileChanged(value.to_owned()))
             .width(410)
@@ -178,10 +206,10 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
             .menu_style(theme::pick_list_menu),
         ]
         .spacing(5),
-        secondary("复制预设", Message::CopyPreset)
+        secondary(app.language.tr("复制预设"), Message::CopyPreset)
             .width(104)
             .height(CONTROL_HEIGHT),
-        secondary("重置", Message::ResetMappings)
+        secondary(app.language.tr("重置"), Message::ResetMappings)
             .width(76)
             .height(CONTROL_HEIGHT),
     ]
@@ -191,15 +219,15 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
     let mut table = column![
         container(
             row![
-                text("本地按键")
+                text(app.language.tr("本地按键"))
                     .size(CAPTION_SIZE)
                     .color(theme::palette().text_muted)
                     .width(170),
-                text("远程动作")
+                text(app.language.tr("远程动作"))
                     .size(CAPTION_SIZE)
                     .color(theme::palette().text_muted)
                     .width(220),
-                text("作用域")
+                text(app.language.tr("作用域"))
                     .size(CAPTION_SIZE)
                     .color(theme::palette().text_muted)
                     .width(160),
@@ -232,11 +260,11 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
                             .size(BODY_SIZE)
                             .color(theme::palette().text)
                             .width(170),
-                        text(&mapping.remote)
+                        text(app.language.tr(&mapping.remote))
                             .size(BODY_SIZE)
                             .color(theme::palette().text)
                             .width(220),
-                        text(&mapping.scope)
+                        text(app.language.tr(&mapping.scope))
                             .size(BODY_SIZE)
                             .color(theme::palette().text)
                             .width(160),
@@ -266,11 +294,15 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
         .width(Fill)
         .style(theme::bordered_panel(theme::palette().surface, CARD_RADIUS));
     let add = row![
-        secondary_with_icon(Icon::Plus, "添加常用映射", Message::AddMapping)
-            .width(112)
-            .height(CONTROL_HEIGHT),
+        secondary_with_icon(
+            Icon::Plus,
+            app.language.tr("添加常用映射"),
+            Message::AddMapping
+        )
+        .width(112)
+        .height(CONTROL_HEIGHT),
         container(
-            text("拖动可调整优先级")
+            text(app.language.tr("拖动可调整优先级"))
                 .size(CAPTION_SIZE)
                 .color(theme::palette().text_dim)
         )
@@ -281,17 +313,17 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
     .align_y(Alignment::Center);
     let common = container(
         column![
-            text("常用选项")
+            text(app.language.tr("常用选项"))
                 .size(BODY_SIZE)
                 .color(theme::palette().text),
             checkbox(app.auto_adapt_keyboard)
-                .label("自动适配远程键盘布局")
+                .label(app.language.tr("自动适配远程键盘布局"))
                 .on_toggle(Message::AutoAdaptChanged)
                 .size(16)
                 .text_size(BODY_SIZE)
                 .style(theme::checkbox),
             checkbox(app.capture_system_shortcuts)
-                .label("在全屏模式中捕获系统快捷键")
+                .label(app.language.tr("在全屏模式中捕获系统快捷键"))
                 .on_toggle(Message::CaptureShortcutsChanged)
                 .size(16)
                 .text_size(BODY_SIZE)
@@ -312,33 +344,33 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
 }
 
 fn display(app: &ArdViewer) -> Element<'_, Message> {
-    const QUALITIES: [&str; 5] = ["低", "中", "高", "自适应", "完整"];
+    let qualities = ["低", "中", "高", "自适应", "完整"];
     column![
-        text("显示与性能")
+        text(app.language.tr("显示与性能"))
             .size(TITLE_SIZE)
             .color(theme::palette().text),
-        muted("设置远程画面的质量和性能。"),
+        muted(app.language.tr("设置远程画面的质量和性能。")),
         card(
-            "远程画面",
+            app.language.tr("远程画面"),
             column![
                 row![
-                    text("视频质量").size(BODY_SIZE).width(150),
+                    text(app.language.tr("视频质量")).size(BODY_SIZE).width(150),
                     pick_list(
-                        Some(match app.quality {
+                        Some(app.language.tr(match app.quality {
                             ArdVideoQuality::Low => "低",
                             ArdVideoQuality::Medium => "中",
                             ArdVideoQuality::High => "高",
                             ArdVideoQuality::Full => "完整",
                             _ => "自适应",
-                        }),
-                        QUALITIES,
-                        |value| (*value).to_owned(),
+                        })),
+                        qualities,
+                        |value| app.language.tr(value).to_owned(),
                     )
                     .on_select(|value| Message::QualityChanged(match value {
-                        "低" => ArdVideoQuality::Low,
-                        "中" => ArdVideoQuality::Medium,
-                        "高" => ArdVideoQuality::High,
-                        "完整" => ArdVideoQuality::Full,
+                        "低" | "Low" => ArdVideoQuality::Low,
+                        "中" | "Medium" => ArdVideoQuality::Medium,
+                        "高" | "High" => ArdVideoQuality::High,
+                        "完整" | "Full" => ArdVideoQuality::Full,
                         _ => ArdVideoQuality::Adaptive,
                     }))
                     .padding([10, 12])
@@ -348,8 +380,10 @@ fn display(app: &ArdViewer) -> Element<'_, Message> {
                 ]
                 .align_y(Alignment::Center),
                 row![
-                    text("帧率 (FPS)").size(BODY_SIZE).width(150),
-                    iced::widget::text_input("自动", &app.frame_rate)
+                    text(app.language.tr("帧率 (FPS)"))
+                        .size(BODY_SIZE)
+                        .width(150),
+                    iced::widget::text_input(app.language.tr("自动"), &app.frame_rate)
                         .on_input(Message::FrameRateChanged)
                         .width(180)
                         .padding([10, 12])
@@ -367,18 +401,23 @@ fn display(app: &ArdViewer) -> Element<'_, Message> {
 
 fn security(app: &ArdViewer) -> Element<'_, Message> {
     column![
-        text("安全").size(TITLE_SIZE).color(theme::palette().text),
-        muted("管理本地凭据与连接数据。"),
+        text(app.language.tr("安全"))
+            .size(TITLE_SIZE)
+            .color(theme::palette().text),
+        muted(app.language.tr("管理本地凭据与连接数据。")),
         card(
-            "凭据存储",
+            app.language.tr("凭据存储"),
             column![
                 checkbox(app.remember_password)
-                    .label("在应用本地加密凭据库中保存当前设备密码")
+                    .label(app.language.tr("在应用本地加密凭据库中保存当前设备密码"))
                     .on_toggle(Message::RememberPasswordChanged)
                     .size(16)
                     .text_size(BODY_SIZE)
                     .style(theme::checkbox),
-                muted("密码保存在独立的 AES-256-GCM 加密文件中，不会写入明文配置。"),
+                muted(
+                    app.language
+                        .tr("密码保存在独立的 AES-256-GCM 加密文件中，不会写入明文配置。")
+                ),
             ]
             .spacing(10)
         ),
@@ -387,16 +426,26 @@ fn security(app: &ArdViewer) -> Element<'_, Message> {
     .into()
 }
 
-fn about() -> Element<'static, Message> {
+fn about(app: &ArdViewer) -> Element<'static, Message> {
     column![
-        text("关于").size(TITLE_SIZE).color(theme::palette().text),
-        muted("Apple Remote Desktop 原生 Rust 客户端。"),
+        text(app.language.tr("关于"))
+            .size(TITLE_SIZE)
+            .color(theme::palette().text),
+        muted(app.language.tr("Apple Remote Desktop 原生 Rust 客户端。")),
         card(
             "ARD Viewer",
             column![
-                text(format!("版本 {}", env!("CARGO_PKG_VERSION"))).size(BODY_SIZE),
-                muted("支持 ARD 认证、加密传输、MVS GPU 解码、键鼠输入、剪贴板与自动重连。"),
-                muted("许可证：MIT OR Apache-2.0"),
+                text(if app.language == crate::i18n::Language::English {
+                    format!("Version {}", env!("CARGO_PKG_VERSION"))
+                } else {
+                    format!("版本 {}", env!("CARGO_PKG_VERSION"))
+                })
+                .size(BODY_SIZE),
+                muted(
+                    app.language
+                        .tr("支持 ARD 认证、加密传输、MVS GPU 解码、键鼠输入、剪贴板与自动重连。")
+                ),
+                muted(app.language.tr("许可证：MIT OR Apache-2.0")),
             ]
             .spacing(10)
         ),

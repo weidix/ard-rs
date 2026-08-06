@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod config;
+mod i18n;
 mod icons;
 mod session_renderer;
 mod session_runtime;
@@ -17,9 +18,10 @@ use ard_rs::ArdVideoQuality;
 use iced::widget::{column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, Subscription, Task, Theme, window};
 
+use i18n::Language;
 use session_runtime::{
     ClipboardSync, ConnectionState, InputEvent, InputState, SessionConfig, SessionEvent,
-    SessionRuntime, StreamMetrics, is_paste_shortcut, map_remote_position,
+    SessionRuntime, StreamMetrics, is_paste_shortcut, map_remote_position, reverse_scroll_delta,
 };
 
 use state::{DeviceState, KeyMapping, SavedDevice, SettingsSection, ThemePreference, WindowKind};
@@ -57,8 +59,10 @@ struct ArdViewer {
     key_profile: String,
     auto_adapt_keyboard: bool,
     capture_system_shortcuts: bool,
+    reverse_scroll: bool,
     show_performance_hud: bool,
     theme_preference: ThemePreference,
+    language: Language,
     system_dark: bool,
     mappings: Vec<KeyMapping>,
     session_zoom: f32,
@@ -130,8 +134,10 @@ enum Message {
     KeyProfileChanged(String),
     AutoAdaptChanged(bool),
     CaptureShortcutsChanged(bool),
+    ReverseScrollChanged(bool),
     PerformanceHudChanged(bool),
     ThemePreferenceChanged(ThemePreference),
+    LanguageChanged(Language),
     SystemThemeChanged(iced::theme::Mode),
     CopyPreset,
     ResetMappings,
@@ -207,8 +213,10 @@ impl ArdViewer {
             key_profile: cached.key_profile,
             auto_adapt_keyboard: cached.auto_adapt_keyboard,
             capture_system_shortcuts: cached.capture_system_shortcuts,
+            reverse_scroll: cached.reverse_scroll,
             show_performance_hud: cached.show_performance_hud,
             theme_preference: config::theme_from_cache(&cached.theme),
+            language: config::language_from_cache(&cached.language),
             system_dark: false,
             mappings,
             session_zoom: 1.0,
@@ -384,14 +392,14 @@ impl ArdViewer {
             Message::CopyDeviceAddress(index) => {
                 self.device_context_menu = None;
                 if let Some(device) = self.devices.get(index) {
-                    self.status = "已复制设备地址".into();
+                    self.status = self.language.tr("已复制设备地址").into();
                     return iced::clipboard::write(device.address.clone()).discard();
                 }
             }
             Message::CopyDeviceUsername(index) => {
                 self.device_context_menu = None;
                 if let Some(device) = self.devices.get(index) {
-                    self.status = "已复制用户名".into();
+                    self.status = self.language.tr("已复制用户名").into();
                     return iced::clipboard::write(device.username.clone()).discard();
                 }
             }
@@ -428,7 +436,11 @@ impl ArdViewer {
                     .unwrap_or_else(|_| self.address.trim().to_owned());
                 if !value && let Err(error) = config::save_password(&address, &self.username, None)
                 {
-                    self.status = format!("移除系统密钥库密码失败：{error}");
+                    self.status = if self.language == Language::English {
+                        format!("Failed to remove the saved password: {error}")
+                    } else {
+                        format!("移除系统密钥库密码失败：{error}")
+                    };
                 }
                 if !value {
                     self.has_saved_password = false;
@@ -441,7 +453,7 @@ impl ArdViewer {
             }
             Message::SaveDevice => {
                 let Ok(address) = self.remote_endpoint() else {
-                    self.status = "请输入有效的设备地址和端口".into();
+                    self.status = self.language.tr("请输入有效的设备地址和端口").into();
                     return Task::none();
                 };
                 if let Some(index) = self
@@ -451,7 +463,7 @@ impl ArdViewer {
                 {
                     self.selected_device = index;
                     self.devices[index].username = self.username.trim().to_owned();
-                    self.status = "历史连接已更新".into();
+                    self.status = self.language.tr("历史连接已更新").into();
                 } else {
                     let (name, _) = split_endpoint(&address);
                     self.devices.push(SavedDevice {
@@ -463,7 +475,7 @@ impl ArdViewer {
                     self.previous_selected_device = self.selected_device;
                     self.selected_device = self.devices.len() - 1;
                     self.device_transition = 0.0;
-                    self.status = "已加入历史连接".into();
+                    self.status = self.language.tr("已加入历史连接").into();
                 }
                 self.store_credentials();
                 self.persist_config();
@@ -502,6 +514,10 @@ impl ArdViewer {
                 self.capture_system_shortcuts = value;
                 self.persist_config();
             }
+            Message::ReverseScrollChanged(value) => {
+                self.reverse_scroll = value;
+                self.persist_config();
+            }
             Message::PerformanceHudChanged(value) => {
                 self.show_performance_hud = value;
                 self.persist_config();
@@ -509,6 +525,11 @@ impl ArdViewer {
             Message::ThemePreferenceChanged(preference) => {
                 self.theme_preference = preference;
                 theme::set_dark(self.effective_dark());
+                self.persist_config();
+            }
+            Message::LanguageChanged(language) => {
+                self.language = language;
+                self.status.clear();
                 self.persist_config();
             }
             Message::SystemThemeChanged(mode) => {
@@ -519,7 +540,7 @@ impl ArdViewer {
             }
             Message::ResetMappings => {
                 self.mappings = default_mappings();
-                self.status = "按键映射已恢复默认".into();
+                self.status = self.language.tr("按键映射已恢复默认").into();
             }
             Message::ToggleFullscreen => {
                 self.touch_session_toolbar();
@@ -548,11 +569,11 @@ impl ArdViewer {
             Message::Connect => {
                 self.device_context_menu = None;
                 if self.address.trim().is_empty() || self.username.trim().is_empty() {
-                    self.status = "请输入设备地址和用户名".into();
+                    self.status = self.language.tr("请输入设备地址和用户名").into();
                 } else if self.remote_endpoint().is_err() {
-                    self.status = "请输入有效端口（1–65535）".into();
+                    self.status = self.language.tr("请输入有效端口（1–65535）").into();
                 } else if self.password.is_empty() && !self.has_saved_password {
-                    self.status = "请输入密码".into();
+                    self.status = self.language.tr("请输入密码").into();
                 } else {
                     let endpoint = self.remote_endpoint().expect("endpoint validated above");
                     let password = if self.password.is_empty() {
@@ -562,7 +583,7 @@ impl ArdViewer {
                     };
                     if password.is_empty() {
                         self.has_saved_password = false;
-                        self.status = "保存的密码不可用，请重新输入".into();
+                        self.status = self.language.tr("保存的密码不可用，请重新输入").into();
                         return Task::none();
                     }
                     if self.remember_device {
@@ -580,7 +601,7 @@ impl ArdViewer {
             Message::ExportShortcuts => self.export_shortcuts(),
             Message::CopyPreset => {
                 self.key_profile = format!("{} 副本", self.key_profile.trim_end_matches(" 副本"));
-                self.status = "已复制按键预设".into();
+                self.status = self.language.tr("已复制按键预设").into();
                 self.persist_config();
             }
             Message::AddMapping => {
@@ -589,12 +610,12 @@ impl ArdViewer {
                     remote: "显示桌面".into(),
                     scope: "会话".into(),
                 });
-                self.status = "已添加常用映射".into();
+                self.status = self.language.tr("已添加常用映射").into();
             }
             Message::EditMapping(index) => {
                 if index < self.mappings.len() {
                     self.mappings.remove(index);
-                    self.status = "已移除按键映射".into();
+                    self.status = self.language.tr("已移除按键映射").into();
                 }
             }
             Message::SessionAction(SessionAction::Undo) => {
@@ -603,7 +624,7 @@ impl ArdViewer {
             }
             Message::SessionAction(SessionAction::Input) => {
                 self.touch_session_toolbar();
-                self.status = "远程键鼠输入已启用".into();
+                self.status = self.language.tr("远程键鼠输入已启用").into();
                 if let Some(id) = self.window_id(WindowKind::Session) {
                     return Task::batch([
                         window::gain_focus(id),
@@ -620,9 +641,9 @@ impl ArdViewer {
                 self.capture_system_shortcuts = !self.capture_system_shortcuts;
                 self.persist_config();
                 self.status = if self.capture_system_shortcuts {
-                    "系统快捷键将发送到远端".into()
+                    self.language.tr("系统快捷键将发送到远端").into()
                 } else {
-                    "系统快捷键保留在本机".into()
+                    self.language.tr("系统快捷键保留在本机").into()
                 };
             }
             Message::SessionToolbarTick(now) => {
@@ -730,7 +751,14 @@ impl ArdViewer {
                     && self.session_input.is_ready()
                     && let Err(error) = self.session_input.send_clipboard(&text)
                 {
-                    self.session_error = Some(format!("发送剪贴板失败：{error}"));
+                    self.session_error = Some(if self.language == Language::English {
+                        format!(
+                            "Failed to send clipboard contents: {}",
+                            self.language.tr(&error)
+                        )
+                    } else {
+                        format!("发送剪贴板失败：{error}")
+                    });
                 }
             }
             Message::ImeSinkChanged(value) => {
@@ -758,7 +786,7 @@ impl ArdViewer {
             WindowKind::Session => views::session(self, id),
         };
         if self.pending_close == Some(id) {
-            close_confirmation(content, kind, self.close_modal_progress)
+            close_confirmation(content, kind, self.close_modal_progress, self.language)
         } else {
             content
         }
@@ -902,11 +930,17 @@ impl ArdViewer {
             key_profile: self.key_profile.clone(),
             auto_adapt_keyboard: self.auto_adapt_keyboard,
             capture_system_shortcuts: self.capture_system_shortcuts,
+            reverse_scroll: self.reverse_scroll,
             show_performance_hud: self.show_performance_hud,
             theme: config::theme_to_cache(self.theme_preference).into(),
+            language: self.language.code().into(),
         };
         if let Err(error) = cached.save() {
-            self.status = format!("保存配置失败：{error}");
+            self.status = if self.language == Language::English {
+                format!("Failed to save configuration: {error}")
+            } else {
+                format!("保存配置失败：{error}")
+            };
         }
     }
 
@@ -919,7 +953,11 @@ impl ArdViewer {
             .remote_endpoint()
             .unwrap_or_else(|_| self.address.trim().to_owned());
         if let Err(error) = config::save_password(&address, &self.username, password) {
-            self.status = format!("系统密钥库不可用：{error}");
+            self.status = if self.language == Language::English {
+                format!("Credential vault unavailable: {error}")
+            } else {
+                format!("系统密钥库不可用：{error}")
+            };
         } else {
             self.has_saved_password = password.is_some();
         }
@@ -948,9 +986,15 @@ impl ArdViewer {
         }
         let removed_selected = index == self.selected_device;
         let removed = self.devices.remove(index);
-        if let Err(error) = config::save_password(&removed.address, &removed.username, None) {
-            self.status = format!("移除系统密钥库密码失败：{error}");
-        }
+        let credential_error = config::save_password(&removed.address, &removed.username, None)
+            .err()
+            .map(|error| {
+                if self.language == Language::English {
+                    format!("Failed to remove the saved password: {error}")
+                } else {
+                    format!("移除系统密钥库密码失败：{error}")
+                }
+            });
         if index < self.selected_device {
             self.selected_device -= 1;
         } else {
@@ -969,8 +1013,10 @@ impl ArdViewer {
         } else if removed_selected {
             self.select_device(self.selected_device);
         }
-        if !self.status.starts_with("移除系统密钥库密码失败") {
-            self.status = "已删除历史连接".into();
+        if let Some(error) = credential_error {
+            self.status = error;
+        } else {
+            self.status = self.language.tr("已删除历史连接").into();
         }
         self.persist_config();
     }
@@ -991,7 +1037,7 @@ impl ArdViewer {
             quality: self.quality,
             frame_interval: frame_duration_from_rate(&self.frame_rate),
         }));
-        self.status = "正在当前 Session 窗口中连接…".into();
+        self.status = self.language.tr("正在当前 Session 窗口中连接…").into();
     }
 
     fn upsert_history(&mut self, endpoint: &str) {
@@ -1036,7 +1082,7 @@ impl ArdViewer {
                 ) {
                     self.session_input.clear_input();
                 }
-                self.status = state.label();
+                self.status = state.label(self.language);
                 self.session_connection = state;
             }
             SessionEvent::Connected { server_name, input } => {
@@ -1050,7 +1096,11 @@ impl ArdViewer {
             }
             SessionEvent::Metrics(metrics) => self.session_metrics = metrics,
             SessionEvent::RenderFailed(error) => {
-                self.session_error = Some(format!("渲染失败：{error}"));
+                self.session_error = Some(if self.language == Language::English {
+                    format!("Rendering failed: {}", self.language.tr(&error))
+                } else {
+                    format!("渲染失败：{error}")
+                });
             }
         }
         Task::none()
@@ -1094,7 +1144,11 @@ impl ArdViewer {
             iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta })
                 if event_status == iced::event::Status::Ignored =>
             {
-                Some(InputEvent::Wheel(delta))
+                Some(InputEvent::Wheel(if self.reverse_scroll {
+                    reverse_scroll_delta(delta)
+                } else {
+                    delta
+                }))
             }
             iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
                 Some(InputEvent::ModifiersChanged(modifiers))
@@ -1149,7 +1203,11 @@ impl ArdViewer {
                 .session_input
                 .handle(event, self.capture_system_shortcuts)
         {
-            self.session_error = Some(format!("远程输入失败：{error}"));
+            self.session_error = Some(if self.language == Language::English {
+                format!("Remote input failed: {}", self.language.tr(&error))
+            } else {
+                format!("远程输入失败：{error}")
+            });
         }
         Task::none()
     }
@@ -1160,7 +1218,7 @@ impl ArdViewer {
 
     fn export_shortcuts(&mut self) {
         let Some(path) = config::export_path() else {
-            self.status = "无法确定导出目录".into();
+            self.status = self.language.tr("无法确定导出目录").into();
             return;
         };
         let mappings: Vec<_> = self.mappings.iter().map(|mapping| {
@@ -1177,7 +1235,11 @@ impl ArdViewer {
                 )
             });
         self.status = match result {
+            Ok(()) if self.language == Language::English => {
+                format!("Shortcuts exported to {}", path.display())
+            }
             Ok(()) => format!("快捷方式已导出到 {}", path.display()),
+            Err(error) if self.language == Language::English => format!("Export failed: {error}"),
             Err(error) => format!("导出失败：{error}"),
         };
     }
@@ -1278,12 +1340,15 @@ fn close_confirmation<'a>(
     content: Element<'a, Message>,
     kind: WindowKind,
     progress: f32,
+    language: Language,
 ) -> Element<'a, Message> {
     let (title, description) = match kind {
         WindowKind::Connection => ("退出 ARD Viewer？", "打开的设置和远程会话也会一并关闭。"),
         WindowKind::Settings => ("关闭设置窗口？", "确认关闭当前设置窗口。"),
         WindowKind::Session => ("关闭远程会话？", "当前远程连接将会断开。"),
     };
+    let title = language.tr(title);
+    let description = language.tr(description);
     let progress = smoothstep(0.0, 1.0, progress);
     let text_color = theme::mix(iced::Color::TRANSPARENT, theme::palette().text, progress);
     let muted_color = theme::mix(
@@ -1297,8 +1362,8 @@ fn close_confirmation<'a>(
             text(description).size(theme::BODY_SIZE).color(muted_color),
             row![
                 space().width(Fill),
-                widgets::secondary("取消", Message::CancelClose).width(88),
-                widgets::primary("关闭", Message::ConfirmClose).width(88),
+                widgets::secondary(language.tr("取消"), Message::CancelClose).width(88),
+                widgets::primary(language.tr("关闭"), Message::ConfirmClose).width(88),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
@@ -2046,6 +2111,19 @@ mod tests {
     }
 
     #[test]
+    fn language_can_be_changed_at_runtime() {
+        let (mut app, _task) = ArdViewer::new();
+        let _task = app.update(Message::LanguageChanged(Language::English));
+
+        assert_eq!(app.language, Language::English);
+        assert_eq!(app.language.tr("设置"), "Settings");
+        assert_eq!(
+            ConnectionState::Connecting.label(app.language),
+            "Connecting..."
+        );
+    }
+
+    #[test]
     fn session_connection_transitions_cover_disconnect_and_reconnect() {
         let (mut app, _task) = ArdViewer::new();
         let _ = app.handle_session_event(SessionEvent::State(ConnectionState::Connecting));
@@ -2123,6 +2201,10 @@ mod tests {
                 ),
             ] {
                 let mut ui = iced_test::Simulator::with_size(settings.clone(), size, view);
+                if name.starts_with("settings-dropdown") {
+                    ui.point_at(iced::Point::new(500.0, 138.0));
+                    let _ = ui.simulate(iced_test::simulator::click());
+                }
                 let snapshot = ui.snapshot(&theme::app_theme())?;
                 assert!(
                     snapshot

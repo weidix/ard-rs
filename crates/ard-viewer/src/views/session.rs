@@ -29,7 +29,11 @@ pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let detail = if app.username.trim().is_empty() {
         None
     } else {
-        Some(format!("用户 {}", app.username.trim()))
+        Some(if app.language == crate::i18n::Language::English {
+            format!("User {}", app.username.trim())
+        } else {
+            format!("用户 {}", app.username.trim())
+        })
     };
     let canvas = remote_canvas(
         app,
@@ -167,7 +171,7 @@ fn connection_progress(app: &ArdViewer) -> Element<'_, Message> {
     let label = app
         .session_error
         .clone()
-        .unwrap_or_else(|| app.session_connection.label());
+        .unwrap_or_else(|| app.session_connection.label(app.language));
     let active = matches!(
         app.session_connection,
         ConnectionState::Connecting | ConnectionState::Reconnecting { .. }

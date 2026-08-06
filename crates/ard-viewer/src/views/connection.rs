@@ -65,9 +65,9 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         };
         let selection = selection * selection * (3.0 - 2.0 * selection);
         let state = match device.state {
-            crate::state::DeviceState::Online => "可连接",
-            crate::state::DeviceState::Saved => "历史记录",
-            crate::state::DeviceState::RecentlyUsed => "最近连接",
+            crate::state::DeviceState::Online => app.language.tr("可连接"),
+            crate::state::DeviceState::Saved => app.language.tr("历史记录"),
+            crate::state::DeviceState::RecentlyUsed => app.language.tr("最近连接"),
         };
         let content = row![
             container(icon(Icon::Monitor, ICON_SIZE, theme::palette().text_warm))
@@ -113,10 +113,10 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let body = column![
         row![
             column![
-                text("历史连接")
+                text(app.language.tr("历史连接"))
                     .size(TITLE_SIZE)
                     .color(theme::palette().text),
-                text("选择记录可快速填写")
+                text(app.language.tr("选择记录可快速填写"))
                     .size(CAPTION_SIZE)
                     .color(theme::palette().text_muted)
             ]
@@ -128,7 +128,7 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         container(
             row![
                 icon(Icon::Search, 14.0, theme::palette().text_muted),
-                iced::widget::text_input("搜索历史连接", &app.search)
+                iced::widget::text_input(app.language.tr("搜索历史连接"), &app.search)
                     .on_input(Message::SearchChanged)
                     .padding([0, 0])
                     .size(BODY_SIZE)
@@ -149,16 +149,16 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
                 column![
                     icon(Icon::Monitor, 24.0, theme::palette().text_dim),
                     text(if app.devices.is_empty() {
-                        "暂无历史连接"
+                        app.language.tr("暂无历史连接")
                     } else {
-                        "未找到匹配记录"
+                        app.language.tr("未找到匹配记录")
                     })
                     .size(BODY_SIZE)
                     .color(theme::palette().text_muted),
                     text(if app.devices.is_empty() {
-                        "连接成功后会显示在这里"
+                        app.language.tr("连接成功后会显示在这里")
                     } else {
-                        "请尝试其他关键词"
+                        app.language.tr("请尝试其他关键词")
                     })
                     .size(CAPTION_SIZE)
                     .color(theme::palette().text_dim),
@@ -223,20 +223,30 @@ fn device_context_menu(app: &ArdViewer, index: usize) -> Element<'_, Message> {
                 .spacing(2),
             )
             .padding([5, 8]),
-            context_action(Icon::Monitor, "连接", Message::Connect, false),
+            context_action(
+                Icon::Monitor,
+                app.language.tr("连接"),
+                Message::Connect,
+                false
+            ),
             context_action(
                 Icon::Clipboard,
-                "复制地址",
+                app.language.tr("复制地址"),
                 Message::CopyDeviceAddress(index),
                 false,
             ),
             context_action(
                 Icon::User,
-                "复制用户名",
+                app.language.tr("复制用户名"),
                 Message::CopyDeviceUsername(index),
                 false,
             ),
-            context_action(Icon::Trash, "删除记录", Message::RemoveDevice(index), true),
+            context_action(
+                Icon::Trash,
+                app.language.tr("删除记录"),
+                Message::RemoveDevice(index),
+                true
+            ),
         ]
         .spacing(2),
     )
@@ -286,10 +296,10 @@ fn context_action<'a>(
 
 fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let heading = column![
-        text("连接到远程设备")
+        text(app.language.tr("连接到远程设备"))
             .size(TITLE_SIZE)
             .color(theme::palette().text),
-        text("输入远程地址和凭据，密码由系统安全存储。")
+        text(app.language.tr("输入远程地址和凭据，密码由系统安全存储。"))
             .size(CAPTION_SIZE)
             .color(theme::palette().text_muted),
     ]
@@ -297,7 +307,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
 
     let address = row![
         column![
-            text("远程地址")
+            text(app.language.tr("远程地址"))
                 .size(BODY_SIZE)
                 .color(theme::palette().text_muted),
             iced::widget::text_input("mac-studio.local", &app.address)
@@ -309,10 +319,10 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         .spacing(5)
         .width(Fill),
         column![
-            text("端口")
+            text(app.language.tr("端口"))
                 .size(BODY_SIZE)
                 .color(theme::palette().text_muted),
-            iced::widget::text_input("默认 5900", &app.port)
+            iced::widget::text_input(app.language.tr("默认 5900"), &app.port)
                 .on_input(Message::PortChanged)
                 .padding([10.0, CONTROL_PADDING_X])
                 .size(BODY_SIZE)
@@ -324,10 +334,10 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .spacing(14)
     .align_y(Alignment::End);
     let username = column![
-        text("用户名")
+        text(app.language.tr("用户名"))
             .size(BODY_SIZE)
             .color(theme::palette().text_muted),
-        iced::widget::text_input("远程账户名", &app.username)
+        iced::widget::text_input(app.language.tr("远程账户名"), &app.username)
             .on_input(Message::UsernameChanged)
             .padding([10.0, CONTROL_PADDING_X])
             .size(BODY_SIZE)
@@ -336,9 +346,9 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .spacing(5);
     let password_input: Element<'_, Message> = iced::widget::text_input(
         if app.has_saved_password {
-            "已安全保存"
+            app.language.tr("已安全保存")
         } else {
-            "输入远程密码"
+            app.language.tr("输入远程密码")
         },
         &app.password,
     )
@@ -351,7 +361,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .style(theme::inline_input)
     .into();
     let password = column![
-        text("密码")
+        text(app.language.tr("密码"))
             .size(BODY_SIZE)
             .color(theme::palette().text_muted),
         container(
@@ -390,13 +400,13 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .spacing(5);
     let remembers = row![
         checkbox(app.remember_password)
-            .label("记住密码")
+            .label(app.language.tr("记住密码"))
             .on_toggle(Message::RememberPasswordChanged)
             .size(16)
             .text_size(BODY_SIZE)
             .style(theme::checkbox),
         checkbox(app.remember_device)
-            .label("添加到历史连接")
+            .label(app.language.tr("添加到历史连接"))
             .on_toggle(Message::RememberDeviceChanged)
             .size(16)
             .text_size(BODY_SIZE)
@@ -404,12 +414,12 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     ]
     .spacing(18);
 
-    const QUALITIES: [&str; 5] = ["低画质", "中画质", "高画质", "自适应 MVS", "全画质"];
+    let qualities = ["低画质", "中画质", "高画质", "自适应 MVS", "全画质"];
     let advanced = container(
         column![
             row![
                 icon(Icon::Sliders, 14.0, theme::palette().text_muted),
-                text("连接参数")
+                text(app.language.tr("连接参数"))
                     .size(BODY_SIZE)
                     .color(theme::palette().text),
             ]
@@ -417,17 +427,19 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             .align_y(Alignment::Center),
             row![
                 column![
-                    text("视频质量")
+                    text(app.language.tr("视频质量"))
                         .size(CAPTION_SIZE)
                         .color(theme::palette().text_muted),
-                    pick_list(Some(app.quality.label()), QUALITIES, |value| {
-                        (*value).to_owned()
-                    })
+                    pick_list(
+                        Some(app.language.tr(app.quality.label())),
+                        qualities,
+                        |value| { app.language.tr(value).to_owned() }
+                    )
                     .on_select(|value| Message::QualityChanged(match value {
-                        "低画质" => ArdVideoQuality::Low,
-                        "中画质" => ArdVideoQuality::Medium,
-                        "高画质" => ArdVideoQuality::High,
-                        "全画质" => ArdVideoQuality::Full,
+                        "低画质" | "Low" => ArdVideoQuality::Low,
+                        "中画质" | "Medium" => ArdVideoQuality::Medium,
+                        "高画质" | "High" => ArdVideoQuality::High,
+                        "全画质" | "Full" => ArdVideoQuality::Full,
                         _ => ArdVideoQuality::Adaptive,
                     }))
                     .padding([9, 12])
@@ -438,10 +450,10 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
                 .spacing(5)
                 .width(Fill),
                 column![
-                    text("帧率 (FPS)")
+                    text(app.language.tr("帧率 (FPS)"))
                         .size(CAPTION_SIZE)
                         .color(theme::palette().text_muted),
-                    iced::widget::text_input("自动", &app.frame_rate)
+                    iced::widget::text_input(app.language.tr("自动"), &app.frame_rate)
                         .on_input(Message::FrameRateChanged)
                         .padding([10.0, CONTROL_PADDING_X])
                         .size(BODY_SIZE)
@@ -451,9 +463,12 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
                 .width(Fill),
             ]
             .spacing(12),
-            text("像素格式：服务器原生  ·  缩放：适应窗口  ·  自动重连：已启用")
-                .size(CAPTION_SIZE)
-                .color(theme::palette().text_muted),
+            text(
+                app.language
+                    .tr("像素格式：服务器原生  ·  缩放：适应窗口  ·  自动重连：已启用")
+            )
+            .size(CAPTION_SIZE)
+            .color(theme::palette().text_muted),
         ]
         .spacing(10),
     )
@@ -467,9 +482,12 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let security = container(
         row![
             icon(Icon::Shield, ICON_SIZE, theme::palette().text_warm),
-            text("密码使用应用本地加密凭据库保存，不写入明文配置文件。")
-                .size(CAPTION_SIZE)
-                .color(theme::palette().text_muted)
+            text(
+                app.language
+                    .tr("密码使用应用本地加密凭据库保存，不写入明文配置文件。")
+            )
+            .size(CAPTION_SIZE)
+            .color(theme::palette().text_muted)
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -485,14 +503,14 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     ));
 
     let actions = row![
-        secondary("导出快捷方式", Message::ExportShortcuts)
+        secondary(app.language.tr("导出快捷方式"), Message::ExportShortcuts)
             .width(132)
             .height(CONTROL_HEIGHT),
         space().width(Fill),
-        secondary("加入历史", Message::SaveDevice)
+        secondary(app.language.tr("加入历史"), Message::SaveDevice)
             .width(76)
             .height(CONTROL_HEIGHT),
-        primary("连接", Message::Connect)
+        primary(app.language.tr("连接"), Message::Connect)
             .width(88)
             .height(CONTROL_HEIGHT),
     ]

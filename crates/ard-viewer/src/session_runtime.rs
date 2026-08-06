@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::i18n::Language;
 use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdKey, ArdNamedKey,
     ArdVideoQuality, Framebuffer, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
@@ -54,16 +55,31 @@ pub enum ConnectionState {
 }
 
 impl ConnectionState {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Idle => "未连接".into(),
-            Self::Connecting => "正在连接…".into(),
-            Self::Connected => "已连接".into(),
-            Self::Reconnecting { attempt } => {
+    pub fn label(&self, language: Language) -> String {
+        match (language, self) {
+            (Language::English, Self::Idle) => "Not connected".into(),
+            (Language::English, Self::Connecting) => "Connecting...".into(),
+            (Language::English, Self::Connected) => "Connected".into(),
+            (Language::English, Self::Reconnecting { attempt }) => {
+                format!("Reconnecting ({attempt}/{MAX_RECONNECT_ATTEMPTS})...")
+            }
+            (Language::English, Self::Disconnected(error)) => {
+                format!("Disconnected: {}", language.tr(error))
+            }
+            (Language::English, Self::Failed(error)) => {
+                format!(
+                    "Connection or authentication failed: {}",
+                    language.tr(error)
+                )
+            }
+            (_, Self::Idle) => "未连接".into(),
+            (_, Self::Connecting) => "正在连接…".into(),
+            (_, Self::Connected) => "已连接".into(),
+            (_, Self::Reconnecting { attempt }) => {
                 format!("正在重连（{attempt}/{MAX_RECONNECT_ATTEMPTS}）…")
             }
-            Self::Disconnected(error) => format!("连接已断开：{error}"),
-            Self::Failed(error) => format!("连接或认证失败：{error}"),
+            (_, Self::Disconnected(error)) => format!("连接已断开：{error}"),
+            (_, Self::Failed(error)) => format!("连接或认证失败：{error}"),
         }
     }
 }
@@ -1318,6 +1334,14 @@ impl ScrollAccumulator {
         self.vertical = 0.0;
     }
 }
+
+pub fn reverse_scroll_delta(delta: ScrollDelta) -> ScrollDelta {
+    match delta {
+        ScrollDelta::Lines { x, y } => ScrollDelta::Lines { x: -x, y: -y },
+        ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels { x: -x, y: -y },
+    }
+}
+
 fn take_scroll(value: &mut f64) -> i32 {
     let clicks = value
         .trunc()
@@ -1643,16 +1667,31 @@ mod tests {
 
     #[test]
     fn connection_states_have_real_labels() {
-        assert_eq!(ConnectionState::Connecting.label(), "正在连接…");
+        assert_eq!(
+            ConnectionState::Connecting.label(Language::SimplifiedChinese),
+            "正在连接…"
+        );
         assert!(
             ConnectionState::Reconnecting { attempt: 2 }
-                .label()
+                .label(Language::SimplifiedChinese)
                 .contains("2/5")
         );
         assert!(
             ConnectionState::Disconnected("timeout".into())
-                .label()
+                .label(Language::SimplifiedChinese)
                 .contains("timeout")
+        );
+    }
+
+    #[test]
+    fn scroll_direction_can_be_reversed_on_both_axes() {
+        assert_eq!(
+            reverse_scroll_delta(ScrollDelta::Lines { x: 2.0, y: -3.0 }),
+            ScrollDelta::Lines { x: -2.0, y: 3.0 }
+        );
+        assert_eq!(
+            reverse_scroll_delta(ScrollDelta::Pixels { x: -4.0, y: 5.0 }),
+            ScrollDelta::Pixels { x: 4.0, y: -5.0 }
         );
     }
 

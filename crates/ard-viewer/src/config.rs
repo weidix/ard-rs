@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
 use sha2::{Digest, Sha256};
 
+use crate::i18n::Language;
 use crate::state::{DeviceState, SavedDevice, ThemePreference};
 
 #[cfg(not(test))]
@@ -51,8 +52,10 @@ pub struct AppConfig {
     pub key_profile: String,
     pub auto_adapt_keyboard: bool,
     pub capture_system_shortcuts: bool,
+    pub reverse_scroll: bool,
     pub show_performance_hud: bool,
     pub theme: String,
+    pub language: String,
 }
 
 impl Default for AppConfig {
@@ -69,8 +72,10 @@ impl Default for AppConfig {
             key_profile: "macOS 默认".into(),
             auto_adapt_keyboard: true,
             capture_system_shortcuts: false,
+            reverse_scroll: false,
             show_performance_hud: true,
             theme: "system".into(),
+            language: "zh-CN".into(),
         }
     }
 }
@@ -287,4 +292,8 @@ pub fn theme_to_cache(value: ThemePreference) -> &'static str {
         ThemePreference::Light => "light",
         ThemePreference::Dark => "dark",
     }
+}
+
+pub fn language_from_cache(value: &str) -> Language {
+    Language::from_code(value)
 }

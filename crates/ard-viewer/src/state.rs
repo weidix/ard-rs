@@ -1,6 +1,6 @@
-use iced::Size;
-
+use crate::i18n::Language;
 use crate::icons::Icon;
+use iced::Size;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemePreference {
@@ -12,18 +12,12 @@ pub enum ThemePreference {
 impl ThemePreference {
     pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
 
-    pub fn label(self) -> &'static str {
-        match self {
+    pub fn label(self, language: Language) -> &'static str {
+        language.tr(match self {
             Self::System => "跟随系统",
             Self::Light => "浅色",
             Self::Dark => "深色",
-        }
-    }
-}
-
-impl std::fmt::Display for ThemePreference {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.label())
+        })
     }
 }
 
@@ -77,14 +71,14 @@ impl SettingsSection {
         Self::Security,
         Self::About,
     ];
-    pub fn label(self) -> &'static str {
-        match self {
+    pub fn label(self, language: Language) -> &'static str {
+        language.tr(match self {
             Self::General => "常规",
             Self::Display => "显示与性能",
             Self::KeyMapping => "按键映射",
             Self::Security => "安全",
             Self::About => "关于",
-        }
+        })
     }
     pub fn icon(self) -> Icon {
         match self {
