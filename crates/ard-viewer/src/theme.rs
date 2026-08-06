@@ -194,9 +194,17 @@ pub fn toolbar_foreground(is_dark: bool) -> Color {
 
 fn toolbar_glass_color(is_dark: bool) -> Color {
     if is_dark {
-        Color::from_rgba8(18, 18, 20, 0.94)
+        Color::from_rgba8(18, 18, 20, 1.0)
     } else {
-        Color::from_rgba8(250, 250, 252, 0.95)
+        Color::from_rgba8(250, 250, 252, 1.0)
+    }
+}
+
+fn toolbar_border_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_rgba8(255, 255, 255, 0.26)
+    } else {
+        Color::from_rgba8(0, 0, 0, 0.22)
     }
 }
 
@@ -208,11 +216,7 @@ pub fn toolbar_glass(
         background: Some(Background::Color(toolbar_glass_color(is_dark))),
         text_color: Some(toolbar_foreground(is_dark)),
         border: Border {
-            color: if is_dark {
-                Color::from_rgba8(255, 255, 255, 0.26)
-            } else {
-                Color::from_rgba8(0, 0, 0, 0.22)
-            },
+            color: toolbar_border_color(is_dark),
             width: 1.0,
             radius,
         },
@@ -280,16 +284,49 @@ pub fn toolbar_handle(is_dark: bool) -> impl Fn(&Theme, button::Status) -> butto
             background: Some(Background::Color(background)),
             text_color: toolbar_foreground(is_dark),
             border: Border {
-                color: if is_dark {
-                    Color::from_rgba8(255, 255, 255, 0.26)
-                } else {
-                    Color::from_rgba8(0, 0, 0, 0.22)
-                },
+                color: toolbar_border_color(is_dark),
                 width: 1.0,
                 radius: border::bottom(7),
             },
             ..button::Style::default()
         }
+    }
+}
+
+pub fn toolbar_embedded_handle(
+    is_dark: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |_, status| {
+        let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+            if is_dark {
+                Color::from_rgba8(38, 38, 37, 0.84)
+            } else {
+                Color::from_rgba8(222, 222, 219, 0.88)
+            }
+        } else {
+            toolbar_glass_color(is_dark)
+        };
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: toolbar_foreground(is_dark),
+            border: Border {
+                radius: border::bottom(6),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+pub fn toolbar_handle_shell(is_dark: bool) -> impl Fn(&Theme) -> container::Style + Copy {
+    move |_| container::Style {
+        background: Some(Background::Color(toolbar_border_color(is_dark))),
+        border: Border {
+            radius: border::bottom(7),
+            ..Border::default()
+        },
+        snap: true,
+        ..container::Style::default()
     }
 }
 

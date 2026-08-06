@@ -3,7 +3,7 @@ use std::f32::consts::TAU;
 use iced::widget::{
     button, column, container, mouse_area, progress_bar, row, space, stack, text, text_input,
 };
-use iced::{Alignment, Element, Fill, window};
+use iced::{Alignment, Element, Fill, Padding, window};
 
 use crate::icons::{Icon, icon};
 use crate::session_renderer;
@@ -14,15 +14,10 @@ use crate::{
     ArdViewer, Message, SESSION_TOOLBAR_COLLAPSED_WIDTH, SESSION_TOOLBAR_WIDTH, SessionAction,
 };
 
-pub(crate) const SESSION_TITLEBAR_HEIGHT: f32 = 32.0;
+pub(crate) const SESSION_TITLEBAR_HEIGHT: f32 = 50.0;
 
 pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.session_fullscreen || app.is_window_maximized(window_id);
-    let toolbar_top_padding = if app.session_fullscreen {
-        0.0
-    } else {
-        SESSION_TITLEBAR_HEIGHT
-    };
     let endpoint = app
         .remote_endpoint()
         .unwrap_or_else(|_| app.address.trim().to_owned());
@@ -35,27 +30,27 @@ pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
             format!("用户 {}", app.username.trim())
         })
     };
-    let canvas = remote_canvas(
-        app,
-        maximized,
-        app.effective_dark(),
-        app.session_toolbar_x,
-        app.session_toolbar_window_width,
-        toolbar_top_padding,
-    );
+    let canvas = remote_canvas(app, maximized, app.effective_dark(), app.session_fullscreen);
     if app.session_fullscreen {
         canvas
     } else {
-        stack![
-            canvas,
-            container(window_chrome_with_title(
-                window_id,
-                SESSION_TITLEBAR_HEIGHT,
-                endpoint,
-                detail,
-            ))
-            .id("session-window-chrome"),
+        let titlebar = stack![
+            container(space())
+                .width(Fill)
+                .height(SESSION_TITLEBAR_HEIGHT)
+                .style(theme::panel(theme::palette().surface)),
+            window_chrome_with_title(window_id, SESSION_TITLEBAR_HEIGHT, endpoint, detail,),
+            session_toolbar(app, app.effective_dark()),
         ]
+        .height(SESSION_TITLEBAR_HEIGHT);
+        column![
+            container(titlebar)
+                .id("session-window-chrome")
+                .width(Fill)
+                .height(SESSION_TITLEBAR_HEIGHT),
+            canvas,
+        ]
+        .spacing(0)
         .width(Fill)
         .height(Fill)
         .into()
@@ -66,9 +61,7 @@ fn remote_canvas(
     app: &ArdViewer,
     maximized: bool,
     is_dark: bool,
-    toolbar_x: Option<f32>,
-    window_width: f32,
-    toolbar_top_padding: f32,
+    show_toolbar: bool,
 ) -> Element<'_, Message> {
     let desktop: Element<'_, Message> = if let Some(runtime) = &app.session_runtime {
         container(session_renderer::remote_display(
@@ -88,6 +81,7 @@ fn remote_canvas(
             .into()
     };
     let base = container(desktop)
+        .id("session-remote-canvas")
         .width(Fill)
         .height(Fill)
         .style(theme::shaped_panel(
@@ -99,6 +93,36 @@ fn remote_canvas(
             },
         ));
 
+    let progress = connection_progress(app);
+
+    let ime_sink = container(
+        text_input("", &app.ime_sink)
+            .id(iced::widget::Id::new(crate::SESSION_IME_ID))
+            .on_input(Message::ImeSinkChanged)
+            .size(1)
+            .padding(0)
+            .width(1),
+    )
+    .width(1)
+    .height(1)
+    .clip(true);
+
+    if show_toolbar {
+        stack![base, session_toolbar(app, is_dark), progress, ime_sink]
+            .width(Fill)
+            .height(Fill)
+            .clip(true)
+            .into()
+    } else {
+        stack![base, progress, ime_sink]
+            .width(Fill)
+            .height(Fill)
+            .clip(true)
+            .into()
+    }
+}
+
+fn session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {
     let toolbar_progress = app.session_toolbar_progress
         * app.session_toolbar_progress
         * (3.0 - 2.0 * app.session_toolbar_progress);
@@ -121,9 +145,11 @@ fn remote_canvas(
         SESSION_TOOLBAR_COLLAPSED_WIDTH
     };
     let toolbar = container(toolbar).width(toolbar_width);
-    let positioned: Element<'static, Message> = if let Some(center_x) = toolbar_x {
-        let left =
-            (center_x - toolbar_width / 2.0).clamp(0.0, (window_width - toolbar_width).max(0.0));
+    let positioned: Element<'static, Message> = if let Some(center_x) = app.session_toolbar_x {
+        let left = (center_x - toolbar_width / 2.0).clamp(
+            0.0,
+            (app.session_toolbar_window_width - toolbar_width).max(0.0),
+        );
         row![space().width(left), toolbar, space().width(Fill)]
             .width(Fill)
             .align_y(Alignment::Start)
@@ -138,30 +164,11 @@ fn remote_canvas(
         container(positioned)
             .width(Fill)
             .height(Fill)
-            .padding([toolbar_top_padding, 0.0])
             .align_y(Alignment::Start),
     )
     .on_move(Message::SessionToolbarPointerMoved)
     .on_release(Message::SessionToolbarDragEnded);
-    let progress = connection_progress(app);
-
-    let ime_sink = container(
-        text_input("", &app.ime_sink)
-            .id(iced::widget::Id::new(crate::SESSION_IME_ID))
-            .on_input(Message::ImeSinkChanged)
-            .size(1)
-            .padding(0)
-            .width(1),
-    )
-    .width(1)
-    .height(1)
-    .clip(true);
-
-    stack![base, controls, progress, ime_sink]
-        .width(Fill)
-        .height(Fill)
-        .clip(true)
-        .into()
+    container(controls).width(Fill).height(Fill).into()
 }
 
 fn connection_progress(app: &ArdViewer) -> Element<'_, Message> {
@@ -200,37 +207,38 @@ fn connection_progress(app: &ArdViewer) -> Element<'_, Message> {
 fn control_bar(pinned: bool, is_dark: bool) -> Element<'static, Message> {
     let action_button =
         |kind, action| toolbar_button(kind, false, Message::SessionAction(action), is_dark);
-    let controls = container(
-        row![
-            toolbar_drag_handle(is_dark),
-            action_button(Icon::Scan, SessionAction::Fit),
-            action_button(Icon::ZoomIn, SessionAction::Zoom),
-            action_button(Icon::Pointer, SessionAction::Input),
-            action_button(Icon::Keyboard, SessionAction::SystemShortcut),
-            action_button(Icon::Clipboard, SessionAction::Clipboard),
-            action_button(Icon::Undo, SessionAction::Undo),
-            toolbar_button(Icon::Pin, pinned, Message::ToggleSessionToolbarPin, is_dark,),
-            toolbar_button(Icon::Fullscreen, false, Message::ToggleFullscreen, is_dark,),
-        ]
-        .spacing(2)
-        .align_y(Alignment::Center),
-    )
-    .padding([3, 4])
-    .style(theme::toolbar_glass(is_dark, 0.0.into()));
-
-    column![
-        controls,
-        container(toolbar_handle(
-            Icon::ChevronUp,
-            Message::HideSessionToolbar,
-            is_dark,
-        ))
-        .width(Fill)
-        .center_x(Fill),
+    let controls = row![
+        toolbar_drag_handle(is_dark),
+        action_button(Icon::Scan, SessionAction::Fit),
+        action_button(Icon::ZoomIn, SessionAction::Zoom),
+        action_button(Icon::Pointer, SessionAction::Input),
+        action_button(Icon::Keyboard, SessionAction::SystemShortcut),
+        action_button(Icon::Clipboard, SessionAction::Clipboard),
+        action_button(Icon::Undo, SessionAction::Undo),
+        toolbar_button(Icon::Fullscreen, false, Message::ToggleFullscreen, is_dark,),
+        toolbar_button(Icon::Pin, pinned, Message::ToggleSessionToolbarPin, is_dark,),
     ]
-    .spacing(0)
-    .align_x(Alignment::Center)
-    .into()
+    .spacing(2)
+    .align_y(Alignment::Center);
+
+    let controls = container(controls)
+        .padding([3, 4])
+        .style(theme::toolbar_glass(is_dark, 8.0.into()));
+    let handle = container(embedded_toolbar_handle(is_dark))
+        .width(SESSION_TOOLBAR_COLLAPSED_WIDTH)
+        .height(14)
+        .padding(Padding {
+            top: 0.0,
+            right: 1.0,
+            bottom: 1.0,
+            left: 1.0,
+        })
+        .style(theme::toolbar_handle_shell(is_dark));
+
+    column![controls, handle]
+        .spacing(-1.0)
+        .align_x(Alignment::Center)
+        .into()
 }
 
 fn toolbar_drag_handle(is_dark: bool) -> Element<'static, Message> {
@@ -291,4 +299,24 @@ fn toolbar_handle(
     .padding(0)
     .style(theme::toolbar_handle(is_dark))
     .on_press(message)
+}
+
+fn embedded_toolbar_handle(is_dark: bool) -> iced::widget::Button<'static, Message> {
+    button(
+        container(icon(
+            Icon::ChevronUp,
+            12.0,
+            theme::toolbar_foreground(is_dark),
+        ))
+        .id("session-toolbar-collapse-handle")
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill),
+    )
+    .width(Fill)
+    .height(Fill)
+    .padding(0)
+    .style(theme::toolbar_embedded_handle(is_dark))
+    .on_press(Message::HideSessionToolbar)
 }

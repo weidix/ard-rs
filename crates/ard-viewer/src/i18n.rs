@@ -136,11 +136,11 @@ impl Language {
                 "Supports ARD authentication, encrypted transport, MVS GPU decoding, keyboard and mouse input, clipboard sync, and automatic reconnection."
             }
             "许可证：MIT OR Apache-2.0" => "License: MIT OR Apache-2.0",
-            "低画质" | "低" => "Low",
-            "中画质" | "中" => "Medium",
-            "高画质" | "高" => "High",
+            "黑白" => "Black & White",
+            "灰度" => "Grayscale",
+            "16位颜色" => "16-bit Color",
             "自适应 MVS" | "自适应" => "Adaptive",
-            "全画质" | "完整" => "Full",
+            "全色" => "Full Color",
             "跟随系统" => "System",
             "浅色" => "Light",
             "深色" => "Dark",

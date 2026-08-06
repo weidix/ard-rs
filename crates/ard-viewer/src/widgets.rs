@@ -281,10 +281,10 @@ pub fn quality_dropdown_sections(
         DropdownSection::new(
             Some("Zlib"),
             vec![
+                option(ArdVideoQuality::Full, "quality-option-full"),
                 option(ArdVideoQuality::Low, "quality-option-low"),
                 option(ArdVideoQuality::Medium, "quality-option-medium"),
                 option(ArdVideoQuality::High, "quality-option-high"),
-                option(ArdVideoQuality::Full, "quality-option-full"),
             ],
         ),
         DropdownSection::new(

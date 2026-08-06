@@ -111,11 +111,11 @@ impl ArdVideoQuality {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Low => "低画质",
-            Self::Medium => "中画质",
-            Self::High => "高画质",
+            Self::Low => "黑白",
+            Self::Medium => "灰度",
+            Self::High => "16位颜色",
             Self::Adaptive => "自适应 MVS",
-            Self::Full => "全画质",
+            Self::Full => "全色",
         }
     }
 }

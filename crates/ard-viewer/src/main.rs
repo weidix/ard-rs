@@ -585,7 +585,12 @@ impl ArdViewer {
                     } else {
                         window::Mode::Windowed
                     };
-                    return window::set_mode(id, mode);
+                    let level = if self.session_fullscreen {
+                        window::Level::AlwaysOnTop
+                    } else {
+                        window::Level::Normal
+                    };
+                    return Task::batch([window::set_mode(id, mode), window::set_level(id, level)]);
                 }
             }
             Message::SessionAction(SessionAction::Fit) => {
@@ -1250,7 +1255,17 @@ impl ArdViewer {
     }
 
     fn session_canvas_bounds(&self) -> iced::Rectangle {
-        iced::Rectangle::new(iced::Point::ORIGIN, self.session_window_size)
+        if self.session_fullscreen {
+            iced::Rectangle::new(iced::Point::ORIGIN, self.session_window_size)
+        } else {
+            iced::Rectangle::new(
+                iced::Point::new(0.0, views::SESSION_TITLEBAR_HEIGHT),
+                iced::Size::new(
+                    self.session_window_size.width,
+                    (self.session_window_size.height - views::SESSION_TITLEBAR_HEIGHT).max(0.0),
+                ),
+            )
+        }
     }
 
     fn export_shortcuts(&mut self) {
@@ -1758,6 +1773,18 @@ mod tests {
         app.session_window_size = iced::Size::new(1440.0, 900.0);
         assert_eq!(
             app.session_canvas_bounds(),
+            iced::Rectangle::new(
+                iced::Point::new(0.0, views::SESSION_TITLEBAR_HEIGHT),
+                iced::Size::new(
+                    app.session_window_size.width,
+                    app.session_window_size.height - views::SESSION_TITLEBAR_HEIGHT,
+                ),
+            )
+        );
+
+        app.session_fullscreen = true;
+        assert_eq!(
+            app.session_canvas_bounds(),
             iced::Rectangle::new(iced::Point::ORIGIN, app.session_window_size)
         );
     }
@@ -1779,7 +1806,9 @@ mod tests {
             .expect("connection progress should be visible");
 
         assert!((bounds.center_x() - size.width / 2.0).abs() < 1.0);
-        assert!((bounds.center_y() - size.height / 2.0).abs() < 1.0);
+        assert!(
+            (bounds.center_y() - (size.height + views::SESSION_TITLEBAR_HEIGHT) / 2.0).abs() < 1.0
+        );
     }
 
     #[test]
@@ -2056,8 +2085,8 @@ mod tests {
             (collapse_x - expand_x).abs() < f32::EPSILON,
             "collapse: {collapse_x}, expand: {expand_x}"
         );
-        assert!(collapse_bounds.y >= views::SESSION_TITLEBAR_HEIGHT);
-        assert!(expand_bounds.y >= views::SESSION_TITLEBAR_HEIGHT);
+        assert!(collapse_bounds.y < views::SESSION_TITLEBAR_HEIGHT);
+        assert!(expand_bounds.y < views::SESSION_TITLEBAR_HEIGHT);
     }
 
     #[test]
@@ -2092,6 +2121,25 @@ mod tests {
             .visible_bounds()
             .expect("fullscreen toolbar should be visible");
         assert!(toolbar.y < views::SESSION_TITLEBAR_HEIGHT + 50.0);
+    }
+
+    #[test]
+    fn windowed_session_reserves_the_titlebar_above_the_remote_canvas() {
+        let (app, _task) = ArdViewer::new();
+        let size = WindowKind::Session.size();
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            size,
+            views::session(&app, window::Id::unique()),
+        );
+        let canvas = ui
+            .find(iced::widget::Id::new("session-remote-canvas"))
+            .expect("remote canvas should be present")
+            .visible_bounds()
+            .expect("remote canvas should be visible");
+
+        assert_eq!(canvas.y, views::SESSION_TITLEBAR_HEIGHT);
+        assert_eq!(canvas.height, size.height - views::SESSION_TITLEBAR_HEIGHT);
     }
 
     #[test]
@@ -2172,6 +2220,15 @@ mod tests {
     #[test]
     fn grouped_quality_menu_selects_a_zlib_profile() {
         let (mut app, _task) = ArdViewer::new();
+        let sections =
+            widgets::quality_dropdown_sections(Language::SimplifiedChinese, ArdVideoQuality::Full);
+        let zlib_labels = sections[0]
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(zlib_labels, ["全色", "黑白", "灰度", "16位颜色"]);
+
         app.open_dropdown = Some(DropdownMenu::ConnectionQuality);
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
