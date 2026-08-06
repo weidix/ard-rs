@@ -224,36 +224,58 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             .style(theme::input),
     ]
     .spacing(5);
+    let password_input: Element<'_, Message> = iced::widget::text_input(
+        if app.has_saved_password {
+            "已安全保存"
+        } else {
+            "输入远程密码"
+        },
+        &app.password,
+    )
+    .id("password-input")
+    .on_input(Message::PasswordChanged)
+    .secure(!app.password_visible)
+    .padding([10.0, CONTROL_PADDING_X])
+    .size(BODY_SIZE)
+    .width(Fill)
+    .style(theme::inline_input)
+    .into();
     let password = column![
         text("密码")
             .size(BODY_SIZE)
             .color(theme::palette().text_muted),
-        row![
-            iced::widget::text_input(
-                if app.has_saved_password {
-                    "已安全保存"
-                } else {
-                    "输入远程密码"
-                },
-                &app.password,
-            )
-            .on_input(Message::PasswordChanged)
-            .secure(!app.password_visible)
-            .padding([10.0, CONTROL_PADDING_X])
-            .size(BODY_SIZE)
-            .width(Fill)
-            .style(theme::input),
-            icon_button(
-                if app.password_visible {
-                    Icon::EyeOff
-                } else {
-                    Icon::Eye
-                },
-                Message::TogglePasswordVisibility,
-            ),
-        ]
+        container(
+            row![
+                password_input,
+                button(
+                    container(icon(
+                        if app.password_visible {
+                            Icon::EyeOff
+                        } else {
+                            Icon::Eye
+                        },
+                        ICON_SIZE,
+                        theme::palette().text_muted,
+                    ))
+                    .width(Fill)
+                    .height(Fill)
+                    .center(Fill),
+                )
+                .width(CONTROL_HEIGHT)
+                .height(CONTROL_HEIGHT)
+                .padding(0)
+                .style(theme::password_reveal_button)
+                .on_press(Message::TogglePasswordVisibility),
+            ]
+            .height(CONTROL_HEIGHT)
+            .align_y(Alignment::Center),
+        )
         .height(CONTROL_HEIGHT)
-        .align_y(Alignment::Center),
+        .width(Fill)
+        .style(theme::shaped_panel(
+            theme::palette().surface_active,
+            CONTROL_RADIUS.into(),
+        )),
     ]
     .spacing(5);
     let remembers = row![

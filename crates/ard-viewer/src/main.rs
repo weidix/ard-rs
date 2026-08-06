@@ -1425,6 +1425,77 @@ mod tests {
     }
 
     #[test]
+    fn password_visibility_can_be_toggled() {
+        let (mut app, _task) = ArdViewer::new();
+        app.password = "top-secret".into();
+        assert!(!app.password_visible);
+        let _task = app.update(Message::TogglePasswordVisibility);
+        assert!(app.password_visible);
+        let _task = app.update(Message::TogglePasswordVisibility);
+        assert!(!app.password_visible);
+    }
+
+    #[test]
+    fn password_input_supports_select_all_shortcut() {
+        let (mut app, _task) = ArdViewer::new();
+        app.password = "top-secret".into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Connection.size(),
+            views::connection(&app, window::Id::unique()),
+        );
+
+        ui.click(iced::widget::Id::new("password-input"))
+            .expect("password input should be clickable");
+        ui.simulate([iced::Event::Keyboard(
+            iced::keyboard::Event::ModifiersChanged(iced::keyboard::Modifiers::COMMAND),
+        )]);
+        ui.tap_key(iced::keyboard::Key::Character("a".into()));
+        ui.typewrite("x");
+
+        assert!(
+            ui.into_messages()
+                .any(|message| matches!(message, Message::PasswordChanged(value) if value == "x"))
+        );
+    }
+
+    #[test]
+    fn password_input_supports_mouse_drag_selection() {
+        let (mut app, _task) = ArdViewer::new();
+        app.password = "top-secret".into();
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Connection.size(),
+            views::connection(&app, window::Id::unique()),
+        );
+        let bounds = ui
+            .find(iced::widget::Id::new("password-input"))
+            .expect("password input should be present")
+            .visible_bounds()
+            .expect("password input should be visible");
+        let start = iced::Point::new(bounds.x + 13.0, bounds.center_y());
+        let end = iced::Point::new(bounds.x + bounds.width - 13.0, bounds.center_y());
+
+        ui.point_at(start);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+            iced::mouse::Button::Left,
+        ))]);
+        ui.point_at(end);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: end,
+        })]);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+            iced::mouse::Button::Left,
+        ))]);
+        ui.typewrite("x");
+
+        assert!(
+            ui.into_messages()
+                .any(|message| matches!(message, Message::PasswordChanged(value) if value == "x"))
+        );
+    }
+
+    #[test]
     fn endpoint_uses_the_separate_port_and_supports_pasted_addresses() {
         let (mut app, _task) = ArdViewer::new();
         app.address = "host.local".into();
@@ -1615,12 +1686,12 @@ mod tests {
             WindowKind::Session.size(),
             views::session(&app, window_id),
         );
-        let collapse_x = expanded
+        let collapse_bounds = expanded
             .find(iced::widget::Id::new("session-toolbar-collapse-handle"))
             .expect("collapse handle should be present")
             .visible_bounds()
-            .expect("collapse handle should be visible")
-            .center_x();
+            .expect("collapse handle should be visible");
+        let collapse_x = collapse_bounds.center_x();
         drop(expanded);
 
         app.session_toolbar_visible = false;
@@ -1630,17 +1701,19 @@ mod tests {
             WindowKind::Session.size(),
             views::session(&app, window_id),
         );
-        let expand_x = collapsed
+        let expand_bounds = collapsed
             .find(iced::widget::Id::new("session-toolbar-expand-handle"))
             .expect("expand handle should be present")
             .visible_bounds()
-            .expect("expand handle should be visible")
-            .center_x();
+            .expect("expand handle should be visible");
+        let expand_x = expand_bounds.center_x();
 
         assert!(
             (collapse_x - expand_x).abs() < f32::EPSILON,
             "collapse: {collapse_x}, expand: {expand_x}"
         );
+        assert!(collapse_bounds.y >= views::SESSION_TITLEBAR_HEIGHT);
+        assert!(expand_bounds.y >= views::SESSION_TITLEBAR_HEIGHT);
     }
 
     #[test]

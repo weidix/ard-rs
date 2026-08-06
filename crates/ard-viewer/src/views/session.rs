@@ -14,6 +14,8 @@ use crate::{
     ArdViewer, Message, SESSION_TOOLBAR_COLLAPSED_WIDTH, SESSION_TOOLBAR_WIDTH, SessionAction,
 };
 
+pub(crate) const SESSION_TITLEBAR_HEIGHT: f32 = 32.0;
+
 pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.session_fullscreen || app.is_window_maximized(window_id);
     let endpoint = app
@@ -32,7 +34,7 @@ pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
             app.session_toolbar_x,
             app.session_toolbar_window_width,
         ),
-        window_chrome_with_title(window_id, 32.0, endpoint, detail),
+        window_chrome_with_title(window_id, SESSION_TITLEBAR_HEIGHT, endpoint, detail),
     ]
     .width(Fill)
     .height(Fill)
@@ -113,6 +115,7 @@ fn remote_canvas(
         container(positioned)
             .width(Fill)
             .height(Fill)
+            .padding([SESSION_TITLEBAR_HEIGHT, 0.0])
             .align_y(Alignment::Start),
     )
     .on_move(Message::SessionToolbarPointerMoved)

@@ -29,7 +29,7 @@ const DARK: Palette = Palette {
     surface: Color::from_rgb8(16, 16, 16),
     surface_active: Color::from_rgb8(28, 28, 28),
     border: Color::from_rgb8(61, 61, 61),
-    text: Color::from_rgb8(243, 221, 221),
+    text: Color::from_rgb8(251, 251, 254),
     primary: Color::from_rgb8(224, 224, 224),
     text_muted: Color::from_rgb8(150, 150, 150),
     text_dim: Color::from_rgb8(91, 91, 91),
@@ -187,15 +187,18 @@ pub fn modal_panel(progress: f32) -> impl Fn(&Theme) -> container::Style + Copy 
 }
 
 pub fn toolbar_foreground(is_dark: bool) -> Color {
-    let _ = is_dark;
-    palette().primary
+    if is_dark {
+        palette().text
+    } else {
+        palette().primary
+    }
 }
 
 fn toolbar_glass_color(is_dark: bool) -> Color {
     if is_dark {
-        Color::from_rgba8(24, 24, 23, 0.76)
+        Color::from_rgba8(18, 18, 20, 0.94)
     } else {
-        Color::from_rgba8(238, 238, 235, 0.82)
+        Color::from_rgba8(250, 250, 252, 0.95)
     }
 }
 
@@ -207,13 +210,18 @@ pub fn toolbar_glass(
         background: Some(Background::Color(toolbar_glass_color(is_dark))),
         text_color: Some(toolbar_foreground(is_dark)),
         border: Border {
+            color: if is_dark {
+                Color::from_rgba8(255, 255, 255, 0.26)
+            } else {
+                Color::from_rgba8(0, 0, 0, 0.22)
+            },
+            width: 1.0,
             radius,
-            ..Border::default()
         },
         shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, if is_dark { 0.26 } else { 0.12 }),
-            offset: iced::Vector::new(0.0, 3.0),
-            blur_radius: 12.0,
+            color: Color::from_rgba(0.0, 0.0, 0.0, if is_dark { 0.52 } else { 0.24 }),
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 16.0,
         },
         snap: true,
     }
@@ -226,12 +234,12 @@ pub fn toolbar_glass_button(
     move |_, status| {
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
         let alpha = match (selected, hovered, is_dark) {
-            (true, true, true) => 0.22,
-            (true, _, true) => 0.16,
-            (false, true, true) => 0.11,
-            (true, true, false) => 0.17,
-            (true, _, false) => 0.12,
-            (false, true, false) => 0.08,
+            (true, true, true) => 0.30,
+            (true, _, true) => 0.23,
+            (false, true, true) => 0.17,
+            (true, true, false) => 0.20,
+            (true, _, false) => 0.15,
+            (false, true, false) => 0.11,
             _ => 0.0,
         };
         button::Style {
@@ -242,8 +250,17 @@ pub fn toolbar_glass_button(
             })),
             text_color: toolbar_foreground(is_dark),
             border: Border {
+                color: if selected {
+                    if is_dark {
+                        Color::from_rgba8(255, 255, 255, 0.20)
+                    } else {
+                        Color::from_rgba8(0, 0, 0, 0.16)
+                    }
+                } else {
+                    Color::TRANSPARENT
+                },
+                width: if selected { 1.0 } else { 0.0 },
                 radius: 6.0.into(),
-                ..Border::default()
             },
             ..button::Style::default()
         }
@@ -265,8 +282,13 @@ pub fn toolbar_handle(is_dark: bool) -> impl Fn(&Theme, button::Status) -> butto
             background: Some(Background::Color(background)),
             text_color: toolbar_foreground(is_dark),
             border: Border {
+                color: if is_dark {
+                    Color::from_rgba8(255, 255, 255, 0.26)
+                } else {
+                    Color::from_rgba8(0, 0, 0, 0.22)
+                },
+                width: 1.0,
                 radius: border::bottom(7),
-                ..Border::default()
             },
             ..button::Style::default()
         }
@@ -284,6 +306,31 @@ pub fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
         text_color: palette().text,
         border: Border {
             radius: CONTROL_RADIUS.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+pub fn password_reveal_button(_: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered => Some(Background::Color(mix(
+            palette().surface_active,
+            palette().text,
+            0.08,
+        ))),
+        button::Status::Pressed => Some(Background::Color(mix(
+            palette().surface_active,
+            palette().text,
+            0.14,
+        ))),
+        _ => None,
+    };
+    button::Style {
+        background,
+        text_color: palette().text_muted,
+        border: Border {
+            radius: border::right(CONTROL_RADIUS),
             ..Border::default()
         },
         ..button::Style::default()
@@ -405,7 +452,11 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
         },
         placeholder: palette().text_muted,
         value: palette().text,
-        selection: Color::from_rgba8(235, 237, 242, 0.28),
+        selection: Color {
+            a: 0.34,
+            ..palette().accent
+        },
+        icon: palette().text_muted,
     }
 }
 
@@ -415,19 +466,37 @@ pub fn inline_input(_: &Theme, _: text_input::Status) -> text_input::Style {
         border: Border::default(),
         placeholder: palette().text_muted,
         value: palette().text,
-        selection: Color::from_rgba8(235, 237, 242, 0.28),
+        selection: Color {
+            a: 0.34,
+            ..palette().accent
+        },
+        icon: palette().text_muted,
     }
 }
 
-pub fn pick_list(_: &Theme, _status: iced_pick_list::Status) -> iced_pick_list::Style {
+pub fn pick_list(_: &Theme, status: iced_pick_list::Status) -> iced_pick_list::Style {
+    let opened = matches!(status, iced_pick_list::Status::Opened { .. });
     iced_pick_list::Style {
         text_color: palette().text,
         placeholder_color: palette().text_muted,
-        handle_color: palette().text_muted,
+        handle_color: if opened {
+            palette().text
+        } else {
+            palette().text_muted
+        },
         background: Background::Color(palette().surface_active),
         border: Border {
-            radius: CONTROL_RADIUS.into(),
-            ..Border::default()
+            color: if opened {
+                mix(palette().border, palette().text, 0.20)
+            } else {
+                Color::TRANSPARENT
+            },
+            width: if opened { 1.0 } else { 0.0 },
+            radius: if opened {
+                border::top(CONTROL_RADIUS)
+            } else {
+                CONTROL_RADIUS.into()
+            },
         },
     }
 }
@@ -436,9 +505,9 @@ pub fn pick_list_menu(_: &Theme) -> menu::Style {
     menu::Style {
         background: Background::Color(palette().surface_active),
         border: Border {
-            color: palette().border,
+            color: mix(palette().border, palette().text, 0.20),
             width: 1.0,
-            radius: CONTROL_RADIUS.into(),
+            radius: border::bottom(CONTROL_RADIUS),
         },
         text_color: palette().text,
         selected_text_color: palette().text,
@@ -449,8 +518,8 @@ pub fn pick_list_menu(_: &Theme) -> menu::Style {
         )),
         shadow: Shadow {
             color: Color::from_rgba8(0, 0, 0, 0.45),
-            offset: iced::Vector::new(0.0, 4.0),
-            blur_radius: 12.0,
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 18.0,
         },
     }
 }
