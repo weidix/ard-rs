@@ -829,6 +829,64 @@ pub fn build_pointer_event(button_mask: u8, x: u16, y: u16) -> [u8; 6] {
     out
 }
 
+/// The native macOS scroll-wheel payload carried by Apple's extended input
+/// message. Unlike the standard RFB wheel buttons, it preserves precise point
+/// deltas and the scroll/momentum phases used by trackpads.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArdScrollWheelEvent {
+    pub delta_x: i16,
+    pub delta_y: i16,
+    pub delta_z: i16,
+    pub fixed_delta_x: i32,
+    pub fixed_delta_y: i32,
+    pub fixed_delta_z: i32,
+    pub point_delta_x: i32,
+    pub point_delta_y: i32,
+    pub point_delta_z: i32,
+    pub scroll_phase: u32,
+    pub momentum_phase: u32,
+    pub scroll_count: u32,
+    pub flags: u32,
+    pub x: u16,
+    pub y: u16,
+}
+
+/// Builds Apple's `RFBPostScrollWheelEvent` client message (`0x17/0x0036`).
+///
+/// The layout is byte-for-byte compatible with the message emitted by the
+/// ScreenSharing private framework on macOS 26.
+pub fn build_ard_scroll_wheel_event(event: ArdScrollWheelEvent) -> [u8; 58] {
+    let mut out = [0_u8; 58];
+    out[0] = 0x17;
+    out[2..4].copy_from_slice(&0x0036_u16.to_be_bytes());
+    out[4..6].copy_from_slice(&1_u16.to_be_bytes());
+    out[6..8].copy_from_slice(&11_u16.to_be_bytes());
+    out[8..10].copy_from_slice(&event.delta_x.to_be_bytes());
+    out[10..12].copy_from_slice(&event.delta_y.to_be_bytes());
+    out[12..14].copy_from_slice(&event.delta_z.to_be_bytes());
+    for (offset, value) in [
+        (14, event.fixed_delta_x),
+        (18, event.fixed_delta_y),
+        (22, event.fixed_delta_z),
+        (26, event.point_delta_x),
+        (30, event.point_delta_y),
+        (34, event.point_delta_z),
+    ] {
+        out[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    for (offset, value) in [
+        (38, event.scroll_phase),
+        (42, event.momentum_phase),
+        (46, event.scroll_count),
+        (50, event.flags),
+    ] {
+        out[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    out[54..56].copy_from_slice(&event.x.to_be_bytes());
+    out[56..58].copy_from_slice(&event.y.to_be_bytes());
+    out
+}
+
 /// Builds the standard RFB client `ClientCutText` clipboard message.
 pub fn build_client_cut_text(text: &[u8]) -> Result<Vec<u8>> {
     let length = u32::try_from(text.len()).map_err(|_| Error::LimitExceeded("clipboard text"))?;

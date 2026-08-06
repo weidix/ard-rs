@@ -8,13 +8,14 @@ use std::thread;
 use std::time::Duration;
 
 use crate::{
-    ArdEncryptionControl, ArdMessageDispatcher, ArdServerMessage, ArdVerifiedRecordStream,
-    ArdViewerInformation, Decoder, Framebuffer, FramebufferFormat, PixelFormat, ProtocolVersion,
-    SecurityType, build_ard_auto_frame_update, build_ard_encryption_activation,
-    build_ard_set_encryption_level, build_ard_type30_client_exchange, build_client_cut_text,
-    build_framebuffer_update_request, build_key_event, build_pointer_event, build_set_encodings,
-    build_set_pixel_format, parse_ard_auth_challenge, parse_framebuffer_update,
-    parse_security_types, parse_server_init, unwrap_ard_session_material,
+    ArdEncryptionControl, ArdMessageDispatcher, ArdScrollWheelEvent, ArdServerMessage,
+    ArdVerifiedRecordStream, ArdViewerInformation, Decoder, Framebuffer, FramebufferFormat,
+    PixelFormat, ProtocolVersion, SecurityType, build_ard_auto_frame_update,
+    build_ard_encryption_activation, build_ard_scroll_wheel_event, build_ard_set_encryption_level,
+    build_ard_type30_client_exchange, build_client_cut_text, build_framebuffer_update_request,
+    build_key_event, build_pointer_event, build_set_encodings, build_set_pixel_format,
+    parse_ard_auth_challenge, parse_framebuffer_update, parse_security_types, parse_server_init,
+    unwrap_ard_session_material,
 };
 
 const MAX_KEY_BYTES: usize = 512;
@@ -253,6 +254,7 @@ enum OutboundMessage {
 pub struct ArdClientInput {
     sender: SyncSender<OutboundMessage>,
     writer_error: Arc<Mutex<Option<String>>>,
+    supports_extended_scroll: bool,
 }
 
 impl fmt::Debug for ArdClientInput {
@@ -260,11 +262,17 @@ impl fmt::Debug for ArdClientInput {
         formatter
             .debug_struct("ArdClientInput")
             .field("writer_error", &self.writer_error)
+            .field("supports_extended_scroll", &self.supports_extended_scroll)
             .finish()
     }
 }
 
 impl ArdClientInput {
+    /// Whether the server accepts Apple's extended mouse/scroll input family.
+    pub fn supports_extended_scroll(&self) -> bool {
+        self.supports_extended_scroll
+    }
+
     /// Queues one key press or release using an X11/RFB keysym.
     pub fn send_key_event(&self, pressed: bool, keysym: u32) -> Result<(), ArdClientError> {
         self.submit(OutboundMessage::Payload(
@@ -302,6 +310,21 @@ impl ArdClientInput {
             self.submit(OutboundMessage::Payload(payload))?;
         }
         Ok(())
+    }
+
+    /// Queues one native Apple scroll-wheel event with precise deltas.
+    pub fn send_scroll_wheel_event(
+        &self,
+        event: ArdScrollWheelEvent,
+    ) -> Result<(), ArdClientError> {
+        if !self.supports_extended_scroll {
+            return Err(ArdClientError::Message(
+                "server does not advertise extended scroll input".to_owned(),
+            ));
+        }
+        self.submit(OutboundMessage::Payload(
+            build_ard_scroll_wheel_event(event).to_vec(),
+        ))
     }
 
     /// Queues a pointer update without blocking the GUI event loop when the
@@ -524,6 +547,10 @@ impl ArdClient {
             ));
         }
 
+        let supports_extended_scroll = server_init
+            .extension
+            .as_ref()
+            .is_some_and(|extension| extension.supports_command(0x17));
         let requested_pixel_format = config.output_format.pixel_format(server_init.pixel_format);
         let (mut decoder, mut framebuffer) = if config.video_quality == ArdVideoQuality::Adaptive {
             (
@@ -602,6 +629,7 @@ impl ArdClient {
         let input = ArdClientInput {
             sender,
             writer_error: writer_error.clone(),
+            supports_extended_scroll,
         };
         spawn_input_writer(writer_stream, encoder, receiver, writer_error);
 

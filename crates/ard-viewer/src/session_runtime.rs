@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use crate::i18n::Language;
 use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdKey, ArdNamedKey,
-    ArdVideoQuality, Framebuffer, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
+    ArdScrollWheelEvent, ArdVideoQuality, Framebuffer, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate,
+    keysym_for_key,
 };
 use iced::futures::StreamExt;
 use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -1044,6 +1045,7 @@ enum InputCommand {
     Key { pressed: bool, keysym: u32 },
     Pointer { mask: u8, x: u16, y: u16 },
     PointerBatch(Vec<(u8, u16, u16)>),
+    Scroll(ArdScrollWheelEvent),
     Clipboard(String),
 }
 
@@ -1077,6 +1079,11 @@ impl InputDispatcher {
                         InputCommand::PointerBatch(events) => {
                             if let Some(input) = &input {
                                 let _ = input.send_pointer_events(&events);
+                            }
+                        }
+                        InputCommand::Scroll(event) => {
+                            if let Some(input) = &input {
+                                let _ = input.send_scroll_wheel_event(event);
                             }
                         }
                         InputCommand::Clipboard(text) => {
@@ -1239,19 +1246,26 @@ impl InputState {
             self.scroll.reset();
             return Ok(());
         };
+        if self
+            .input
+            .as_ref()
+            .is_some_and(ArdClientInput::supports_extended_scroll)
+        {
+            self.scroll.reset();
+            if let Some(event) = native_scroll_event(delta, x, y) {
+                self.dispatcher.submit(InputCommand::Scroll(event))?;
+            }
+            return Ok(());
+        }
         let (horizontal, vertical) = self.scroll.update(delta);
         if self.input.is_none() {
             return Ok(());
         }
-        for (clicks, negative, positive) in [(vertical, 0x08, 0x10), (horizontal, 0x20, 0x40)] {
+        for (clicks, positive, negative) in [(vertical, 0x08, 0x10), (horizontal, 0x20, 0x40)] {
             if clicks == 0 {
                 continue;
             }
-            let bit = if clicks.is_negative() {
-                negative
-            } else {
-                positive
-            };
+            let bit = scroll_button(clicks, positive, negative);
             let mut events = Vec::with_capacity(clicks.unsigned_abs() as usize * 2);
             for _ in 0..clicks.unsigned_abs() {
                 events.push((self.button_mask | bit, x, y));
@@ -1342,17 +1356,46 @@ pub fn reverse_scroll_delta(delta: ScrollDelta) -> ScrollDelta {
     }
 }
 
-pub fn scale_scroll_delta(delta: ScrollDelta, multiplier: f32) -> ScrollDelta {
-    match delta {
-        ScrollDelta::Lines { x, y } => ScrollDelta::Lines {
-            x: x * multiplier,
-            y: y * multiplier,
-        },
-        ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels {
-            x: x * multiplier,
-            y: y * multiplier,
-        },
+fn native_scroll_event(delta: ScrollDelta, x: u16, y: u16) -> Option<ArdScrollWheelEvent> {
+    let (delta_x, delta_y, precise) = match delta {
+        ScrollDelta::Lines { x, y } => (x, y, false),
+        ScrollDelta::Pixels { x, y } => (x, y, true),
+    };
+    if !delta_x.is_finite() || !delta_y.is_finite() || delta_x == 0.0 && delta_y == 0.0 {
+        return None;
     }
+    let scroll_phase = if precise { 1 << 2 } else { 0 };
+    Some(ArdScrollWheelEvent {
+        delta_x: rounded_i16(delta_x),
+        delta_y: rounded_i16(delta_y),
+        fixed_delta_x: fixed_16_16(delta_x),
+        fixed_delta_y: fixed_16_16(delta_y),
+        point_delta_x: rounded_i32(delta_x),
+        point_delta_y: rounded_i32(delta_y),
+        scroll_phase,
+        scroll_count: 1,
+        x,
+        y,
+        ..ArdScrollWheelEvent::default()
+    })
+}
+
+fn rounded_i16(value: f32) -> i16 {
+    value
+        .round()
+        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+}
+
+fn rounded_i32(value: f32) -> i32 {
+    f64::from(value)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn fixed_16_16(value: f32) -> i32 {
+    (f64::from(value) * 65_536.0)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 fn take_scroll(value: &mut f64) -> i32 {
@@ -1361,6 +1404,14 @@ fn take_scroll(value: &mut f64) -> i32 {
         .clamp(-MAX_SCROLL_CLICKS_PER_EVENT, MAX_SCROLL_CLICKS_PER_EVENT);
     *value -= clicks;
     clicks as i32
+}
+
+fn scroll_button(clicks: i32, positive: u8, negative: u8) -> u8 {
+    if clicks.is_positive() {
+        positive
+    } else {
+        negative
+    }
 }
 
 pub fn mouse_button_bit(button: Button, modifiers: Modifiers) -> Option<u8> {
@@ -1709,15 +1760,26 @@ mod tests {
     }
 
     #[test]
-    fn scroll_delta_can_be_scaled_on_both_axes() {
+    fn precise_scroll_preserves_point_and_fractional_deltas() {
+        let event = native_scroll_event(ScrollDelta::Pixels { x: -0.5, y: 3.25 }, 12, 34)
+            .expect("non-zero scroll event");
+        assert_eq!((event.delta_x, event.delta_y), (-1, 3));
         assert_eq!(
-            scale_scroll_delta(ScrollDelta::Lines { x: 2.0, y: -3.0 }, 3.0),
-            ScrollDelta::Lines { x: 6.0, y: -9.0 }
+            (event.fixed_delta_x, event.fixed_delta_y),
+            (-32_768, 212_992)
         );
-        assert_eq!(
-            scale_scroll_delta(ScrollDelta::Pixels { x: -4.0, y: 5.0 }, 2.0),
-            ScrollDelta::Pixels { x: -8.0, y: 10.0 }
-        );
+        assert_eq!((event.point_delta_x, event.point_delta_y), (-1, 3));
+        assert_eq!(event.scroll_phase, 4);
+        assert_eq!(event.scroll_count, 1);
+        assert_eq!((event.x, event.y), (12, 34));
+    }
+
+    #[test]
+    fn fallback_scroll_uses_rfb_positive_direction_buttons() {
+        assert_eq!(scroll_button(1, 0x08, 0x10), 0x08);
+        assert_eq!(scroll_button(-1, 0x08, 0x10), 0x10);
+        assert_eq!(scroll_button(1, 0x20, 0x40), 0x20);
+        assert_eq!(scroll_button(-1, 0x20, 0x40), 0x40);
     }
 
     #[test]

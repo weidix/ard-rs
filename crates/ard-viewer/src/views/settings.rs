@@ -169,16 +169,6 @@ fn general(app: &ArdViewer) -> Element<'_, Message> {
                     .text_size(BODY_SIZE)
                     .style(theme::checkbox),
                 muted(app.language.tr("同时反转垂直和水平滚动方向。")),
-                setting_field(
-                    app.language.tr("滚动倍数"),
-                    iced::widget::text_input("5", &app.scroll_multiplier)
-                        .on_input(Message::ScrollMultiplierChanged)
-                        .width(280)
-                        .padding([10, 12])
-                        .size(BODY_SIZE)
-                        .style(theme::input),
-                ),
-                muted(app.language.tr("提高远程界面的滚轮滚动速度。")),
             ]
             .spacing(8),
         ),

@@ -22,7 +22,6 @@ use i18n::Language;
 use session_runtime::{
     ClipboardSync, ConnectionState, InputEvent, InputState, SessionConfig, SessionEvent,
     SessionRuntime, StreamMetrics, is_paste_shortcut, map_remote_position, reverse_scroll_delta,
-    scale_scroll_delta,
 };
 
 use state::{DeviceState, KeyMapping, SavedDevice, SettingsSection, ThemePreference, WindowKind};
@@ -61,7 +60,6 @@ struct ArdViewer {
     auto_adapt_keyboard: bool,
     capture_system_shortcuts: bool,
     reverse_scroll: bool,
-    scroll_multiplier: String,
     show_performance_hud: bool,
     theme_preference: ThemePreference,
     language: Language,
@@ -137,7 +135,6 @@ enum Message {
     AutoAdaptChanged(bool),
     CaptureShortcutsChanged(bool),
     ReverseScrollChanged(bool),
-    ScrollMultiplierChanged(String),
     PerformanceHudChanged(bool),
     ThemePreferenceChanged(ThemePreference),
     LanguageChanged(Language),
@@ -217,7 +214,6 @@ impl ArdViewer {
             auto_adapt_keyboard: cached.auto_adapt_keyboard,
             capture_system_shortcuts: cached.capture_system_shortcuts,
             reverse_scroll: cached.reverse_scroll,
-            scroll_multiplier: format_scroll_multiplier(cached.scroll_multiplier),
             show_performance_hud: cached.show_performance_hud,
             theme_preference: config::theme_from_cache(&cached.theme),
             language: config::language_from_cache(&cached.language),
@@ -521,12 +517,6 @@ impl ArdViewer {
             Message::ReverseScrollChanged(value) => {
                 self.reverse_scroll = value;
                 self.persist_config();
-            }
-            Message::ScrollMultiplierChanged(value) => {
-                self.scroll_multiplier = sanitize_scroll_multiplier_input(&value);
-                if parse_scroll_multiplier(&self.scroll_multiplier).is_some() {
-                    self.persist_config();
-                }
             }
             Message::PerformanceHudChanged(value) => {
                 self.show_performance_hud = value;
@@ -941,8 +931,6 @@ impl ArdViewer {
             auto_adapt_keyboard: self.auto_adapt_keyboard,
             capture_system_shortcuts: self.capture_system_shortcuts,
             reverse_scroll: self.reverse_scroll,
-            scroll_multiplier: parse_scroll_multiplier(&self.scroll_multiplier)
-                .unwrap_or(config::DEFAULT_SCROLL_MULTIPLIER),
             show_performance_hud: self.show_performance_hud,
             theme: config::theme_to_cache(self.theme_preference).into(),
             language: self.language.code().into(),
@@ -1161,11 +1149,7 @@ impl ArdViewer {
                 } else {
                     delta
                 };
-                Some(InputEvent::Wheel(scale_scroll_delta(
-                    delta,
-                    parse_scroll_multiplier(&self.scroll_multiplier)
-                        .unwrap_or(config::DEFAULT_SCROLL_MULTIPLIER),
-                )))
+                Some(InputEvent::Wheel(delta))
             }
             iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
                 Some(InputEvent::ModifiersChanged(modifiers))
@@ -1562,36 +1546,6 @@ fn profile_mappings(profile: &str) -> Vec<KeyMapping> {
     ]
 }
 
-fn format_scroll_multiplier(value: f32) -> String {
-    if value.is_finite() && value > 0.0 {
-        value.to_string()
-    } else {
-        config::DEFAULT_SCROLL_MULTIPLIER.to_string()
-    }
-}
-
-fn sanitize_scroll_multiplier_input(value: &str) -> String {
-    let mut has_decimal_point = false;
-    value
-        .chars()
-        .filter(|character| match *character {
-            character if character.is_ascii_digit() => true,
-            '.' if !has_decimal_point => {
-                has_decimal_point = true;
-                true
-            }
-            _ => false,
-        })
-        .collect()
-}
-
-fn parse_scroll_multiplier(value: &str) -> Option<f32> {
-    value
-        .parse::<f32>()
-        .ok()
-        .filter(|value| value.is_finite() && *value > 0.0)
-}
-
 fn main() -> iced::Result {
     iced::daemon(ArdViewer::new, ArdViewer::update, ArdViewer::view)
         .title(ArdViewer::title)
@@ -1612,19 +1566,10 @@ mod tests {
         assert_eq!(app.settings_section, SettingsSection::KeyMapping);
         assert_eq!(app.quality, ArdVideoQuality::Adaptive);
         assert_eq!(app.theme_preference, ThemePreference::System);
-        assert_eq!(app.scroll_multiplier, "5");
         assert!(app.session_toolbar_visible);
         assert!(!app.session_toolbar_pinned);
         assert_eq!(app.pending_close, None);
         assert_eq!(app.port, "5900");
-    }
-
-    #[test]
-    fn scroll_multiplier_accepts_arbitrary_positive_numbers() {
-        assert_eq!(sanitize_scroll_multiplier_input("12.75x"), "12.75");
-        assert_eq!(parse_scroll_multiplier("12.75"), Some(12.75));
-        assert_eq!(parse_scroll_multiplier("0"), None);
-        assert_eq!(parse_scroll_multiplier(""), None);
     }
 
     #[test]
