@@ -13,6 +13,7 @@ pub struct Palette {
     pub surface_active: Color,
     pub border: Color,
     pub text: Color,
+    pub primary: Color,
     pub text_muted: Color,
     pub text_dim: Color,
     pub text_warm: Color,
@@ -23,35 +24,35 @@ pub struct Palette {
 }
 
 const DARK: Palette = Palette {
-    background: Color::from_rgb8(13, 13, 14),
-    remote_canvas: Color::from_rgb8(5, 5, 6),
-    surface: Color::from_rgb8(22, 22, 24),
-    surface_active: Color::from_rgb8(41, 41, 43),
-    border: Color::from_rgb8(59, 59, 64),
-    text: Color::from_rgb8(240, 240, 242),
-    text_muted: Color::from_rgb8(158, 158, 168),
-    text_dim: Color::from_rgb8(107, 107, 117),
-    text_warm: Color::from_rgb8(209, 204, 194),
-    accent: Color::from_rgb8(240, 240, 242),
-    accent_text: Color::from_rgb8(9, 9, 10),
+    background: Color::from_rgb8(5, 5, 5),
+    remote_canvas: Color::from_rgb8(5, 5, 5),
+    surface: Color::from_rgb8(16, 16, 16),
+    surface_active: Color::from_rgb8(28, 28, 28),
+    border: Color::from_rgb8(61, 61, 61),
+    text: Color::from_rgb8(243, 221, 221),
+    primary: Color::from_rgb8(224, 224, 224),
+    text_muted: Color::from_rgb8(150, 150, 150),
+    text_dim: Color::from_rgb8(91, 91, 91),
+    text_warm: Color::from_rgb8(224, 224, 224),
+    accent: Color::from_rgb8(113, 109, 227),
+    accent_text: Color::from_rgb8(5, 5, 5),
     success: Color::from_rgb8(87, 158, 107),
     warning: Color::from_rgb8(209, 204, 194),
 };
 
-// Neutral off-white surfaces with near-black accents, following the familiar
-// grayscale hierarchy used by modern productivity and chat applications.
 const LIGHT: Palette = Palette {
-    background: Color::from_rgb8(247, 247, 245),
-    remote_canvas: Color::from_rgb8(232, 232, 229),
-    surface: Color::from_rgb8(242, 242, 239),
-    surface_active: Color::from_rgb8(229, 229, 225),
-    border: Color::from_rgb8(211, 211, 207),
-    text: Color::from_rgb8(32, 32, 31),
-    text_muted: Color::from_rgb8(100, 100, 97),
-    text_dim: Color::from_rgb8(137, 137, 133),
-    text_warm: Color::from_rgb8(70, 70, 68),
-    accent: Color::from_rgb8(35, 35, 34),
-    accent_text: Color::from_rgb8(248, 248, 246),
+    background: Color::from_rgb8(249, 249, 249),
+    remote_canvas: Color::from_rgb8(249, 249, 249),
+    surface: Color::from_rgb8(242, 242, 242),
+    surface_active: Color::from_rgb8(232, 232, 232),
+    border: Color::from_rgb8(194, 194, 194),
+    text: Color::from_rgb8(35, 12, 12),
+    primary: Color::from_rgb8(30, 30, 30),
+    text_muted: Color::from_rgb8(105, 105, 105),
+    text_dim: Color::from_rgb8(154, 154, 154),
+    text_warm: Color::from_rgb8(30, 30, 30),
+    accent: Color::from_rgb8(32, 28, 146),
+    accent_text: Color::from_rgb8(249, 249, 249),
     success: Color::from_rgb8(65, 126, 82),
     warning: Color::from_rgb8(112, 79, 58),
 };
@@ -142,19 +143,6 @@ pub fn shaped_panel(
     }
 }
 
-pub fn rounded_panel(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style + Copy {
-    move |_| container::Style {
-        background: Some(Background::Color(color)),
-        text_color: Some(palette().text),
-        border: Border {
-            radius: radius.into(),
-            ..Border::default()
-        },
-        shadow: Shadow::default(),
-        snap: true,
-    }
-}
-
 pub fn bordered_panel(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style + Copy {
     move |_| container::Style {
         background: Some(Background::Color(color)),
@@ -199,11 +187,8 @@ pub fn modal_panel(progress: f32) -> impl Fn(&Theme) -> container::Style + Copy 
 }
 
 pub fn toolbar_foreground(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_rgb8(242, 242, 240)
-    } else {
-        Color::from_rgb8(36, 36, 35)
-    }
+    let _ = is_dark;
+    palette().primary
 }
 
 fn toolbar_glass_color(is_dark: bool) -> Color {

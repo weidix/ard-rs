@@ -1,12 +1,14 @@
 use std::f32::consts::TAU;
 
-use iced::widget::{button, column, container, mouse_area, row, space, stack, text, text_input};
+use iced::widget::{
+    button, column, container, mouse_area, progress_bar, row, space, stack, text, text_input,
+};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::icons::{Icon, icon};
 use crate::session_renderer;
 use crate::session_runtime::ConnectionState;
-use crate::theme::{self, CONTROL_RADIUS, MICRO_SIZE, WINDOW_RADIUS};
+use crate::theme::{self, MICRO_SIZE, WINDOW_RADIUS};
 use crate::widgets::{window_drag_region, window_platform_controls};
 use crate::{
     ArdViewer, Message, SESSION_TOOLBAR_COLLAPSED_WIDTH, SESSION_TOOLBAR_WIDTH, SessionAction,
@@ -42,33 +44,28 @@ fn remote_canvas(
             runtime.mailbox(),
             app.session_zoom,
         ))
-        .height(650)
+        .height(Fill)
         .width(Fill)
-        .style(theme::rounded_panel(theme::palette().remote_canvas, 6.0))
+        .style(theme::panel(theme::palette().remote_canvas))
         .into()
     } else {
-        container(text(app.session_connection.label()).color(theme::palette().text_muted))
-            .height(650)
+        container(space())
+            .height(Fill)
             .width(Fill)
-            .center(Fill)
-            .style(theme::rounded_panel(theme::palette().remote_canvas, 6.0))
+            .style(theme::panel(theme::palette().remote_canvas))
             .into()
     };
-    let base = container(column![
-        space().height(62),
-        row![space().width(85), desktop, space().width(85)].height(650),
-        space().height(Fill),
-    ])
-    .width(Fill)
-    .height(Fill)
-    .style(theme::shaped_panel(
-        theme::palette().remote_canvas,
-        if maximized {
-            0.0.into()
-        } else {
-            WINDOW_RADIUS.into()
-        },
-    ));
+    let base = container(desktop)
+        .width(Fill)
+        .height(Fill)
+        .style(theme::shaped_panel(
+            theme::palette().remote_canvas,
+            if maximized {
+                0.0.into()
+            } else {
+                WINDOW_RADIUS.into()
+            },
+        ));
 
     let toolbar_progress = app.session_toolbar_progress
         * app.session_toolbar_progress
@@ -113,60 +110,7 @@ fn remote_canvas(
     )
     .on_move(Message::SessionToolbarPointerMoved)
     .on_release(Message::SessionToolbarDragEnded);
-    let pulse = ((app.ui_time * TAU / 2.4).sin() + 1.0) * 0.5;
-    let connected = app.session_connection == ConnectionState::Connected;
-    let status_color = if connected {
-        theme::mix(
-            theme::palette().success,
-            iced::Color::from_rgb8(126, 196, 145),
-            pulse,
-        )
-    } else {
-        theme::palette().text_muted
-    };
-    let decoder = if app.session_metrics.gpu_mvs {
-        "GPU MVS"
-    } else {
-        "RGBA"
-    };
-    let metrics = &app.session_metrics;
-    let status_text = app.session_error.clone().unwrap_or_else(|| {
-        if metrics.width > 0 && metrics.height > 0 {
-            format!(
-                "{decoder} · {} · {}×{} · {:.1} fps · ↓{:.2} Mbit/s · {}",
-                app.quality.label(),
-                metrics.width,
-                metrics.height,
-                metrics.frames_per_second,
-                metrics.megabits_per_second,
-                app.session_connection.label(),
-            )
-        } else {
-            app.session_connection.label()
-        }
-    });
-    let status = container(
-        container(
-            row![
-                dot(status_color, 6.0 + pulse * 1.4),
-                text(status_text)
-                    .size(MICRO_SIZE)
-                    .color(theme::palette().text_muted)
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        )
-        .padding(8)
-        .style(theme::bordered_panel(
-            theme::palette().surface,
-            CONTROL_RADIUS,
-        )),
-    )
-    .width(Fill)
-    .height(Fill)
-    .padding([23, 18])
-    .align_x(Alignment::Start)
-    .align_y(Alignment::End);
+    let progress = connection_progress(app);
 
     let ime_sink = container(
         text_input("", &app.ime_sink)
@@ -180,10 +124,43 @@ fn remote_canvas(
     .height(1)
     .clip(true);
 
-    stack![base, controls, status, ime_sink]
+    stack![base, controls, progress, ime_sink]
         .width(Fill)
         .height(Fill)
         .clip(true)
+        .into()
+}
+
+fn connection_progress(app: &ArdViewer) -> Element<'_, Message> {
+    if app.session_connection == ConnectionState::Connected {
+        return space().into();
+    }
+
+    let label = app
+        .session_error
+        .clone()
+        .unwrap_or_else(|| app.session_connection.label());
+    let active = matches!(
+        app.session_connection,
+        ConnectionState::Connecting | ConnectionState::Reconnecting { .. }
+    );
+    let pulse = ((app.ui_time * TAU / 1.8).sin() + 1.0) * 0.5;
+    let mut content = column![
+        text(label)
+            .size(MICRO_SIZE)
+            .color(theme::palette().text_muted)
+    ]
+    .spacing(10)
+    .align_x(Alignment::Center);
+    if active {
+        content = content.push(progress_bar(0.0..=1.0, pulse).length(180).girth(3));
+    }
+
+    let indicator = container(content).id("session-connection-progress");
+    container(indicator)
+        .width(Fill)
+        .height(Fill)
+        .center(Fill)
         .into()
 }
 
@@ -281,12 +258,4 @@ fn toolbar_handle(
     .padding(0)
     .style(theme::toolbar_handle(is_dark))
     .on_press(message)
-}
-
-fn dot(color: iced::Color, size: f32) -> Element<'static, Message> {
-    container(space())
-        .width(size)
-        .height(size)
-        .style(theme::rounded_panel(color, size / 2.0))
-        .into()
 }

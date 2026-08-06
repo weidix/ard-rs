@@ -155,17 +155,38 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     ]
     .spacing(2);
 
-    let address = column![
-        text("远程地址")
-            .size(BODY_SIZE)
-            .color(theme::palette().text_muted),
-        iced::widget::text_input("mac-studio.local", &app.address)
-            .on_input(Message::AddressChanged)
-            .padding([10.0, CONTROL_PADDING_X])
-            .size(BODY_SIZE)
-            .style(theme::input),
+    let address = row![
+        column![
+            text("远程地址")
+                .size(BODY_SIZE)
+                .color(theme::palette().text_muted),
+            iced::widget::text_input("mac-studio.local", &app.address)
+                .on_input(Message::AddressChanged)
+                .padding([10.0, CONTROL_PADDING_X])
+                .size(BODY_SIZE)
+                .style(theme::input),
+        ]
+        .spacing(5)
+        .width(Fill),
+        column![
+            text("端口")
+                .size(BODY_SIZE)
+                .color(theme::palette().text_muted),
+            column![
+                iced::widget::text_input("5900", &app.port)
+                    .on_input(Message::PortChanged)
+                    .padding([9.0, 2.0])
+                    .size(BODY_SIZE)
+                    .style(theme::inline_input),
+                dashed_rule(),
+            ]
+            .spacing(0),
+        ]
+        .spacing(5)
+        .width(92),
     ]
-    .spacing(5);
+    .spacing(14)
+    .align_y(Alignment::End);
     let username = column![
         text("用户名")
             .size(BODY_SIZE)
@@ -219,7 +240,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
                 .width(Fill)
                 .style(theme::panel(theme::palette().border)),
             text(format!(
-                "端口  默认 5900        像素格式  自动        编码  {}",
+                "像素格式  自动        编码  {}",
                 app.quality.label()
             ))
             .size(CAPTION_SIZE)
@@ -299,4 +320,17 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             iced::border::right(if maximized { 0.0 } else { WINDOW_RADIUS }),
         ))
         .into()
+}
+
+fn dashed_rule<'a>() -> Element<'a, Message> {
+    let mut rule = row![].spacing(3);
+    for _ in 0..7 {
+        rule = rule.push(
+            container(space())
+                .width(5)
+                .height(1)
+                .style(theme::panel(theme::palette().text_muted)),
+        );
+    }
+    rule.height(1).into()
 }

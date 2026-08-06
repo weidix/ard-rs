@@ -27,9 +27,6 @@ use state::{DeviceState, KeyMapping, SavedDevice, SettingsSection, ThemePreferen
 const SESSION_TOOLBAR_WIDTH: f32 = 286.0;
 const SESSION_TOOLBAR_COLLAPSED_WIDTH: f32 = 44.0;
 const SETTINGS_WINDOW_OFFSET: f32 = 32.0;
-const SESSION_CANVAS_TOP: f32 = 62.0;
-const SESSION_CANVAS_SIDE: f32 = 85.0;
-const SESSION_CANVAS_HEIGHT: f32 = 650.0;
 const SESSION_IME_ID: &str = "session-ime-sink";
 
 #[derive(Debug)]
@@ -42,6 +39,7 @@ struct ArdViewer {
     device_transition: f32,
     search: String,
     address: String,
+    port: String,
     username: String,
     password: String,
     remember_password: bool,
@@ -106,6 +104,7 @@ enum Message {
     SearchChanged(String),
     DeviceSelected(usize),
     AddressChanged(String),
+    PortChanged(String),
     UsernameChanged(String),
     PasswordChanged(String),
     RememberPasswordChanged(bool),
@@ -166,6 +165,8 @@ impl ArdViewer {
         } else {
             cached.last_address.clone()
         };
+        let (address, port) = split_endpoint(&address);
+        let endpoint = format_endpoint(&address, &port);
         let username = if cached.last_username.is_empty() {
             devices
                 .first()
@@ -174,7 +175,7 @@ impl ArdViewer {
             cached.last_username.clone()
         };
         let password = if cached.remember_password {
-            config::load_password(&address, &username).unwrap_or_default()
+            config::load_password(&endpoint, &username).unwrap_or_default()
         } else {
             String::new()
         };
@@ -183,6 +184,7 @@ impl ArdViewer {
             windows: BTreeMap::new(),
             maximized_windows: BTreeSet::new(),
             address,
+            port,
             username,
             devices,
             selected_device: 0,
@@ -365,22 +367,34 @@ impl ArdViewer {
                         self.device_transition = 0.0;
                     }
                     self.selected_device = index;
-                    self.address.clone_from(&device.address);
+                    (self.address, self.port) = split_endpoint(&device.address);
                     self.username.clone_from(&device.username);
                     self.password = if self.remember_password {
-                        config::load_password(&self.address, &self.username).unwrap_or_default()
+                        let endpoint = format_endpoint(&self.address, &self.port);
+                        config::load_password(&endpoint, &self.username).unwrap_or_default()
                     } else {
                         String::new()
                     };
                 }
             }
-            Message::AddressChanged(value) => self.address = value,
+            Message::AddressChanged(value) => {
+                let (address, port) = split_endpoint(&value);
+                self.address = address;
+                if value.trim() != self.address.trim() {
+                    self.port = port;
+                }
+            }
+            Message::PortChanged(value) => {
+                self.port = value.chars().filter(char::is_ascii_digit).take(5).collect();
+            }
             Message::UsernameChanged(value) => self.username = value,
             Message::PasswordChanged(value) => self.password = value,
             Message::RememberPasswordChanged(value) => {
                 self.remember_password = value;
-                if !value
-                    && let Err(error) = config::save_password(&self.address, &self.username, None)
+                let address = self
+                    .remote_endpoint()
+                    .unwrap_or_else(|_| self.address.trim().to_owned());
+                if !value && let Err(error) = config::save_password(&address, &self.username, None)
                 {
                     self.status = format!("移除系统密钥库密码失败：{error}");
                 }
@@ -391,22 +405,23 @@ impl ArdViewer {
                 self.persist_config();
             }
             Message::SaveDevice => {
-                let address = self.address.trim();
-                if address.is_empty() {
-                    self.status = "请输入设备地址".into();
-                } else if let Some(index) = self
+                let Ok(address) = self.remote_endpoint() else {
+                    self.status = "请输入有效的设备地址和端口".into();
+                    return Task::none();
+                };
+                if let Some(index) = self
                     .devices
                     .iter()
-                    .position(|device| device.address.eq_ignore_ascii_case(address))
+                    .position(|device| device.address.eq_ignore_ascii_case(&address))
                 {
                     self.selected_device = index;
                     self.devices[index].username = self.username.trim().to_owned();
                     self.status = "设备已保存".into();
                 } else {
-                    let name = address.trim_end_matches(":5900").to_owned();
+                    let (name, _) = split_endpoint(&address);
                     self.devices.push(SavedDevice {
                         name,
-                        address: address.to_owned(),
+                        address: address.clone(),
                         username: self.username.trim().to_owned(),
                         state: DeviceState::Saved,
                     });
@@ -415,9 +430,7 @@ impl ArdViewer {
                     self.device_transition = 0.0;
                     self.status = "设备已保存".into();
                 }
-                if !address.is_empty() {
-                    self.store_credentials();
-                }
+                self.store_credentials();
                 self.persist_config();
             }
             Message::SettingsSectionSelected(section) => {
@@ -493,6 +506,8 @@ impl ArdViewer {
             Message::Connect => {
                 if self.address.trim().is_empty() || self.username.trim().is_empty() {
                     self.status = "请输入设备地址和用户名".into();
+                } else if self.remote_endpoint().is_err() {
+                    self.status = "请输入有效端口（1–65535）".into();
                 } else if self.password.is_empty() {
                     self.status = "请输入密码".into();
                 } else {
@@ -743,7 +758,11 @@ impl ArdViewer {
         let transition_active = self.device_transition < 0.999
             || self.settings_transition < 0.999
             || (self.session_toolbar_progress - toolbar_target).abs() > 0.001
-            || (self.close_modal_progress - modal_target).abs() > 0.001;
+            || (self.close_modal_progress - modal_target).abs() > 0.001
+            || matches!(
+                self.session_connection,
+                ConnectionState::Connecting | ConnectionState::Reconnecting { .. }
+            );
         if transition_active {
             subscriptions
                 .push(iced::time::every(Duration::from_millis(16)).map(Message::AnimationTick));
@@ -773,6 +792,30 @@ impl ArdViewer {
         }
     }
 
+    fn remote_endpoint(&self) -> Result<String, ()> {
+        let address = self.address.trim();
+        let (parsed_host, parsed_port) = split_endpoint(address);
+        let has_embedded_port = parsed_host != address;
+        if !has_embedded_port && address.matches(':').count() == 1 {
+            return Err(());
+        }
+        let host = if has_embedded_port {
+            parsed_host.as_str()
+        } else {
+            address
+        };
+        let port_text = if has_embedded_port {
+            parsed_port.as_str()
+        } else {
+            self.port.trim()
+        };
+        let port = port_text.parse::<u16>().map_err(|_| ())?;
+        if host.is_empty() || port == 0 {
+            return Err(());
+        }
+        Ok(format_endpoint(host, &port.to_string()))
+    }
+
     fn clamp_session_toolbar_position(&mut self) {
         const TOOLBAR_HALF_WIDTH: f32 = SESSION_TOOLBAR_WIDTH / 2.0;
         if let Some(x) = self.session_toolbar_x.as_mut() {
@@ -797,7 +840,9 @@ impl ArdViewer {
             } else {
                 Vec::new()
             },
-            last_address: self.address.trim().to_owned(),
+            last_address: self
+                .remote_endpoint()
+                .unwrap_or_else(|_| self.address.trim().to_owned()),
             last_username: self.username.trim().to_owned(),
             remember_password: self.remember_password,
             remember_device: self.remember_device,
@@ -816,7 +861,10 @@ impl ArdViewer {
 
     fn store_credentials(&mut self) {
         let password = self.remember_password.then_some(self.password.as_str());
-        if let Err(error) = config::save_password(&self.address, &self.username, password) {
+        let address = self
+            .remote_endpoint()
+            .unwrap_or_else(|_| self.address.trim().to_owned());
+        if let Err(error) = config::save_password(&address, &self.username, password) {
             self.status = format!("系统密钥库不可用：{error}");
         }
     }
@@ -829,7 +877,9 @@ impl ArdViewer {
         self.session_error = None;
         self.session_zoom = 1.0;
         self.session_runtime = Some(SessionRuntime::start(SessionConfig {
-            address: self.address.trim().to_owned(),
+            address: self
+                .remote_endpoint()
+                .expect("validated before starting a session"),
             username: self.username.trim().to_owned(),
             password: self.password.as_bytes().to_vec(),
             quality: self.quality,
@@ -979,14 +1029,7 @@ impl ArdViewer {
     }
 
     fn session_canvas_bounds(&self) -> iced::Rectangle {
-        iced::Rectangle::new(
-            iced::Point::new(SESSION_CANVAS_SIDE, SESSION_CANVAS_TOP),
-            iced::Size::new(
-                (self.session_window_size.width - SESSION_CANVAS_SIDE * 2.0).max(0.0),
-                SESSION_CANVAS_HEIGHT
-                    .min((self.session_window_size.height - SESSION_CANVAS_TOP).max(0.0)),
-            ),
-        )
+        iced::Rectangle::new(iced::Point::ORIGIN, self.session_window_size)
     }
 
     fn export_shortcuts(&mut self) {
@@ -1011,6 +1054,32 @@ impl ArdViewer {
             Ok(()) => format!("快捷方式已导出到 {}", path.display()),
             Err(error) => format!("导出失败：{error}"),
         };
+    }
+}
+
+fn split_endpoint(value: &str) -> (String, String) {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[')
+        && let Some((host, port)) = rest.rsplit_once("]:")
+        && port.parse::<u16>().is_ok()
+    {
+        return (host.to_owned(), port.to_owned());
+    }
+    if let Some((host, port)) = value.rsplit_once(':')
+        && !host.contains(':')
+        && port.parse::<u16>().is_ok()
+    {
+        return (host.to_owned(), port.to_owned());
+    }
+    (value.to_owned(), "5900".to_owned())
+}
+
+fn format_endpoint(host: &str, port: &str) -> String {
+    let host = host.trim();
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -1262,6 +1331,53 @@ mod tests {
         assert!(app.session_toolbar_visible);
         assert!(!app.session_toolbar_pinned);
         assert_eq!(app.pending_close, None);
+        assert_eq!(app.port, "5900");
+    }
+
+    #[test]
+    fn endpoint_uses_the_separate_port_and_supports_pasted_addresses() {
+        let (mut app, _task) = ArdViewer::new();
+        app.address = "host.local".into();
+        app.port = "5999".into();
+        assert_eq!(app.remote_endpoint(), Ok("host.local:5999".into()));
+
+        let _task = app.update(Message::AddressChanged("other.local:5901".into()));
+        assert_eq!(app.address, "other.local");
+        assert_eq!(app.port, "5901");
+        assert_eq!(app.remote_endpoint(), Ok("other.local:5901".into()));
+
+        app.address = "other.local:not-a-port".into();
+        assert_eq!(app.remote_endpoint(), Err(()));
+    }
+
+    #[test]
+    fn session_canvas_fills_the_window() {
+        let (mut app, _task) = ArdViewer::new();
+        app.session_window_size = iced::Size::new(1440.0, 900.0);
+        assert_eq!(
+            app.session_canvas_bounds(),
+            iced::Rectangle::new(iced::Point::ORIGIN, app.session_window_size)
+        );
+    }
+
+    #[test]
+    fn connection_progress_is_centered_in_the_session_window() {
+        let (mut app, _task) = ArdViewer::new();
+        app.session_connection = ConnectionState::Connecting;
+        let size = WindowKind::Session.size();
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            size,
+            views::session(&app, window::Id::unique()),
+        );
+        let bounds = ui
+            .find(iced::widget::Id::new("session-connection-progress"))
+            .expect("connection progress should be present")
+            .visible_bounds()
+            .expect("connection progress should be visible");
+
+        assert!((bounds.center_x() - size.width / 2.0).abs() < 1.0);
+        assert!((bounds.center_y() - size.height / 2.0).abs() < 1.0);
     }
 
     #[test]
