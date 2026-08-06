@@ -194,7 +194,7 @@ pub fn toolbar_foreground(is_dark: bool) -> Color {
 
 fn toolbar_glass_color(is_dark: bool) -> Color {
     if is_dark {
-        Color::from_rgba8(18, 18, 20, 1.0)
+        Color::from_rgba8(30, 30, 32, 1.0)
     } else {
         Color::from_rgba8(250, 250, 252, 1.0)
     }
@@ -202,7 +202,7 @@ fn toolbar_glass_color(is_dark: bool) -> Color {
 
 fn toolbar_border_color(is_dark: bool) -> Color {
     if is_dark {
-        Color::from_rgba8(255, 255, 255, 0.26)
+        Color::TRANSPARENT
     } else {
         Color::from_rgba8(0, 0, 0, 0.22)
     }
@@ -273,7 +273,7 @@ pub fn toolbar_handle(is_dark: bool) -> impl Fn(&Theme, button::Status) -> butto
     move |_, status| {
         let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
             if is_dark {
-                Color::from_rgba8(38, 38, 37, 0.84)
+                Color::from_rgba8(48, 48, 50, 1.0)
             } else {
                 Color::from_rgba8(222, 222, 219, 0.88)
             }
@@ -299,7 +299,7 @@ pub fn toolbar_embedded_handle(
     move |_, status| {
         let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
             if is_dark {
-                Color::from_rgba8(38, 38, 37, 0.84)
+                Color::from_rgba8(48, 48, 50, 1.0)
             } else {
                 Color::from_rgba8(222, 222, 219, 0.88)
             }

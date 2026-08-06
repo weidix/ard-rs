@@ -39,8 +39,14 @@ pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
                 .width(Fill)
                 .height(SESSION_TITLEBAR_HEIGHT)
                 .style(theme::panel(theme::palette().surface)),
-            window_chrome_with_title(window_id, SESSION_TITLEBAR_HEIGHT, endpoint, detail,),
-            session_toolbar(app, app.effective_dark()),
+            window_chrome_with_title(
+                window_id,
+                SESSION_TITLEBAR_HEIGHT,
+                maximized,
+                endpoint,
+                detail,
+            ),
+            windowed_session_toolbar(app.effective_dark()),
         ]
         .height(SESSION_TITLEBAR_HEIGHT);
         column![
@@ -108,11 +114,16 @@ fn remote_canvas(
     .clip(true);
 
     if show_toolbar {
-        stack![base, session_toolbar(app, is_dark), progress, ime_sink]
-            .width(Fill)
-            .height(Fill)
-            .clip(true)
-            .into()
+        stack![
+            base,
+            fullscreen_session_toolbar(app, is_dark),
+            progress,
+            ime_sink
+        ]
+        .width(Fill)
+        .height(Fill)
+        .clip(true)
+        .into()
     } else {
         stack![base, progress, ime_sink]
             .width(Fill)
@@ -122,7 +133,7 @@ fn remote_canvas(
     }
 }
 
-fn session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {
+fn fullscreen_session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {
     let toolbar_progress = app.session_toolbar_progress
         * app.session_toolbar_progress
         * (3.0 - 2.0 * app.session_toolbar_progress);
@@ -144,6 +155,25 @@ fn session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> 
     } else {
         SESSION_TOOLBAR_COLLAPSED_WIDTH
     };
+    positioned_session_toolbar(app, toolbar, toolbar_width, Alignment::Start)
+}
+
+fn windowed_session_toolbar(is_dark: bool) -> Element<'static, Message> {
+    container(windowed_toolbar_controls(is_dark))
+        .id("session-windowed-toolbar")
+        .width(Fill)
+        .height(Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+fn positioned_session_toolbar(
+    app: &ArdViewer,
+    toolbar: Element<'static, Message>,
+    toolbar_width: f32,
+    vertical_alignment: Alignment,
+) -> Element<'static, Message> {
     let toolbar = container(toolbar).width(toolbar_width);
     let positioned: Element<'static, Message> = if let Some(center_x) = app.session_toolbar_x {
         let left = (center_x - toolbar_width / 2.0).clamp(
@@ -164,7 +194,7 @@ fn session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> 
         container(positioned)
             .width(Fill)
             .height(Fill)
-            .align_y(Alignment::Start),
+            .align_y(vertical_alignment),
     )
     .on_move(Message::SessionToolbarPointerMoved)
     .on_release(Message::SessionToolbarDragEnded);
@@ -205,6 +235,25 @@ fn connection_progress(app: &ArdViewer) -> Element<'_, Message> {
 }
 
 fn control_bar(pinned: bool, is_dark: bool) -> Element<'static, Message> {
+    let controls = toolbar_controls(pinned, is_dark);
+    let handle = container(embedded_toolbar_handle(is_dark))
+        .width(SESSION_TOOLBAR_COLLAPSED_WIDTH)
+        .height(14)
+        .padding(Padding {
+            top: 0.0,
+            right: 1.0,
+            bottom: 1.0,
+            left: 1.0,
+        })
+        .style(theme::toolbar_handle_shell(is_dark));
+
+    column![controls, handle]
+        .spacing(-2.0)
+        .align_x(Alignment::Center)
+        .into()
+}
+
+fn toolbar_controls(pinned: bool, is_dark: bool) -> Element<'static, Message> {
     let action_button =
         |kind, action| toolbar_button(kind, false, Message::SessionAction(action), is_dark);
     let controls = row![
@@ -221,24 +270,27 @@ fn control_bar(pinned: bool, is_dark: bool) -> Element<'static, Message> {
     .spacing(2)
     .align_y(Alignment::Center);
 
-    let controls = container(controls)
+    container(controls)
         .padding([3, 4])
-        .style(theme::toolbar_glass(is_dark, 8.0.into()));
-    let handle = container(embedded_toolbar_handle(is_dark))
-        .width(SESSION_TOOLBAR_COLLAPSED_WIDTH)
-        .height(14)
-        .padding(Padding {
-            top: 0.0,
-            right: 1.0,
-            bottom: 1.0,
-            left: 1.0,
-        })
-        .style(theme::toolbar_handle_shell(is_dark));
-
-    column![controls, handle]
-        .spacing(-1.0)
-        .align_x(Alignment::Center)
+        .style(theme::toolbar_glass(is_dark, 8.0.into()))
         .into()
+}
+
+fn windowed_toolbar_controls(is_dark: bool) -> Element<'static, Message> {
+    let action_button =
+        |kind, action| toolbar_button(kind, false, Message::SessionAction(action), is_dark);
+    row![
+        action_button(Icon::Scan, SessionAction::Fit),
+        action_button(Icon::ZoomIn, SessionAction::Zoom),
+        action_button(Icon::Pointer, SessionAction::Input),
+        action_button(Icon::Keyboard, SessionAction::SystemShortcut),
+        action_button(Icon::Clipboard, SessionAction::Clipboard),
+        action_button(Icon::Undo, SessionAction::Undo),
+        toolbar_button(Icon::Fullscreen, false, Message::ToggleFullscreen, is_dark,),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn toolbar_drag_handle(is_dark: bool) -> Element<'static, Message> {

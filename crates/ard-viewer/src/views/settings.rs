@@ -19,7 +19,7 @@ pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> 
         row![sidebar(app, maximized), content(app, maximized)]
             .width(Fill)
             .height(Fill),
-        window_chrome_with_title(window_id, 32.0, app.language.tr("设置"), None),
+        window_chrome_with_title(window_id, 32.0, maximized, app.language.tr("设置"), None,),
     ]
     .width(Fill)
     .height(Fill)

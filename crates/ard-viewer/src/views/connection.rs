@@ -28,6 +28,7 @@ pub fn connection(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message
         window_chrome_with_title(
             window_id,
             TITLEBAR_HEIGHT,
+            maximized,
             if cfg!(target_os = "macos") {
                 ""
             } else {

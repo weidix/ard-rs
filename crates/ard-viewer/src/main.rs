@@ -2052,6 +2052,7 @@ mod tests {
     #[test]
     fn collapsed_and_expanded_toolbar_handles_share_the_same_axis() {
         let (mut app, _task) = ArdViewer::new();
+        app.session_fullscreen = true;
         app.session_toolbar_x = Some(215.0);
         let window_id = window::Id::unique();
         let mut expanded = iced_test::Simulator::with_size(
@@ -2087,6 +2088,29 @@ mod tests {
         );
         assert!(collapse_bounds.y < views::SESSION_TITLEBAR_HEIGHT);
         assert!(expand_bounds.y < views::SESSION_TITLEBAR_HEIGHT);
+    }
+
+    #[test]
+    fn windowed_session_uses_the_titlebar_toolbar_without_a_collapse_handle() {
+        let (app, _task) = ArdViewer::new();
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Session.size(),
+            views::session(&app, window::Id::unique()),
+        );
+
+        assert!(
+            ui.find(iced::widget::Id::new("session-windowed-toolbar"))
+                .is_ok()
+        );
+        assert!(
+            ui.find(iced::widget::Id::new("session-toolbar-collapse-handle"))
+                .is_err()
+        );
+        assert!(
+            ui.find(iced::widget::Id::new("session-toolbar-expand-handle"))
+                .is_err()
+        );
     }
 
     #[test]

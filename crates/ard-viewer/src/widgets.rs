@@ -32,6 +32,7 @@ fn centered_icon(kind: Icon, size: f32, color: iced::Color) -> Element<'static, 
 pub fn window_chrome_with_title(
     window_id: window::Id,
     drag_height: f32,
+    maximized: bool,
     title: impl Into<String>,
     detail: Option<String>,
 ) -> Element<'static, Message> {
@@ -56,7 +57,7 @@ pub fn window_chrome_with_title(
             .padding([0.0, leading])
             .height(drag_height)
             .align_y(Alignment::Center),
-        window_platform_controls(window_id),
+        window_platform_controls(window_id, maximized),
     ]
     .width(Fill)
     .height(Fill)
@@ -66,11 +67,11 @@ pub fn window_chrome_with_title(
 fn window_drag_region_with_height(window_id: window::Id, height: f32) -> Element<'static, Message> {
     let leading_controls_width = if cfg!(target_os = "macos") { 72.0 } else { 8.0 };
     let trailing_controls_width = if cfg!(target_os = "windows") {
-        138.0
+        150.0
     } else if cfg!(target_os = "macos") {
         0.0
     } else {
-        110.0
+        128.0
     };
 
     let drag_handle = mouse_area(container(space()).width(Fill).height(height))
@@ -92,9 +93,12 @@ fn window_drag_region_with_height(window_id: window::Id, height: f32) -> Element
     .into()
 }
 
-pub fn window_platform_controls(window_id: window::Id) -> Element<'static, Message> {
+pub fn window_platform_controls(
+    window_id: window::Id,
+    maximized: bool,
+) -> Element<'static, Message> {
     #[cfg(target_os = "macos")]
-    let _ = window_id;
+    let _ = (window_id, maximized);
 
     #[cfg(target_os = "macos")]
     let platform_buttons: Element<'static, Message> = space().width(1).into();
@@ -102,7 +106,11 @@ pub fn window_platform_controls(window_id: window::Id) -> Element<'static, Messa
     let platform_buttons: Element<'static, Message> = row![
         titlebar_control(Icon::Minimize, Message::MinimizeWindow(window_id), false),
         titlebar_control(
-            Icon::Maximize,
+            if maximized {
+                Icon::Restore
+            } else {
+                Icon::Maximize
+            },
             Message::ToggleMaximizeWindow(window_id),
             false
         ),
@@ -113,7 +121,11 @@ pub fn window_platform_controls(window_id: window::Id) -> Element<'static, Messa
     let platform_buttons: Element<'static, Message> = row![
         titlebar_control(Icon::Minimize, Message::MinimizeWindow(window_id), false),
         titlebar_control(
-            Icon::Maximize,
+            if maximized {
+                Icon::Restore
+            } else {
+                Icon::Maximize
+            },
             Message::ToggleMaximizeWindow(window_id),
             false
         ),
@@ -136,9 +148,9 @@ fn titlebar_control<'a>(
     message: Message,
     close: bool,
 ) -> iced::widget::Button<'a, Message> {
-    button(centered_icon(kind, 10.0, theme::palette().text))
-        .width(if cfg!(target_os = "windows") { 46 } else { 34 })
-        .height(if cfg!(target_os = "windows") { 32 } else { 28 })
+    button(centered_icon(kind, 12.0, theme::palette().text))
+        .width(if cfg!(target_os = "windows") { 50 } else { 40 })
+        .height(32)
         .padding(0)
         .style(titlebar_control_style(close))
         .on_press(message)

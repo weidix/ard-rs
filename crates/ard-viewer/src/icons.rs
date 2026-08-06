@@ -9,6 +9,8 @@ pub enum Icon {
     #[cfg(not(target_os = "macos"))]
     Maximize,
     #[cfg(not(target_os = "macos"))]
+    Restore,
+    #[cfg(not(target_os = "macos"))]
     Close,
     Monitor,
     ChevronRight,
@@ -43,6 +45,8 @@ impl Icon {
             Self::Minimize => include_bytes!("../assets/icons/minus.svg"),
             #[cfg(not(target_os = "macos"))]
             Self::Maximize => include_bytes!("../assets/icons/maximize.svg"),
+            #[cfg(not(target_os = "macos"))]
+            Self::Restore => include_bytes!("../assets/icons/restore.svg"),
             #[cfg(not(target_os = "macos"))]
             Self::Close => include_bytes!("../assets/icons/close.svg"),
             Self::Monitor => include_bytes!("../assets/icons/monitor.svg"),
