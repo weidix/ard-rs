@@ -2331,8 +2331,14 @@ fn parse_cli_args(
     ))
 }
 
+fn parse_process_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(String, String, ArdVideoQuality, Duration), String> {
+    parse_cli_args(args.into_iter().skip(1))
+}
+
 fn main() {
-    let (address, username, quality, frame_interval) = match parse_cli_args(env::args().skip(2)) {
+    let (address, username, quality, frame_interval) = match parse_process_args(env::args()) {
         Ok(parsed) => parsed,
         Err(error) => {
             if !error.is_empty() {
@@ -2378,7 +2384,7 @@ mod tests {
 
     use super::{
         ScrollAccumulator, TileSet, fitted_viewport, framebuffer_to_rgba, is_system_shortcut,
-        mouse_button_bit, pack_dirty_gpu_tiles, pack_gpu_tiles, parse_cli_args,
+        mouse_button_bit, pack_dirty_gpu_tiles, pack_gpu_tiles, parse_cli_args, parse_process_args,
     };
     use ard_rs::{ArdVideoQuality, Framebuffer, MvsGpuTile, MvsGpuTileUpdate, PixelFormat};
     use winit::dpi::PhysicalPosition;
@@ -2392,6 +2398,18 @@ mod tests {
             parse_cli_args(["host:5900".to_owned(), "user".to_owned()]).unwrap();
         assert_eq!(quality, ArdVideoQuality::Adaptive);
         assert_eq!(interval, Duration::ZERO);
+    }
+
+    #[test]
+    fn viewer_process_args_skip_only_the_executable_name() {
+        let (address, username, _, _) = parse_process_args([
+            "ard_viewer.exe".to_owned(),
+            "host:5900".to_owned(),
+            "user".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(address, "host:5900");
+        assert_eq!(username, "user");
     }
 
     #[test]
