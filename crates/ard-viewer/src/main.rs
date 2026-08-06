@@ -2,8 +2,8 @@
 
 mod config;
 mod icons;
-#[path = "reference/ard-viewer.rs"]
-mod legacy_viewer;
+mod session_renderer;
+mod session_runtime;
 mod state;
 mod theme;
 mod views;
@@ -11,18 +11,26 @@ mod widgets;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ard_rs::ArdVideoQuality;
 use iced::widget::{column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, Subscription, Task, Theme, window};
 
+use session_runtime::{
+    ClipboardSync, ConnectionState, InputEvent, InputState, SessionConfig, SessionEvent,
+    SessionRuntime, StreamMetrics, is_paste_shortcut, map_remote_position,
+};
+
 use state::{DeviceState, KeyMapping, SavedDevice, SettingsSection, ThemePreference, WindowKind};
 
 const SESSION_TOOLBAR_WIDTH: f32 = 286.0;
 const SESSION_TOOLBAR_COLLAPSED_WIDTH: f32 = 44.0;
 const SETTINGS_WINDOW_OFFSET: f32 = 32.0;
+const SESSION_CANVAS_TOP: f32 = 62.0;
+const SESSION_CANVAS_SIDE: f32 = 85.0;
+const SESSION_CANVAS_HEIGHT: f32 = 650.0;
+const SESSION_IME_ID: &str = "session-ime-sink";
 
 #[derive(Debug)]
 struct ArdViewer {
@@ -50,6 +58,16 @@ struct ArdViewer {
     system_dark: bool,
     mappings: Vec<KeyMapping>,
     session_zoom: f32,
+    session_runtime: Option<SessionRuntime>,
+    session_connection: ConnectionState,
+    session_metrics: StreamMetrics,
+    session_server_name: String,
+    session_error: Option<String>,
+    session_input: InputState,
+    session_clipboard: ClipboardSync,
+    session_window_size: iced::Size,
+    session_pointer_remote: Option<(u16, u16)>,
+    ime_sink: String,
     session_fullscreen: bool,
     session_toolbar_visible: bool,
     session_toolbar_progress: f32,
@@ -120,6 +138,10 @@ enum Message {
     SessionToolbarDragStarted,
     SessionToolbarDragEnded,
     ToggleSessionToolbarPin,
+    SessionPoll,
+    SessionRawEvent(window::Id, iced::Event, iced::event::Status),
+    ClipboardRead(Option<String>),
+    ImeSinkChanged(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -181,6 +203,16 @@ impl ArdViewer {
             system_dark: false,
             mappings,
             session_zoom: 1.0,
+            session_runtime: None,
+            session_connection: ConnectionState::Idle,
+            session_metrics: StreamMetrics::default(),
+            session_server_name: String::new(),
+            session_error: None,
+            session_input: InputState::default(),
+            session_clipboard: ClipboardSync::default(),
+            session_window_size: WindowKind::Session.size(),
+            session_pointer_remote: None,
+            ime_sink: String::new(),
             session_fullscreen: false,
             session_toolbar_visible: true,
             session_toolbar_progress: 1.0,
@@ -206,7 +238,10 @@ impl ArdViewer {
         match self.windows.get(&id) {
             Some(WindowKind::Connection) => "ARD Viewer — Connect",
             Some(WindowKind::Settings) => "ARD Viewer — Settings",
-            Some(WindowKind::Session) => "Studio Mac — ARD Viewer",
+            Some(WindowKind::Session) if !self.session_server_name.is_empty() => {
+                return format!("{} — ARD Viewer", self.session_server_name);
+            }
+            Some(WindowKind::Session) => "ARD Viewer — Session",
             None => "ARD Viewer",
         }
         .to_owned()
@@ -217,7 +252,10 @@ impl ArdViewer {
             Message::WindowOpened(kind, id) => {
                 self.windows.insert(id, kind);
                 if kind == WindowKind::Session {
-                    return disable_implicit_titlebar_drag(id);
+                    return Task::batch([
+                        disable_implicit_titlebar_drag(id),
+                        iced::widget::operation::focus(iced::widget::Id::new(SESSION_IME_ID)),
+                    ]);
                 }
             }
             Message::WindowClosed(id) => {
@@ -226,13 +264,18 @@ impl ArdViewer {
                     self.pending_close = None;
                 }
                 let closed = self.windows.remove(&id);
+                if closed == Some(WindowKind::Session) {
+                    self.disconnect_session();
+                }
                 if closed == Some(WindowKind::Connection) || self.windows.is_empty() {
+                    self.disconnect_session();
                     return iced::exit();
                 }
             }
             Message::WindowEvent(id, window::Event::Resized(size)) => {
                 if self.windows.get(&id) == Some(&WindowKind::Session) {
                     self.session_toolbar_window_width = size.width;
+                    self.session_window_size = size;
                     self.clamp_session_toolbar_position();
                 }
                 return window::is_maximized(id)
@@ -457,10 +500,11 @@ impl ArdViewer {
                 } else {
                     self.store_credentials();
                     self.persist_config();
-                    match self.launch_session() {
-                        Ok(()) => self.status = "已启动远程会话".into(),
-                        Err(error) => self.status = format!("无法启动会话：{error}"),
+                    self.start_session();
+                    if let Some(id) = self.window_id(WindowKind::Session) {
+                        return window::gain_focus(id);
                     }
+                    return open_window(WindowKind::Session);
                 }
             }
             Message::ManageDevices => {
@@ -503,9 +547,33 @@ impl ArdViewer {
                     self.status = "已移除按键映射".into();
                 }
             }
-            Message::SessionAction(_) => {
+            Message::SessionAction(SessionAction::Undo) => {
+                self.session_zoom = 1.0;
                 self.touch_session_toolbar();
-                self.status = "会话输入、剪贴板与快捷键由实时渲染窗口处理".into();
+            }
+            Message::SessionAction(SessionAction::Input) => {
+                self.touch_session_toolbar();
+                self.status = "远程键鼠输入已启用".into();
+                if let Some(id) = self.window_id(WindowKind::Session) {
+                    return Task::batch([
+                        window::gain_focus(id),
+                        iced::widget::operation::focus(iced::widget::Id::new(SESSION_IME_ID)),
+                    ]);
+                }
+            }
+            Message::SessionAction(SessionAction::Clipboard) => {
+                self.touch_session_toolbar();
+                return iced::clipboard::read().map(Message::ClipboardRead);
+            }
+            Message::SessionAction(SessionAction::SystemShortcut) => {
+                self.touch_session_toolbar();
+                self.capture_system_shortcuts = !self.capture_system_shortcuts;
+                self.persist_config();
+                self.status = if self.capture_system_shortcuts {
+                    "系统快捷键将发送到远端".into()
+                } else {
+                    "系统快捷键保留在本机".into()
+                };
             }
             Message::SessionToolbarTick(now) => {
                 if self.session_toolbar_visible
@@ -583,6 +651,40 @@ impl ArdViewer {
                 self.session_toolbar_pinned = !self.session_toolbar_pinned;
                 self.touch_session_toolbar();
             }
+            Message::SessionPoll => {
+                let events = self
+                    .session_runtime
+                    .as_ref()
+                    .map(SessionRuntime::drain_events)
+                    .unwrap_or_default();
+                let mut tasks = Vec::new();
+                for event in events {
+                    tasks.push(self.handle_session_event(event));
+                }
+                tasks.push(iced::clipboard::read().map(Message::ClipboardRead));
+                return Task::batch(tasks);
+            }
+            Message::SessionRawEvent(id, event, event_status) => {
+                return self.handle_session_raw_event(id, event, event_status);
+            }
+            Message::ClipboardRead(contents) => {
+                if let Some(text) = self.session_clipboard.observe_local(contents)
+                    && self.session_input.is_ready()
+                    && let Err(error) = self.session_input.send_clipboard(&text)
+                {
+                    self.session_error = Some(format!("发送剪贴板失败：{error}"));
+                }
+            }
+            Message::ImeSinkChanged(value) => {
+                self.ime_sink = value
+                    .chars()
+                    .rev()
+                    .take(8)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+            }
         }
         Task::none()
     }
@@ -613,12 +715,15 @@ impl ArdViewer {
             window::close_events().map(Message::WindowClosed),
             window::events().map(|(id, event)| Message::WindowEvent(id, event)),
             iced::system::theme_changes().map(Message::SystemThemeChanged),
+            iced::event::listen_with(session_event_subscription),
         ];
         let session_open = self.window_id(WindowKind::Session).is_some();
         if session_open {
             subscriptions.push(
                 iced::time::every(Duration::from_millis(250)).map(Message::SessionToolbarTick),
             );
+            subscriptions
+                .push(iced::time::every(Duration::from_millis(250)).map(|_| Message::SessionPoll));
         }
         let toolbar_target = if self.session_toolbar_visible {
             1.0
@@ -711,20 +816,172 @@ impl ArdViewer {
         }
     }
 
-    fn launch_session(&self) -> Result<(), String> {
-        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        Command::new(executable)
-            .arg("--session-renderer")
-            .arg("--quality")
-            .arg(config::quality_to_cache(self.quality))
-            .arg("--frame-interval-ms")
-            .arg(normalized_frame_interval(&self.frame_interval_ms).to_string())
-            .arg(self.address.trim())
-            .arg(self.username.trim())
-            .env("ARD_PASSWORD", &self.password)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+    fn start_session(&mut self) {
+        self.disconnect_session();
+        self.session_connection = ConnectionState::Connecting;
+        self.session_metrics = StreamMetrics::default();
+        self.session_server_name.clear();
+        self.session_error = None;
+        self.session_zoom = 1.0;
+        self.session_runtime = Some(SessionRuntime::start(SessionConfig {
+            address: self.address.trim().to_owned(),
+            username: self.username.trim().to_owned(),
+            password: self.password.as_bytes().to_vec(),
+            quality: self.quality,
+            frame_interval: Duration::from_millis(normalized_frame_interval(
+                &self.frame_interval_ms,
+            )),
+        }));
+        self.status = "正在当前 Session 窗口中连接…".into();
+    }
+
+    fn disconnect_session(&mut self) {
+        if let Some(mut runtime) = self.session_runtime.take() {
+            runtime.disconnect();
+        }
+        self.session_input.clear_input();
+        self.session_pointer_remote = None;
+        self.session_connection = ConnectionState::Idle;
+    }
+
+    fn handle_session_event(&mut self, event: SessionEvent) -> Task<Message> {
+        match event {
+            SessionEvent::State(state) => {
+                if matches!(
+                    state,
+                    ConnectionState::Disconnected(_)
+                        | ConnectionState::Reconnecting { .. }
+                        | ConnectionState::Failed(_)
+                ) {
+                    self.session_input.clear_input();
+                }
+                self.status = state.label();
+                self.session_connection = state;
+            }
+            SessionEvent::Connected { server_name, input } => {
+                self.session_server_name = server_name;
+                self.session_input.set_input(input);
+                self.session_error = None;
+            }
+            SessionEvent::Clipboard(text) => {
+                let text = self.session_clipboard.apply_remote(text);
+                return iced::clipboard::write(text);
+            }
+            SessionEvent::Metrics(metrics) => self.session_metrics = metrics,
+            SessionEvent::RenderFailed(error) => {
+                self.session_error = Some(format!("渲染失败：{error}"));
+            }
+        }
+        Task::none()
+    }
+
+    fn handle_session_raw_event(
+        &mut self,
+        id: window::Id,
+        event: iced::Event,
+        event_status: iced::event::Status,
+    ) -> Task<Message> {
+        if self.window_id(WindowKind::Session) != Some(id) || self.session_runtime.is_none() {
+            return Task::none();
+        }
+        let input_event = match event {
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                let canvas = self.session_canvas_bounds();
+                let position = map_remote_position(
+                    canvas,
+                    position,
+                    iced::Size::new(self.session_metrics.width, self.session_metrics.height),
+                    self.session_zoom,
+                );
+                self.session_pointer_remote = position;
+                Some(InputEvent::CursorMoved(position))
+            }
+            iced::Event::Mouse(iced::mouse::Event::CursorLeft) => {
+                self.session_pointer_remote = None;
+                Some(InputEvent::CursorMoved(None))
+            }
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button))
+                if event_status == iced::event::Status::Ignored =>
+            {
+                Some(InputEvent::ButtonPressed(button))
+            }
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button))
+                if event_status == iced::event::Status::Ignored =>
+            {
+                Some(InputEvent::ButtonReleased(button))
+            }
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta })
+                if event_status == iced::event::Status::Ignored =>
+            {
+                Some(InputEvent::Wheel(delta))
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                Some(InputEvent::ModifiersChanged(modifiers))
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                location,
+                modifiers,
+                ..
+            }) => {
+                if is_paste_shortcut(&key, modifiers) {
+                    self.session_input.suppress_paste(physical_key);
+                    return iced::clipboard::read().map(Message::ClipboardRead);
+                }
+                Some(InputEvent::KeyPressed {
+                    key,
+                    physical: physical_key,
+                    location,
+                    modifiers,
+                })
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+                key,
+                physical_key,
+                location,
+                modifiers,
+                ..
+            }) => Some(InputEvent::KeyReleased {
+                key,
+                physical: physical_key,
+                location,
+                modifiers,
+            }),
+            iced::Event::InputMethod(iced::advanced::input_method::Event::Opened) => {
+                Some(InputEvent::ImeOpened)
+            }
+            iced::Event::InputMethod(iced::advanced::input_method::Event::Preedit(text, _)) => {
+                Some(InputEvent::ImePreedit(text))
+            }
+            iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(text)) => {
+                Some(InputEvent::ImeCommit(text))
+            }
+            iced::Event::InputMethod(iced::advanced::input_method::Event::Closed) => {
+                Some(InputEvent::ImeClosed)
+            }
+            iced::Event::Window(window::Event::Unfocused) => Some(InputEvent::FocusLost),
+            _ => None,
+        };
+        if let Some(event) = input_event
+            && let Err(error) = self
+                .session_input
+                .handle(event, self.capture_system_shortcuts)
+        {
+            self.session_error = Some(format!("远程输入失败：{error}"));
+        }
+        Task::none()
+    }
+
+    fn session_canvas_bounds(&self) -> iced::Rectangle {
+        iced::Rectangle::new(
+            iced::Point::new(SESSION_CANVAS_SIDE, SESSION_CANVAS_TOP),
+            iced::Size::new(
+                (self.session_window_size.width - SESSION_CANVAS_SIDE * 2.0).max(0.0),
+                SESSION_CANVAS_HEIGHT
+                    .min((self.session_window_size.height - SESSION_CANVAS_TOP).max(0.0)),
+            ),
+        )
     }
 
     fn export_shortcuts(&mut self) {
@@ -754,6 +1011,21 @@ impl ArdViewer {
 
 fn normalized_frame_interval(value: &str) -> u64 {
     value.trim().parse().unwrap_or(0)
+}
+
+fn session_event_subscription(
+    event: iced::Event,
+    status: iced::event::Status,
+    id: window::Id,
+) -> Option<Message> {
+    matches!(
+        event,
+        iced::Event::Keyboard(_)
+            | iced::Event::Mouse(_)
+            | iced::Event::InputMethod(_)
+            | iced::Event::Window(window::Event::Unfocused)
+    )
+    .then_some(Message::SessionRawEvent(id, event, status))
 }
 
 fn close_confirmation<'a>(
@@ -958,10 +1230,6 @@ fn profile_mappings(profile: &str) -> Vec<KeyMapping> {
 }
 
 fn main() -> iced::Result {
-    if std::env::args().nth(1).as_deref() == Some("--session-renderer") {
-        legacy_viewer::run_from_gui();
-        return Ok(());
-    }
     iced::daemon(ArdViewer::new, ArdViewer::update, ArdViewer::view)
         .title(ArdViewer::title)
         .theme(ArdViewer::theme)
@@ -1183,6 +1451,45 @@ mod tests {
         let _task = app.update(Message::SystemThemeChanged(iced::theme::Mode::Light));
         let _task = app.update(Message::ThemePreferenceChanged(ThemePreference::Dark));
         assert!(app.effective_dark());
+    }
+
+    #[test]
+    fn session_connection_transitions_cover_disconnect_and_reconnect() {
+        let (mut app, _task) = ArdViewer::new();
+        let _ = app.handle_session_event(SessionEvent::State(ConnectionState::Connecting));
+        assert_eq!(app.session_connection, ConnectionState::Connecting);
+
+        let _ = app.handle_session_event(SessionEvent::State(ConnectionState::Disconnected(
+            "transport lost".into(),
+        )));
+        assert!(app.status.contains("transport lost"));
+
+        let _ = app.handle_session_event(SessionEvent::State(ConnectionState::Reconnecting {
+            attempt: 1,
+        }));
+        assert!(app.status.contains("正在重连"));
+
+        let _ = app.handle_session_event(SessionEvent::State(ConnectionState::Connected));
+        assert_eq!(app.session_connection, ConnectionState::Connected);
+    }
+
+    #[test]
+    fn session_buttons_change_zoom_shortcut_and_toolbar_state() {
+        let (mut app, _task) = ArdViewer::new();
+        let _ = app.update(Message::SessionAction(SessionAction::Zoom));
+        assert!(app.session_zoom > 1.0);
+
+        let _ = app.update(Message::SessionAction(SessionAction::Fit));
+        assert_eq!(app.session_zoom, 1.0);
+
+        let shortcuts = app.capture_system_shortcuts;
+        let _ = app.update(Message::SessionAction(SessionAction::SystemShortcut));
+        assert_ne!(app.capture_system_shortcuts, shortcuts);
+        let _ = app.update(Message::SessionAction(SessionAction::SystemShortcut));
+        assert_eq!(app.capture_system_shortcuts, shortcuts);
+
+        let _ = app.update(Message::ToggleSessionToolbarPin);
+        assert!(app.session_toolbar_pinned);
     }
 
     #[test]

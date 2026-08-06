@@ -1,10 +1,12 @@
 use std::f32::consts::TAU;
 
-use iced::widget::{button, column, container, mouse_area, row, space, stack, text};
-use iced::{Alignment, Background, Border, Element, Fill, window};
+use iced::widget::{button, column, container, mouse_area, row, space, stack, text, text_input};
+use iced::{Alignment, Element, Fill, window};
 
 use crate::icons::{Icon, icon};
-use crate::theme::{self, BODY_SIZE, CAPTION_SIZE, CONTROL_RADIUS, MICRO_SIZE, WINDOW_RADIUS};
+use crate::session_renderer;
+use crate::session_runtime::ConnectionState;
+use crate::theme::{self, CONTROL_RADIUS, MICRO_SIZE, WINDOW_RADIUS};
 use crate::widgets::{window_drag_region, window_platform_controls};
 use crate::{
     ArdViewer, Message, SESSION_TOOLBAR_COLLAPSED_WIDTH, SESSION_TOOLBAR_WIDTH, SessionAction,
@@ -35,7 +37,23 @@ fn remote_canvas(
     toolbar_x: Option<f32>,
     window_width: f32,
 ) -> Element<'static, Message> {
-    let desktop = remote_desktop();
+    let desktop: Element<'static, Message> = if let Some(runtime) = &app.session_runtime {
+        container(session_renderer::remote_display(
+            runtime.mailbox(),
+            app.session_zoom,
+        ))
+        .height(650)
+        .width(Fill)
+        .style(theme::rounded_panel(theme::palette().remote_canvas, 6.0))
+        .into()
+    } else {
+        container(text(app.session_connection.label()).color(theme::palette().text_muted))
+            .height(650)
+            .width(Fill)
+            .center(Fill)
+            .style(theme::rounded_panel(theme::palette().remote_canvas, 6.0))
+            .into()
+    };
     let base = container(column![
         space().height(62),
         row![space().width(85), desktop, space().width(85)].height(650),
@@ -96,18 +114,42 @@ fn remote_canvas(
     .on_move(Message::SessionToolbarPointerMoved)
     .on_release(Message::SessionToolbarDragEnded);
     let pulse = ((app.ui_time * TAU / 2.4).sin() + 1.0) * 0.5;
+    let connected = app.session_connection == ConnectionState::Connected;
+    let status_color = if connected {
+        theme::mix(
+            theme::palette().success,
+            iced::Color::from_rgb8(126, 196, 145),
+            pulse,
+        )
+    } else {
+        theme::palette().text_muted
+    };
+    let decoder = if app.session_metrics.gpu_mvs {
+        "GPU MVS"
+    } else {
+        "RGBA"
+    };
+    let metrics = &app.session_metrics;
+    let status_text = app.session_error.clone().unwrap_or_else(|| {
+        if metrics.width > 0 && metrics.height > 0 {
+            format!(
+                "{decoder} · {} · {}×{} · {:.1} fps · ↓{:.2} Mbit/s · {}",
+                app.quality.label(),
+                metrics.width,
+                metrics.height,
+                metrics.frames_per_second,
+                metrics.megabits_per_second,
+                app.session_connection.label(),
+            )
+        } else {
+            app.session_connection.label()
+        }
+    });
     let status = container(
         container(
             row![
-                dot(
-                    theme::mix(
-                        theme::palette().success,
-                        iced::Color::from_rgb8(126, 196, 145),
-                        pulse
-                    ),
-                    6.0 + pulse * 1.4
-                ),
-                text("RGBA · 自适应质量 · 60 fps")
+                dot(status_color, 6.0 + pulse * 1.4),
+                text(status_text)
                     .size(MICRO_SIZE)
                     .color(theme::palette().text_muted)
             ]
@@ -126,7 +168,19 @@ fn remote_canvas(
     .align_x(Alignment::Start)
     .align_y(Alignment::End);
 
-    stack![base, controls, status]
+    let ime_sink = container(
+        text_input("", &app.ime_sink)
+            .id(iced::widget::Id::new(crate::SESSION_IME_ID))
+            .on_input(Message::ImeSinkChanged)
+            .size(1)
+            .padding(0)
+            .width(1),
+    )
+    .width(1)
+    .height(1)
+    .clip(true);
+
+    stack![base, controls, status, ime_sink]
         .width(Fill)
         .height(Fill)
         .clip(true)
@@ -227,156 +281,6 @@ fn toolbar_handle(
     .padding(0)
     .style(theme::toolbar_handle(is_dark))
     .on_press(message)
-}
-
-fn remote_desktop() -> Element<'static, Message> {
-    let menu = container(
-        row![
-            dot(theme::palette().text, 6.0),
-            text("Finder")
-                .size(CAPTION_SIZE)
-                .color(theme::palette().text),
-            text("文件   编辑   显示   前往   窗口   帮助")
-                .size(MICRO_SIZE)
-                .color(theme::palette().text_muted),
-            space().width(Fill),
-            text("Wi‑Fi   14:32")
-                .size(MICRO_SIZE)
-                .color(theme::palette().text_muted),
-        ]
-        .spacing(14)
-        .align_y(Alignment::Center),
-    )
-    .height(28)
-    .padding([0, 12])
-    .width(Fill)
-    .style(theme::shaped_panel(
-        iced::Color::from_rgb8(20, 20, 22),
-        iced::border::top(6),
-    ));
-
-    let remote_app = remote_app();
-    let contents = column![
-        menu,
-        space().height(90),
-        row![space().width(Fill), remote_app, space().width(Fill)],
-        space().height(Fill),
-    ]
-    .height(Fill)
-    .width(Fill);
-    let gradient = iced::gradient::Linear::new(iced::Degrees(150.0))
-        .add_stop(0.14, iced::Color::from_rgb8(23, 23, 26))
-        .add_stop(0.86, iced::Color::from_rgb8(77, 74, 69));
-    container(contents)
-        .height(650)
-        .width(Fill)
-        .style(move |_| iced::widget::container::Style {
-            background: Some(Background::Gradient(gradient.into())),
-            border: Border {
-                radius: 6.0.into(),
-                ..Border::default()
-            },
-            ..iced::widget::container::Style::default()
-        })
-        .into()
-}
-
-fn remote_app() -> Element<'static, Message> {
-    let chrome = container(
-        row![
-            dot(iced::Color::from_rgb8(51, 51, 51), 8.0),
-            dot(iced::Color::from_rgb8(51, 51, 51), 8.0),
-            dot(iced::Color::from_rgb8(51, 51, 51), 8.0),
-            text("Remote Project")
-                .size(BODY_SIZE)
-                .color(iced::Color::from_rgb8(51, 51, 51)),
-        ]
-        .spacing(7)
-        .align_y(Alignment::Center),
-    )
-    .height(42)
-    .width(Fill)
-    .padding([0, 12])
-    .center_y(42)
-    .style(theme::shaped_panel(
-        iced::Color::from_rgb8(214, 214, 212),
-        iced::border::top(10),
-    ));
-    let sidebar = container(
-        column![
-            text("Overview")
-                .size(CAPTION_SIZE)
-                .color(iced::Color::from_rgb8(64, 64, 64)),
-            text("Sessions")
-                .size(CAPTION_SIZE)
-                .color(iced::Color::from_rgb8(64, 64, 64)),
-            text("Devices")
-                .size(CAPTION_SIZE)
-                .color(iced::Color::from_rgb8(64, 64, 64)),
-            text("Settings")
-                .size(CAPTION_SIZE)
-                .color(iced::Color::from_rgb8(64, 64, 64)),
-        ]
-        .spacing(10),
-    )
-    .width(150)
-    .height(Fill)
-    .padding(14)
-    .style(theme::shaped_panel(
-        iced::Color::from_rgb8(222, 222, 219),
-        iced::border::bottom_left(10),
-    ));
-    let session_card = |label: &'static str, status: &'static str| {
-        container(
-            row![
-                icon(Icon::Monitor, 12.0, iced::Color::from_rgb8(56, 56, 56)),
-                text(label)
-                    .size(BODY_SIZE)
-                    .color(iced::Color::from_rgb8(56, 56, 56)),
-                text(status)
-                    .size(BODY_SIZE)
-                    .color(iced::Color::from_rgb8(56, 56, 56)),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-        )
-        .height(52)
-        .width(Fill)
-        .padding(12)
-        .center_y(52)
-        .style(theme::rounded_panel(
-            iced::Color::from_rgb8(227, 227, 224),
-            CONTROL_RADIUS,
-        ))
-    };
-    let pane = container(
-        column![
-            text("Active Sessions")
-                .size(19)
-                .color(iced::Color::from_rgb8(33, 33, 33)),
-            text("2 devices currently connected")
-                .size(CAPTION_SIZE)
-                .color(iced::Color::from_rgb8(107, 107, 107)),
-            session_card("Studio Mac", "Connected"),
-            session_card("Office Mini", "Idle"),
-        ]
-        .spacing(14),
-    )
-    .width(470)
-    .height(Fill)
-    .padding(22)
-    .style(theme::shaped_panel(
-        iced::Color::from_rgb8(242, 242, 240),
-        iced::border::bottom_right(10),
-    ));
-    container(column![chrome, row![sidebar, pane].height(Fill)])
-        .width(620)
-        .height(390)
-        .style(theme::rounded_panel(
-            iced::Color::from_rgb8(237, 237, 235),
-            10.0,
-        ))
-        .into()
 }
 
 fn dot(color: iced::Color, size: f32) -> Element<'static, Message> {
