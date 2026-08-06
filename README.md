@@ -15,6 +15,15 @@ depends on windowing, GPU, and clipboard backends.
 It connects directly to the ARD TCP service and supports mouse, keyboard,
 clipboard, and IME text input.
 
+The pre-Iced standalone Winit/WGPU viewer is retained as an `ard-core` example:
+
+```sh
+cargo run -p ard-core --release --example ard_viewer -- \
+  192.168.1.20:5900 username
+```
+
+The example prompts for the ARD password interactively without echoing it.
+
 ```sh
 cargo build -p ard-viewer --release --bin ard-viewer
 ARD_PASSWORD='screen-sharing-password' \

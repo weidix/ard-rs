@@ -139,6 +139,7 @@ enum Message {
     SessionToolbarDragEnded,
     ToggleSessionToolbarPin,
     SessionPoll,
+    SessionClipboardPoll,
     SessionRawEvent(window::Id, iced::Event, iced::event::Status),
     ClipboardRead(Option<String>),
     ImeSinkChanged(String),
@@ -252,10 +253,7 @@ impl ArdViewer {
             Message::WindowOpened(kind, id) => {
                 self.windows.insert(id, kind);
                 if kind == WindowKind::Session {
-                    return Task::batch([
-                        disable_implicit_titlebar_drag(id),
-                        iced::widget::operation::focus(iced::widget::Id::new(SESSION_IME_ID)),
-                    ]);
+                    return disable_implicit_titlebar_drag(id);
                 }
             }
             Message::WindowClosed(id) => {
@@ -563,7 +561,7 @@ impl ArdViewer {
             }
             Message::SessionAction(SessionAction::Clipboard) => {
                 self.touch_session_toolbar();
-                return iced::clipboard::read().map(Message::ClipboardRead);
+                return read_clipboard_text();
             }
             Message::SessionAction(SessionAction::SystemShortcut) => {
                 self.touch_session_toolbar();
@@ -661,8 +659,10 @@ impl ArdViewer {
                 for event in events {
                     tasks.push(self.handle_session_event(event));
                 }
-                tasks.push(iced::clipboard::read().map(Message::ClipboardRead));
                 return Task::batch(tasks);
+            }
+            Message::SessionClipboardPoll => {
+                return read_clipboard_text();
             }
             Message::SessionRawEvent(id, event, event_status) => {
                 return self.handle_session_raw_event(id, event, event_status);
@@ -722,8 +722,13 @@ impl ArdViewer {
             subscriptions.push(
                 iced::time::every(Duration::from_millis(250)).map(Message::SessionToolbarTick),
             );
-            subscriptions
-                .push(iced::time::every(Duration::from_millis(250)).map(|_| Message::SessionPoll));
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(250))
+                    .map(|_| Message::SessionClipboardPoll),
+            );
+            if let Some(runtime) = &self.session_runtime {
+                subscriptions.push(runtime.frame_subscription().map(|_| Message::SessionPoll));
+            }
         }
         let toolbar_target = if self.session_toolbar_visible {
             1.0
@@ -739,7 +744,7 @@ impl ArdViewer {
             || self.settings_transition < 0.999
             || (self.session_toolbar_progress - toolbar_target).abs() > 0.001
             || (self.close_modal_progress - modal_target).abs() > 0.001;
-        if session_open || transition_active {
+        if transition_active {
             subscriptions
                 .push(iced::time::every(Duration::from_millis(16)).map(Message::AnimationTick));
         }
@@ -865,7 +870,7 @@ impl ArdViewer {
             }
             SessionEvent::Clipboard(text) => {
                 let text = self.session_clipboard.apply_remote(text);
-                return iced::clipboard::write(text);
+                return iced::clipboard::write(text).discard();
             }
             SessionEvent::Metrics(metrics) => self.session_metrics = metrics,
             SessionEvent::RenderFailed(error) => {
@@ -927,7 +932,7 @@ impl ArdViewer {
             }) => {
                 if is_paste_shortcut(&key, modifiers) {
                     self.session_input.suppress_paste(physical_key);
-                    return iced::clipboard::read().map(Message::ClipboardRead);
+                    return read_clipboard_text();
                 }
                 Some(InputEvent::KeyPressed {
                     key,
@@ -1112,6 +1117,11 @@ fn reveal_and_focus(id: window::Id) -> Task<Message> {
     Task::batch([window::minimize(id, false), window::gain_focus(id)])
 }
 
+fn read_clipboard_text() -> Task<Message> {
+    iced::clipboard::read_text()
+        .map(|result| Message::ClipboardRead(result.ok().map(|text| text.as_ref().clone())))
+}
+
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn disable_implicit_titlebar_drag(id: window::Id) -> Task<Message> {
@@ -1235,7 +1245,7 @@ fn main() -> iced::Result {
         .theme(ArdViewer::theme)
         .subscription(ArdViewer::subscription)
         .font(include_bytes!("../assets/Inter-Variable.ttf").as_slice())
-        .default_font(iced::Font::with_name("Inter"))
+        .default_font(iced::Font::new("Inter"))
         .antialiasing(true)
         .run()
 }
@@ -1501,7 +1511,7 @@ mod tests {
                     .as_slice()
                     .into(),
             ],
-            default_font: iced::Font::with_name("Inter"),
+            default_font: iced::Font::new("Inter"),
             ..iced::Settings::default()
         };
         for (mode, preference) in [

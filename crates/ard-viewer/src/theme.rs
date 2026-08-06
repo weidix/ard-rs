@@ -107,7 +107,7 @@ pub fn app_theme() -> Theme {
     };
     Theme::custom(
         name,
-        iced::theme::Palette {
+        iced::theme::palette::Seed {
             background: palette.background,
             text: palette.text,
             primary: palette.accent,
@@ -424,7 +424,6 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
             width: 1.0,
             radius: CONTROL_RADIUS.into(),
         },
-        icon: palette().text_muted,
         placeholder: palette().text_muted,
         value: palette().text,
         selection: Color::from_rgba8(235, 237, 242, 0.28),
@@ -435,7 +434,6 @@ pub fn inline_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(Color::TRANSPARENT),
         border: Border::default(),
-        icon: palette().text_muted,
         placeholder: palette().text_muted,
         value: palette().text,
         selection: Color::from_rgba8(235, 237, 242, 0.28),

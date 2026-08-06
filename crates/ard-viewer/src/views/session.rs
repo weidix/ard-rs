@@ -36,8 +36,8 @@ fn remote_canvas(
     is_dark: bool,
     toolbar_x: Option<f32>,
     window_width: f32,
-) -> Element<'static, Message> {
-    let desktop: Element<'static, Message> = if let Some(runtime) = &app.session_runtime {
+) -> Element<'_, Message> {
+    let desktop: Element<'_, Message> = if let Some(runtime) = &app.session_runtime {
         container(session_renderer::remote_display(
             runtime.mailbox(),
             app.session_zoom,

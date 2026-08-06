@@ -4,7 +4,7 @@ use ard_rs::{MvsGpuTile, MvsGpuTileUpdate};
 use iced::widget::shader::{self, Program};
 use iced::{Element, Fill, Rectangle, Size};
 
-use crate::session_runtime::{FramePacket, SessionEvent, SharedMailbox, TileSet, fitted_viewport};
+use crate::session_runtime::{FramePacket, SharedMailbox, TileSet, fitted_viewport};
 
 #[derive(Debug, Clone)]
 pub struct RemoteProgram {
@@ -64,7 +64,6 @@ impl shader::Primitive for RemotePrimitive {
         _bounds: &Rectangle,
         viewport: &shader::Viewport,
     ) {
-        pipeline.used_this_frame = true;
         let changed_session = pipeline
             .mailbox
             .as_ref()
@@ -83,14 +82,11 @@ impl shader::Primitive for RemotePrimitive {
             .ok()
             .and_then(|mut mailbox| mailbox.latest.take());
         let Some(mut frame) = frame else { return };
-        let uploaded = pipeline.upload(&mut frame);
+        pipeline.upload(&mut frame);
         if let Some(buffer) = frame.rgba.take()
             && let Ok(mut mailbox) = self.mailbox.lock()
         {
             mailbox.recycle_rgba(buffer);
-        }
-        if !uploaded {
-            pipeline.report_error("远程帧 GPU 上传失败");
         }
     }
 
@@ -142,7 +138,6 @@ pub struct RemotePipeline {
     bounds: Rectangle,
     zoom: f32,
     scale_factor: f32,
-    used_this_frame: bool,
 }
 
 impl std::fmt::Debug for RemotePipeline {
@@ -201,8 +196,8 @@ impl shader::Pipeline for RemotePipeline {
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ARD MVS compute pipeline layout"),
-                bind_group_layouts: &[&compute_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&compute_layout)],
+                immediate_size: 0,
             });
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("ARD MVS tile decoder"),
@@ -219,8 +214,8 @@ impl shader::Pipeline for RemotePipeline {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ARD presentation pipeline layout"),
-                bind_group_layouts: &[&empty_layout, &render_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&empty_layout), Some(&render_layout)],
+                immediate_size: 0,
             });
         let empty_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ARD empty presentation bind group"),
@@ -249,7 +244,7 @@ impl shader::Pipeline for RemotePipeline {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -284,17 +279,7 @@ impl shader::Pipeline for RemotePipeline {
             bounds: Rectangle::default(),
             zoom: 1.0,
             scale_factor: 1.0,
-            used_this_frame: false,
         }
-    }
-
-    fn trim(&mut self) {
-        if self.used_this_frame {
-            self.used_this_frame = false;
-            return;
-        }
-        self.reset_session();
-        self.mailbox = None;
     }
 }
 
@@ -309,14 +294,6 @@ impl RemotePipeline {
         self.mvs_bind_group = None;
         if let Ok(mut pending) = self.pending_mvs_decode.lock() {
             *pending = None;
-        }
-    }
-
-    fn report_error(&self, error: &str) {
-        if let Some(mailbox) = &self.mailbox
-            && let Ok(mut mailbox) = mailbox.lock()
-        {
-            mailbox.push_event(SessionEvent::RenderFailed(error.to_owned()));
         }
     }
 
@@ -450,7 +427,7 @@ impl RemotePipeline {
         if dirty == 0 {
             tiles.clear_dirty();
             self.uploaded_mvs_tiles = Some(tiles);
-            return true;
+            return false;
         }
         pack_dirty_gpu_tiles(&tiles, &mut self.records_scratch, &mut self.payload_scratch);
         let records_recreated = write_storage_buffer(
@@ -576,6 +553,7 @@ impl RemotePipeline {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_scissor_rect(
             clip_bounds.x,
@@ -584,8 +562,8 @@ impl RemotePipeline {
             clip_bounds.height,
         );
         pass.set_viewport(
-            viewport.x,
-            viewport.y,
+            viewport.x.round(),
+            viewport.y.round(),
             viewport.width,
             viewport.height,
             0.0,

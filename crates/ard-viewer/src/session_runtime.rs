@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -9,10 +10,13 @@ use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdKey, ArdNamedKey,
     ArdVideoQuality, Framebuffer, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
 };
+use iced::futures::StreamExt;
+use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use iced::futures::stream::BoxStream;
 use iced::keyboard::key::{Code, Named, Physical};
 use iced::keyboard::{Key, Location, Modifiers};
 use iced::mouse::{Button, ScrollDelta};
-use iced::{Point, Rectangle, Size};
+use iced::{Point, Rectangle, Size, Subscription};
 
 const MAX_EVENTS: usize = 32;
 const MAX_INPUT_COMMANDS: usize = 128;
@@ -213,8 +217,58 @@ impl FrameMailbox {
 
 pub type SharedMailbox = Arc<Mutex<FrameMailbox>>;
 
+#[derive(Debug)]
+struct FrameWake {
+    sender: UnboundedSender<()>,
+    receiver: Mutex<Option<UnboundedReceiver<()>>>,
+    pending: AtomicBool,
+}
+
+impl FrameWake {
+    fn new() -> Arc<Self> {
+        let (sender, receiver) = unbounded();
+        Arc::new(Self {
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+            pending: AtomicBool::new(false),
+        })
+    }
+
+    fn notify(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.unbounded_send(());
+        }
+    }
+
+    fn acknowledge(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+struct FrameWakeSubscription(Arc<FrameWake>);
+
+impl Hash for FrameWakeSubscription {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+fn frame_wake_stream(wake: &FrameWakeSubscription) -> BoxStream<'static, ()> {
+    wake.0
+        .receiver
+        .lock()
+        .ok()
+        .and_then(|mut receiver| receiver.take())
+        .map_or_else(
+            || iced::futures::stream::pending().boxed(),
+            StreamExt::boxed,
+        )
+}
+
 pub struct SessionRuntime {
     mailbox: SharedMailbox,
+    frame_wake: Arc<FrameWake>,
     cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -230,15 +284,18 @@ impl std::fmt::Debug for SessionRuntime {
 impl SessionRuntime {
     pub fn start(config: SessionConfig) -> Self {
         let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
+        let frame_wake = FrameWake::new();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_mailbox = Arc::clone(&mailbox);
+        let worker_frame_wake = Arc::clone(&frame_wake);
         let worker_cancel = Arc::clone(&cancel);
         let worker = thread::Builder::new()
             .name("ard-session".into())
-            .spawn(move || run_receiver(config, worker_mailbox, worker_cancel))
+            .spawn(move || run_receiver(config, worker_mailbox, worker_frame_wake, worker_cancel))
             .expect("ARD session worker thread should start");
         Self {
             mailbox,
+            frame_wake,
             cancel,
             worker: Some(worker),
         }
@@ -249,9 +306,17 @@ impl SessionRuntime {
     }
 
     pub fn drain_events(&self) -> Vec<SessionEvent> {
+        self.frame_wake.acknowledge();
         self.mailbox.lock().map_or_else(
             |_| vec![SessionEvent::RenderFailed("会话缓存已损坏".into())],
             |mut mailbox| mailbox.drain_events(),
+        )
+    }
+
+    pub fn frame_subscription(&self) -> Subscription<()> {
+        Subscription::run_with(
+            FrameWakeSubscription(Arc::clone(&self.frame_wake)),
+            frame_wake_stream,
         )
     }
 
@@ -267,12 +332,18 @@ impl Drop for SessionRuntime {
     }
 }
 
-fn run_receiver(config: SessionConfig, mailbox: SharedMailbox, cancel: Arc<AtomicBool>) {
+fn run_receiver(
+    config: SessionConfig,
+    mailbox: SharedMailbox,
+    frame_wake: Arc<FrameWake>,
+    cancel: Arc<AtomicBool>,
+) {
     let mut reconnecting = false;
     let mut attempts = 0;
     while !cancel.load(Ordering::Acquire) {
         push_event(
             &mailbox,
+            &frame_wake,
             SessionEvent::State(if reconnecting {
                 ConnectionState::Reconnecting {
                     attempt: attempts + 1,
@@ -296,6 +367,7 @@ fn run_receiver(config: SessionConfig, mailbox: SharedMailbox, cancel: Arc<Atomi
                 if attempts >= MAX_RECONNECT_ATTEMPTS {
                     push_event(
                         &mailbox,
+                        &frame_wake,
                         SessionEvent::State(ConnectionState::Failed(error.to_string())),
                     );
                     return;
@@ -311,12 +383,17 @@ fn run_receiver(config: SessionConfig, mailbox: SharedMailbox, cancel: Arc<Atomi
         reconnecting = true;
         push_event(
             &mailbox,
+            &frame_wake,
             SessionEvent::Connected {
                 server_name: client.server_name().to_owned(),
                 input: client.input(),
             },
         );
-        push_event(&mailbox, SessionEvent::State(ConnectionState::Connected));
+        push_event(
+            &mailbox,
+            &frame_wake,
+            SessionEvent::State(ConnectionState::Connected),
+        );
         let mut meter = RateMeter::new();
         loop {
             if cancel.load(Ordering::Acquire) {
@@ -324,7 +401,7 @@ fn run_receiver(config: SessionConfig, mailbox: SharedMailbox, cancel: Arc<Atomi
             }
             match client.next_event() {
                 Ok(ArdClientEvent::Frame(info)) => {
-                    let gpu_mvs = queue_frame(&mailbox, &mut client, config.quality);
+                    let gpu_mvs = queue_frame(&mailbox, &frame_wake, &mut client, config.quality);
                     let metrics = meter.record(
                         info.framebuffer_updates,
                         info.wire_bytes,
@@ -344,13 +421,14 @@ fn run_receiver(config: SessionConfig, mailbox: SharedMailbox, cancel: Arc<Atomi
                     }
                 }
                 Ok(ArdClientEvent::Clipboard(text)) => {
-                    push_event(&mailbox, SessionEvent::Clipboard(text));
+                    push_event(&mailbox, &frame_wake, SessionEvent::Clipboard(text));
                 }
                 Ok(ArdClientEvent::Bell | ArdClientEvent::StateChange) => {}
                 Ok(ArdClientEvent::Reconnected) => unreachable!("automatic reconnect is disabled"),
                 Err(error) => {
                     push_event(
                         &mailbox,
+                        &frame_wake,
                         SessionEvent::State(ConnectionState::Disconnected(error.to_string())),
                     );
                     if wait_for_retry(&cancel) {
@@ -374,13 +452,19 @@ fn wait_for_retry(cancel: &AtomicBool) -> bool {
     false
 }
 
-fn push_event(mailbox: &SharedMailbox, event: SessionEvent) {
+fn push_event(mailbox: &SharedMailbox, frame_wake: &FrameWake, event: SessionEvent) {
     if let Ok(mut mailbox) = mailbox.lock() {
         mailbox.push_event(event);
     }
+    frame_wake.notify();
 }
 
-fn queue_frame(mailbox: &SharedMailbox, client: &mut ArdClient, quality: ArdVideoQuality) -> bool {
+fn queue_frame(
+    mailbox: &SharedMailbox,
+    frame_wake: &FrameWake,
+    client: &mut ArdClient,
+    quality: ArdVideoQuality,
+) -> bool {
     let gpu_frames = client.take_gpu_mvs_frames();
     if !gpu_frames.is_empty() {
         let Ok(mut queued) = mailbox.lock() else {
@@ -405,6 +489,8 @@ fn queue_frame(mailbox: &SharedMailbox, client: &mut ArdClient, quality: ArdVide
                 queued.replace_latest(FramePacket::from_mvs(frame, quality));
             }
         }
+        drop(queued);
+        frame_wake.notify();
         return true;
     }
     let framebuffer = client.framebuffer();
@@ -430,6 +516,7 @@ fn queue_frame(mailbox: &SharedMailbox, client: &mut ArdClient, quality: ArdVide
             ));
         }
     }
+    frame_wake.notify();
     false
 }
 
@@ -525,7 +612,62 @@ impl TileSet {
     }
 
     fn from_updates(width: u16, height: u16, updates: Vec<MvsGpuTileUpdate>) -> Self {
-        let mut set = Self::new(width, height, updates.len());
+        let tiles_wide = usize::from(width).div_ceil(8);
+        let tiles_high = usize::from(height).div_ceil(8);
+        let tile_count = tiles_wide.saturating_mul(tiles_high);
+        let expected_tiles = updates.len();
+        if tile_count <= MAX_DENSE_TILE_SLOTS {
+            let mut slots = vec![EMPTY_TILE_SLOT; tile_count];
+            let mut dirty_bits = vec![0; tile_count.div_ceil(64)];
+            let mut dirty_positions = Vec::with_capacity(expected_tiles);
+            let mut unique_slots = true;
+            for (position, update) in updates.iter().enumerate() {
+                let slot = (usize::from(update.y) / 8)
+                    .saturating_mul(tiles_wide)
+                    .saturating_add(usize::from(update.x) / 8);
+                let Some(slot_position) = slots.get_mut(slot) else {
+                    unique_slots = false;
+                    break;
+                };
+                if *slot_position != EMPTY_TILE_SLOT {
+                    unique_slots = false;
+                    break;
+                }
+                *slot_position = u32::try_from(position).expect("MVS tile count fits u32");
+                let word = slot / 64;
+                dirty_bits[word] |= 1_u64 << (slot % 64);
+                dirty_positions.push(position);
+            }
+            if unique_slots {
+                return Self {
+                    width,
+                    height,
+                    tiles_wide,
+                    storage: TileStorage::Dense {
+                        slots,
+                        tiles: updates,
+                        dirty_bits,
+                        dirty_positions,
+                    },
+                };
+            }
+        } else {
+            let mut tiles = HashMap::with_capacity(expected_tiles);
+            let mut dirty = HashSet::with_capacity(expected_tiles);
+            for update in updates {
+                let key = (update.x, update.y);
+                tiles.insert(key, update);
+                dirty.insert(key);
+            }
+            return Self {
+                width,
+                height,
+                tiles_wide,
+                storage: TileStorage::Sparse { tiles, dirty },
+            };
+        }
+
+        let mut set = Self::new(width, height, expected_tiles);
         for update in updates {
             set.insert_force_dirty(update);
         }
@@ -565,6 +707,8 @@ impl TileSet {
                     let index = *position as usize;
                     let current = &tiles[index];
                     if force_dirty
+                        || current.x != update.x
+                        || current.y != update.y
                         || current.width != update.width
                         || current.height != update.height
                         || !same_mvs_tile(&current.tile, &update.tile)
@@ -630,6 +774,22 @@ impl TileSet {
 
     pub fn matches_dimensions(&self, width: u16, height: u16) -> bool {
         (self.width, self.height) == (width, height)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match &self.storage {
+            TileStorage::Dense { tiles, .. } => tiles.len(),
+            TileStorage::Sparse { tiles, .. } => tiles.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn first(&self) -> Option<&MvsGpuTileUpdate> {
+        match &self.storage {
+            TileStorage::Dense { tiles, .. } => tiles.first(),
+            TileStorage::Sparse { tiles, .. } => tiles.values().next(),
+        }
     }
 
     pub fn dirty_len(&self) -> usize {
@@ -1518,6 +1678,59 @@ mod tests {
             Some(SessionEvent::State(ConnectionState::Connected))
         ));
         assert!(mailbox.rgba_pool.len() <= MAX_RGBA_POOL);
+    }
+
+    #[test]
+    fn tile_set_coalesces_same_tile_without_stale_geometry() {
+        let mut tiles = TileSet::new(16, 16, 2);
+        tiles.insert(MvsGpuTileUpdate {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+            tile: MvsGpuTile::SolidRgba([1, 2, 3, 255]),
+        });
+        tiles.insert(MvsGpuTileUpdate {
+            x: 1,
+            y: 1,
+            width: 8,
+            height: 8,
+            tile: MvsGpuTile::SolidRgba([1, 2, 3, 255]),
+        });
+
+        let update = tiles.first().expect("tile was inserted");
+        assert_eq!(tiles.len(), 1);
+        assert_eq!((update.x, update.y), (1, 1));
+        assert_eq!((update.width, update.height), (8, 8));
+    }
+
+    #[test]
+    fn tile_set_from_updates_preserves_known_good_coalescing() {
+        let first = MvsGpuTileUpdate {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+            tile: MvsGpuTile::SolidRgba([1, 2, 3, 255]),
+        };
+        let second = MvsGpuTileUpdate {
+            x: 8,
+            y: 0,
+            width: 8,
+            height: 8,
+            tile: MvsGpuTile::SolidRgba([4, 5, 6, 255]),
+        };
+        let unique = TileSet::from_updates(16, 8, vec![first.clone(), second]);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique.dirty_len(), 2);
+
+        let replacement = MvsGpuTileUpdate {
+            tile: MvsGpuTile::SolidRgba([7, 8, 9, 255]),
+            ..first.clone()
+        };
+        let duplicate = TileSet::from_updates(16, 8, vec![first, replacement.clone()]);
+        assert_eq!(duplicate.len(), 1);
+        assert_eq!(duplicate.first(), Some(&replacement));
     }
 
     #[test]

@@ -126,10 +126,11 @@ fn general(app: &ArdViewer) -> Element<'_, Message> {
                 row![
                     text("主题模式").size(BODY_SIZE).width(150),
                     pick_list(
-                        ThemePreference::ALL,
                         Some(app.theme_preference),
-                        Message::ThemePreferenceChanged,
+                        ThemePreference::ALL,
+                        ToString::to_string,
                     )
+                    .on_select(Message::ThemePreferenceChanged)
                     .width(180)
                     .padding([10, 12])
                     .text_size(BODY_SIZE)
@@ -170,9 +171,10 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
             text("预设")
                 .size(BODY_SIZE)
                 .color(theme::palette().text_muted),
-            pick_list(presets, Some(app.key_profile.as_str()), |value| {
-                Message::KeyProfileChanged(value.to_owned())
+            pick_list(Some(app.key_profile.as_str()), presets, |value| {
+                (*value).to_owned()
             })
+            .on_select(|value| Message::KeyProfileChanged(value.to_owned()))
             .width(410)
             .padding([10, 12])
             .text_size(BODY_SIZE)
@@ -326,7 +328,6 @@ fn display(app: &ArdViewer) -> Element<'_, Message> {
                 row![
                     text("视频质量").size(BODY_SIZE).width(150),
                     pick_list(
-                        QUALITIES,
                         Some(match app.quality {
                             ArdVideoQuality::Low => "低",
                             ArdVideoQuality::Medium => "中",
@@ -334,14 +335,16 @@ fn display(app: &ArdViewer) -> Element<'_, Message> {
                             ArdVideoQuality::Full => "完整",
                             _ => "自适应",
                         }),
-                        |value| Message::QualityChanged(match value {
-                            "低" => ArdVideoQuality::Low,
-                            "中" => ArdVideoQuality::Medium,
-                            "高" => ArdVideoQuality::High,
-                            "完整" => ArdVideoQuality::Full,
-                            _ => ArdVideoQuality::Adaptive,
-                        })
+                        QUALITIES,
+                        |value| (*value).to_owned(),
                     )
+                    .on_select(|value| Message::QualityChanged(match value {
+                        "低" => ArdVideoQuality::Low,
+                        "中" => ArdVideoQuality::Medium,
+                        "高" => ArdVideoQuality::High,
+                        "完整" => ArdVideoQuality::Full,
+                        _ => ArdVideoQuality::Adaptive,
+                    }))
                     .padding([10, 12])
                     .text_size(BODY_SIZE)
                     .style(theme::pick_list)
