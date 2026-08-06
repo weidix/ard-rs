@@ -1202,7 +1202,7 @@ impl ArdViewer {
                 modifiers,
                 ..
             }) => {
-                if is_paste_shortcut(&key, modifiers) {
+                if !self.capture_system_shortcuts && is_paste_shortcut(&key, modifiers) {
                     self.session_input.suppress_paste(physical_key);
                     return read_clipboard_text();
                 }

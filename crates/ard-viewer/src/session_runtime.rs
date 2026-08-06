@@ -1061,6 +1061,7 @@ enum InputCommand {
 struct InputDispatcher {
     sender: SyncSender<InputCommand>,
     input: Arc<Mutex<Option<ArdClientInput>>>,
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl InputDispatcher {
@@ -1068,51 +1069,78 @@ impl InputDispatcher {
         let (sender, receiver) = sync_channel(MAX_INPUT_COMMANDS);
         let input: Arc<Mutex<Option<ArdClientInput>>> = Arc::new(Mutex::new(None));
         let worker_input = Arc::clone(&input);
+        let error = Arc::new(Mutex::new(None));
+        let worker_error = Arc::clone(&error);
         thread::Builder::new()
             .name("ard-input-dispatch".into())
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
                     let input = worker_input.lock().ok().and_then(|input| input.clone());
-                    match command {
+                    let result = match command {
                         InputCommand::Key { pressed, keysym } => {
                             if let Some(input) = &input {
-                                let _ = input.send_key_event(pressed, keysym);
+                                input.send_key_event(pressed, keysym)
+                            } else {
+                                Ok(())
                             }
                         }
                         InputCommand::Pointer { mask, x, y } => {
                             if let Some(input) = &input {
-                                let _ = input.send_pointer_event(mask, x, y);
+                                input.send_pointer_event(mask, x, y)
+                            } else {
+                                Ok(())
                             }
                         }
                         InputCommand::PointerBatch(events) => {
                             if let Some(input) = &input {
-                                let _ = input.send_pointer_events(&events);
+                                input.send_pointer_events(&events)
+                            } else {
+                                Ok(())
                             }
                         }
                         InputCommand::Scroll(event) => {
                             if let Some(input) = &input {
-                                let _ = input.send_scroll_wheel_event(event);
+                                input.send_scroll_wheel_event(event)
+                            } else {
+                                Ok(())
                             }
                         }
                         InputCommand::Clipboard(text) => {
                             if let Some(input) = &input {
-                                let _ = input.send_clipboard_text(&text);
+                                input.send_clipboard_text(&text)
+                            } else {
+                                Ok(())
                             }
                         }
+                    };
+                    if let Err(send_error) = result
+                        && let Ok(mut current) = worker_error.lock()
+                    {
+                        *current = Some(send_error.to_string());
                     }
                 }
             })
             .expect("ARD input dispatcher should start");
-        Self { sender, input }
+        Self {
+            sender,
+            input,
+            error,
+        }
     }
 
     fn set_input(&self, input: Option<ArdClientInput>) {
         if let Ok(mut current) = self.input.lock() {
             *current = input;
         }
+        if let Ok(mut error) = self.error.lock() {
+            *error = None;
+        }
     }
 
     fn submit(&self, command: InputCommand) -> Result<(), String> {
+        if let Some(error) = self.error.lock().ok().and_then(|mut error| error.take()) {
+            return Err(error);
+        }
         self.sender.try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => "远程输入缓存已满".to_owned(),
             TrySendError::Disconnected(_) => "远程输入调度器已停止".to_owned(),
@@ -1163,7 +1191,7 @@ impl InputState {
                 modifiers,
             } => {
                 self.modifiers = modifiers;
-                if is_paste_shortcut(&key, modifiers) {
+                if !capture_shortcuts && is_paste_shortcut(&key, modifiers) {
                     return Ok(());
                 }
                 if !capture_shortcuts && is_system_shortcut(physical, &key, modifiers) {
@@ -1481,17 +1509,32 @@ fn is_textual_key(key: &Key) -> bool {
 }
 
 fn key_event_keysym(key: &Key, physical: Physical, location: Location) -> Option<u32> {
-    match key.as_ref() {
-        Key::Character(text) => text
-            .chars()
-            .next()
-            .and_then(|c| keysym_for_key(ArdKey::Character(c))),
-        Key::Named(key) => {
-            named_key_to_ard(key, location).and_then(|key| keysym_for_key(ArdKey::Named(key)))
+    apple_modifier_keysym(physical).or_else(|| {
+        match key.as_ref() {
+            Key::Character(text) => text
+                .chars()
+                .next()
+                .and_then(|c| keysym_for_key(ArdKey::Character(c))),
+            Key::Named(key) => {
+                named_key_to_ard(key, location).and_then(|key| keysym_for_key(ArdKey::Named(key)))
+            }
+            Key::Unidentified => None,
         }
-        Key::Unidentified => None,
-    }
-    .or_else(|| physical_key_to_keysym(physical))
+        .or_else(|| physical_key_to_keysym(physical))
+    })
+}
+
+fn apple_modifier_keysym(physical: Physical) -> Option<u32> {
+    let key = match physical {
+        // Apple's RFB client and server use Alt keysyms for Command and Meta
+        // keysyms for Option. Super keysyms are not interpreted as Command.
+        Physical::Code(Code::SuperLeft) => ArdNamedKey::AltLeft,
+        Physical::Code(Code::SuperRight) => ArdNamedKey::AltRight,
+        Physical::Code(Code::AltLeft) => ArdNamedKey::MetaLeft,
+        Physical::Code(Code::AltRight) => ArdNamedKey::MetaRight,
+        _ => return None,
+    };
+    keysym_for_key(ArdKey::Named(key))
 }
 
 fn named_key_to_ard(key: Named, location: Location) -> Option<ArdNamedKey> {
@@ -1528,23 +1571,16 @@ fn named_key_to_ard(key: Named, location: Location) -> Option<ArdNamedKey> {
         }
         Named::Alt | Named::AltGraph => {
             if left && key != Named::AltGraph {
-                ArdNamedKey::AltLeft
-            } else {
-                ArdNamedKey::AltRight
-            }
-        }
-        Named::Super => {
-            if left {
-                ArdNamedKey::SuperLeft
-            } else {
-                ArdNamedKey::SuperRight
-            }
-        }
-        Named::Meta => {
-            if left {
                 ArdNamedKey::MetaLeft
             } else {
                 ArdNamedKey::MetaRight
+            }
+        }
+        Named::Super | Named::Meta => {
+            if left {
+                ArdNamedKey::AltLeft
+            } else {
+                ArdNamedKey::AltRight
             }
         }
         Named::CapsLock => ArdNamedKey::CapsLock,
@@ -1906,6 +1942,80 @@ mod tests {
             &Key::Character("v".into()),
             Modifiers::COMMAND
         ));
+    }
+
+    #[test]
+    fn apple_command_and_option_use_native_rfb_modifier_keysyms() {
+        assert_eq!(
+            key_event_keysym(
+                &Key::Named(Named::Super),
+                Physical::Code(Code::SuperLeft),
+                Location::Left,
+            ),
+            Some(0xffe9)
+        );
+        assert_eq!(
+            key_event_keysym(
+                &Key::Named(Named::Super),
+                Physical::Code(Code::SuperRight),
+                Location::Right,
+            ),
+            Some(0xffea)
+        );
+        assert_eq!(
+            key_event_keysym(
+                &Key::Named(Named::Alt),
+                Physical::Code(Code::AltLeft),
+                Location::Left,
+            ),
+            Some(0xffe7)
+        );
+        assert_eq!(
+            key_event_keysym(
+                &Key::Named(Named::Alt),
+                Physical::Code(Code::AltRight),
+                Location::Right,
+            ),
+            Some(0xffe8)
+        );
+        assert_eq!(
+            key_event_keysym(
+                &Key::Named(Named::Super),
+                Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+                Location::Left,
+            ),
+            Some(0xffe9)
+        );
+        assert_eq!(
+            key_event_keysym(
+                &Key::Named(Named::Alt),
+                Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+                Location::Left,
+            ),
+            Some(0xffe7)
+        );
+    }
+
+    #[test]
+    fn paste_shortcut_is_forwarded_when_remote_shortcut_capture_is_enabled() {
+        let physical = Physical::Code(Code::KeyV);
+        let event = || InputEvent::KeyPressed {
+            key: Key::Character("v".into()),
+            physical,
+            location: Location::Standard,
+            modifiers: Modifiers::COMMAND,
+        };
+
+        let mut local_paste = InputState::default();
+        local_paste.handle(event(), false).unwrap();
+        assert!(!local_paste.pressed_keys.contains_key(&physical));
+
+        let mut remote_paste = InputState::default();
+        remote_paste.handle(event(), true).unwrap();
+        assert_eq!(
+            remote_paste.pressed_keys.get(&physical),
+            Some(&u32::from(b'v'))
+        );
     }
 
     #[test]
