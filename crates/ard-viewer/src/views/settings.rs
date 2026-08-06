@@ -1,5 +1,4 @@
-use ard_rs::ArdVideoQuality;
-use iced::widget::{checkbox, column, container, pick_list, row, space, stack, text};
+use iced::widget::{checkbox, column, container, row, space, stack, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::icons::{Icon, icon};
@@ -8,8 +7,11 @@ use crate::theme::{
     self, BODY_SIZE, CAPTION_SIZE, CONTENT_PADDING_X, CONTROL_HEIGHT, CONTROL_RADIUS, ICON_SIZE,
     TITLE_SIZE, WINDOW_RADIUS,
 };
-use crate::widgets::{muted, secondary, secondary_with_icon, window_chrome_with_title};
-use crate::{ArdViewer, Message};
+use crate::widgets::{
+    DropdownOption, DropdownSection, dropdown, muted, quality_dropdown_sections, secondary,
+    secondary_with_icon, window_chrome_with_title,
+};
+use crate::{ArdViewer, DropdownMenu, Message};
 
 pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.is_window_maximized(window_id);
@@ -123,29 +125,62 @@ fn general(app: &ArdViewer) -> Element<'_, Message> {
             column![
                 setting_field(
                     app.language.tr("主题模式"),
-                    pick_list(
-                        Some(app.theme_preference),
-                        ThemePreference::ALL,
-                        move |value| value.label(app.language).to_owned(),
-                    )
-                    .on_select(Message::ThemePreferenceChanged)
-                    .width(280)
-                    .padding([10, 12])
-                    .text_size(BODY_SIZE)
-                    .style(theme::pick_list)
-                    .menu_style(theme::pick_list_menu),
+                    dropdown(
+                        app.theme_preference.label(app.language),
+                        vec![DropdownSection::new(
+                            None,
+                            ThemePreference::ALL
+                                .into_iter()
+                                .map(|value| {
+                                    DropdownOption::new(
+                                        value.label(app.language),
+                                        app.theme_preference == value,
+                                        Message::ThemePreferenceChanged(value),
+                                    )
+                                    .id(match value {
+                                        ThemePreference::System => "theme-option-system",
+                                        ThemePreference::Light => "theme-option-light",
+                                        ThemePreference::Dark => "theme-option-dark",
+                                    })
+                                })
+                                .collect(),
+                        )],
+                        280.0,
+                        BODY_SIZE,
+                        app.open_dropdown == Some(DropdownMenu::Theme),
+                        Message::ToggleDropdown(DropdownMenu::Theme),
+                        Message::CloseDropdown,
+                    ),
                 ),
                 setting_field(
                     app.language.tr("语言"),
-                    pick_list(Some(app.language), crate::i18n::Language::ALL, |value| {
-                        value.label().to_owned()
-                    })
-                    .on_select(Message::LanguageChanged)
-                    .width(280)
-                    .padding([10, 12])
-                    .text_size(BODY_SIZE)
-                    .style(theme::pick_list)
-                    .menu_style(theme::pick_list_menu),
+                    dropdown(
+                        app.language.label(),
+                        vec![DropdownSection::new(
+                            None,
+                            crate::i18n::Language::ALL
+                                .into_iter()
+                                .map(|value| {
+                                    DropdownOption::new(
+                                        value.label(),
+                                        app.language == value,
+                                        Message::LanguageChanged(value),
+                                    )
+                                    .id(match value {
+                                        crate::i18n::Language::SimplifiedChinese => {
+                                            "language-option-zh"
+                                        }
+                                        crate::i18n::Language::English => "language-option-en",
+                                    })
+                                })
+                                .collect(),
+                        )],
+                        280.0,
+                        BODY_SIZE,
+                        app.open_dropdown == Some(DropdownMenu::Language),
+                        Message::ToggleDropdown(DropdownMenu::Language),
+                        Message::CloseDropdown,
+                    ),
                 ),
                 text(active_theme)
                     .size(CAPTION_SIZE)
@@ -227,15 +262,32 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
             text(app.language.tr("预设"))
                 .size(BODY_SIZE)
                 .color(theme::palette().text_muted),
-            pick_list(Some(app.key_profile.as_str()), presets, |value| {
-                app.language.tr(value).to_owned()
-            })
-            .on_select(|value| Message::KeyProfileChanged(value.to_owned()))
-            .width(410)
-            .padding([10, 12])
-            .text_size(BODY_SIZE)
-            .style(theme::pick_list)
-            .menu_style(theme::pick_list_menu),
+            dropdown(
+                app.language.tr(&app.key_profile),
+                vec![DropdownSection::new(
+                    None,
+                    presets
+                        .into_iter()
+                        .map(|value| {
+                            DropdownOption::new(
+                                app.language.tr(value),
+                                app.key_profile == value,
+                                Message::KeyProfileChanged(value.to_owned()),
+                            )
+                            .id(match value {
+                                "Windows 默认" => "key-profile-option-windows",
+                                "Linux 默认" => "key-profile-option-linux",
+                                _ => "key-profile-option-macos",
+                            })
+                        })
+                        .collect(),
+                )],
+                410.0,
+                BODY_SIZE,
+                app.open_dropdown == Some(DropdownMenu::KeyProfile),
+                Message::ToggleDropdown(DropdownMenu::KeyProfile),
+                Message::CloseDropdown,
+            ),
         ]
         .spacing(5),
         secondary(app.language.tr("复制预设"), Message::CopyPreset)
@@ -372,7 +424,6 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
 }
 
 fn display(app: &ArdViewer) -> Element<'_, Message> {
-    let qualities = ["低", "中", "高", "自适应", "完整"];
     column![
         page_heading(
             app.language.tr("显示与性能"),
@@ -383,28 +434,15 @@ fn display(app: &ArdViewer) -> Element<'_, Message> {
             row![
                 container(setting_field(
                     app.language.tr("视频质量"),
-                    pick_list(
-                        Some(app.language.tr(match app.quality {
-                            ArdVideoQuality::Low => "低",
-                            ArdVideoQuality::Medium => "中",
-                            ArdVideoQuality::High => "高",
-                            ArdVideoQuality::Full => "完整",
-                            _ => "自适应",
-                        })),
-                        qualities,
-                        |value| app.language.tr(value).to_owned(),
-                    )
-                    .on_select(|value| Message::QualityChanged(match value {
-                        "低" | "Low" => ArdVideoQuality::Low,
-                        "中" | "Medium" => ArdVideoQuality::Medium,
-                        "高" | "High" => ArdVideoQuality::High,
-                        "完整" | "Full" => ArdVideoQuality::Full,
-                        _ => ArdVideoQuality::Adaptive,
-                    }))
-                    .padding([10, 12])
-                    .text_size(BODY_SIZE)
-                    .style(theme::pick_list)
-                    .menu_style(theme::pick_list_menu),
+                    dropdown(
+                        app.language.tr(app.quality.label()),
+                        quality_dropdown_sections(app.language, app.quality),
+                        Fill,
+                        BODY_SIZE,
+                        app.open_dropdown == Some(DropdownMenu::DisplayQuality),
+                        Message::ToggleDropdown(DropdownMenu::DisplayQuality),
+                        Message::CloseDropdown,
+                    ),
                 ))
                 .width(Fill),
                 container(setting_field(

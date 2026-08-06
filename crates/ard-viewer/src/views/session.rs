@@ -74,6 +74,7 @@ fn remote_canvas(
         container(session_renderer::remote_display(
             runtime.mailbox(),
             app.session_zoom,
+            runtime.should_interpolate(),
         ))
         .height(Fill)
         .width(Fill)

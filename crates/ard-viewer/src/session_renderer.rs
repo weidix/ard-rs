@@ -10,11 +10,16 @@ use crate::session_runtime::{FramePacket, SharedMailbox, TileSet, fitted_viewpor
 pub struct RemoteProgram {
     mailbox: SharedMailbox,
     zoom: f32,
+    should_interpolate: bool,
 }
 
 impl RemoteProgram {
-    pub fn new(mailbox: SharedMailbox, zoom: f32) -> Self {
-        Self { mailbox, zoom }
+    pub fn new(mailbox: SharedMailbox, zoom: f32, should_interpolate: bool) -> Self {
+        Self {
+            mailbox,
+            zoom,
+            should_interpolate,
+        }
     }
 }
 
@@ -32,6 +37,7 @@ impl<Message> Program<Message> for RemoteProgram {
             mailbox: Arc::clone(&self.mailbox),
             bounds,
             zoom: self.zoom,
+            should_interpolate: self.should_interpolate,
         }
     }
 }
@@ -39,8 +45,9 @@ impl<Message> Program<Message> for RemoteProgram {
 pub fn remote_display<Message: 'static>(
     mailbox: SharedMailbox,
     zoom: f32,
+    should_interpolate: bool,
 ) -> Element<'static, Message> {
-    shader::Shader::new(RemoteProgram::new(mailbox, zoom))
+    shader::Shader::new(RemoteProgram::new(mailbox, zoom, should_interpolate))
         .width(Fill)
         .height(Fill)
         .into()
@@ -51,6 +58,7 @@ pub struct RemotePrimitive {
     mailbox: SharedMailbox,
     bounds: Rectangle,
     zoom: f32,
+    should_interpolate: bool,
 }
 
 impl shader::Primitive for RemotePrimitive {
@@ -73,6 +81,7 @@ impl shader::Primitive for RemotePrimitive {
         }
         pipeline.mailbox = Some(Arc::clone(&self.mailbox));
         pipeline.zoom = self.zoom;
+        pipeline.should_interpolate = self.should_interpolate;
         pipeline.scale_factor = viewport.scale_factor();
         pipeline.bounds = self.bounds;
 
@@ -118,7 +127,8 @@ pub struct RemotePipeline {
     device: wgpu::Device,
     queue: wgpu::Queue,
     compute_pipeline: wgpu::ComputePipeline,
-    render_pipeline: wgpu::RenderPipeline,
+    interpolated_render_pipeline: wgpu::RenderPipeline,
+    nearest_render_pipeline: wgpu::RenderPipeline,
     compute_layout: wgpu::BindGroupLayout,
     render_layout: wgpu::BindGroupLayout,
     empty_bind_group: wgpu::BindGroup,
@@ -137,6 +147,7 @@ pub struct RemotePipeline {
     mailbox: Option<SharedMailbox>,
     bounds: Rectangle,
     zoom: f32,
+    should_interpolate: bool,
     scale_factor: f32,
 }
 
@@ -222,31 +233,37 @@ impl shader::Pipeline for RemotePipeline {
             layout: &empty_layout,
             entries: &[],
         });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ARD presentation pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let create_render_pipeline = |label, entry_point| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry_point),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let interpolated_render_pipeline =
+            create_render_pipeline("ARD interpolated presentation pipeline", "fs_interpolated");
+        let nearest_render_pipeline =
+            create_render_pipeline("ARD nearest presentation pipeline", "fs_nearest");
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ARD decoded frame sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -259,7 +276,8 @@ impl shader::Pipeline for RemotePipeline {
             device: device.clone(),
             queue: queue.clone(),
             compute_pipeline,
-            render_pipeline,
+            interpolated_render_pipeline,
+            nearest_render_pipeline,
             compute_layout,
             render_layout,
             empty_bind_group,
@@ -278,6 +296,7 @@ impl shader::Pipeline for RemotePipeline {
             mailbox: None,
             bounds: Rectangle::default(),
             zoom: 1.0,
+            should_interpolate: true,
             scale_factor: 1.0,
         }
     }
@@ -569,7 +588,11 @@ impl RemotePipeline {
             0.0,
             1.0,
         );
-        pass.set_pipeline(&self.render_pipeline);
+        pass.set_pipeline(if self.should_interpolate {
+            &self.interpolated_render_pipeline
+        } else {
+            &self.nearest_render_pipeline
+        });
         pass.set_bind_group(0, &self.empty_bind_group, &[]);
         pass.set_bind_group(1, &decoded.render_bind_group, &[]);
         pass.draw(0..3, 0..1);
@@ -715,7 +738,7 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0),
+            remote_display::<()>(mailbox, 1.0, true),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
         assert!(snapshot.matches_image("/tmp/ard-viewer-iced-rgba-pipeline")?);
@@ -745,7 +768,7 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0),
+            remote_display::<()>(mailbox, 1.0, true),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
         assert!(snapshot.matches_image("/tmp/ard-viewer-iced-mvs-pipeline")?);

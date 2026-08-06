@@ -37,6 +37,7 @@ pub struct SessionConfig {
     pub password: Vec<u8>,
     pub quality: ArdVideoQuality,
     pub frame_interval: Duration,
+    pub should_interpolate: bool,
 }
 
 impl Drop for SessionConfig {
@@ -286,6 +287,7 @@ fn frame_wake_stream(wake: &FrameWakeSubscription) -> BoxStream<'static, ()> {
 pub struct SessionRuntime {
     mailbox: SharedMailbox,
     frame_wake: Arc<FrameWake>,
+    should_interpolate: bool,
     cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -300,6 +302,7 @@ impl std::fmt::Debug for SessionRuntime {
 
 impl SessionRuntime {
     pub fn start(config: SessionConfig) -> Self {
+        let should_interpolate = config.should_interpolate;
         let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
         let frame_wake = FrameWake::new();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -313,6 +316,7 @@ impl SessionRuntime {
         Self {
             mailbox,
             frame_wake,
+            should_interpolate,
             cancel,
             worker: Some(worker),
         }
@@ -320,6 +324,10 @@ impl SessionRuntime {
 
     pub fn mailbox(&self) -> SharedMailbox {
         Arc::clone(&self.mailbox)
+    }
+
+    pub fn should_interpolate(&self) -> bool {
+        self.should_interpolate
     }
 
     pub fn drain_events(&self) -> Vec<SessionEvent> {

@@ -53,7 +53,9 @@ struct ArdViewer {
     remember_password: bool,
     remember_device: bool,
     quality: ArdVideoQuality,
+    open_dropdown: Option<DropdownMenu>,
     frame_rate: String,
+    should_interpolate: bool,
     settings_section: SettingsSection,
     settings_transition: f32,
     key_profile: String,
@@ -94,6 +96,15 @@ struct ArdViewer {
     status: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropdownMenu {
+    ConnectionQuality,
+    Theme,
+    Language,
+    KeyProfile,
+    DisplayQuality,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     WindowOpened(WindowKind, window::Id),
@@ -129,8 +140,11 @@ enum Message {
     Connect,
     ExportShortcuts,
     SettingsSectionSelected(SettingsSection),
+    ToggleDropdown(DropdownMenu),
+    CloseDropdown,
     QualityChanged(ArdVideoQuality),
     FrameRateChanged(String),
+    ShouldInterpolateChanged(bool),
     KeyProfileChanged(String),
     AutoAdaptChanged(bool),
     CaptureShortcutsChanged(bool),
@@ -203,11 +217,13 @@ impl ArdViewer {
             remember_password: cached.remember_password,
             remember_device: cached.remember_device,
             quality: config::quality_from_cache(&cached.quality),
+            open_dropdown: None,
             frame_rate: if cached.frame_rate.is_empty() {
                 frame_rate_from_interval(&cached.frame_interval_ms)
             } else {
                 cached.frame_rate.clone()
             },
+            should_interpolate: cached.should_interpolate,
             settings_section: SettingsSection::KeyMapping,
             settings_transition: 1.0,
             key_profile: cached.key_profile,
@@ -486,8 +502,19 @@ impl ArdViewer {
                     self.settings_transition = 0.0;
                 }
             }
+            Message::ToggleDropdown(dropdown) => {
+                self.open_dropdown = if self.open_dropdown == Some(dropdown) {
+                    None
+                } else {
+                    Some(dropdown)
+                };
+            }
+            Message::CloseDropdown => {
+                self.open_dropdown = None;
+            }
             Message::QualityChanged(quality) => {
                 self.quality = quality;
+                self.open_dropdown = None;
                 self.persist_config();
             }
             Message::FrameRateChanged(value) => {
@@ -501,9 +528,14 @@ impl ArdViewer {
                 });
                 self.persist_config();
             }
+            Message::ShouldInterpolateChanged(value) => {
+                self.should_interpolate = value;
+                self.persist_config();
+            }
             Message::KeyProfileChanged(value) => {
                 self.mappings = profile_mappings(&value);
                 self.key_profile = value;
+                self.open_dropdown = None;
                 self.persist_config();
             }
             Message::AutoAdaptChanged(value) => {
@@ -524,11 +556,13 @@ impl ArdViewer {
             }
             Message::ThemePreferenceChanged(preference) => {
                 self.theme_preference = preference;
+                self.open_dropdown = None;
                 theme::set_dark(self.effective_dark());
                 self.persist_config();
             }
             Message::LanguageChanged(language) => {
                 self.language = language;
+                self.open_dropdown = None;
                 self.status.clear();
                 self.persist_config();
             }
@@ -927,6 +961,7 @@ impl ArdViewer {
             quality: config::quality_to_cache(self.quality).into(),
             frame_rate: self.frame_rate.clone(),
             frame_interval_ms: frame_interval_from_rate(&self.frame_rate).to_string(),
+            should_interpolate: self.should_interpolate,
             key_profile: self.key_profile.clone(),
             auto_adapt_keyboard: self.auto_adapt_keyboard,
             capture_system_shortcuts: self.capture_system_shortcuts,
@@ -1036,6 +1071,7 @@ impl ArdViewer {
             password: password.into_bytes(),
             quality: self.quality,
             frame_interval: frame_duration_from_rate(&self.frame_rate),
+            should_interpolate: self.should_interpolate,
         }));
         self.status = self.language.tr("正在当前 Session 窗口中连接…").into();
     }
@@ -2125,6 +2161,54 @@ mod tests {
     }
 
     #[test]
+    fn native_interpolation_connection_parameter_can_be_changed() {
+        let (mut app, _task) = ArdViewer::new();
+        assert!(app.should_interpolate);
+
+        let _task = app.update(Message::ShouldInterpolateChanged(false));
+        assert!(!app.should_interpolate);
+    }
+
+    #[test]
+    fn grouped_quality_menu_selects_a_zlib_profile() {
+        let (mut app, _task) = ArdViewer::new();
+        app.open_dropdown = Some(DropdownMenu::ConnectionQuality);
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Connection.size(),
+            views::connection(&app, window::Id::unique()),
+        );
+
+        ui.click(iced::widget::Id::new("quality-option-full"))
+            .expect("full-quality Zlib option should be clickable");
+
+        assert!(
+            ui.into_messages()
+                .any(|message| matches!(message, Message::QualityChanged(ArdVideoQuality::Full)))
+        );
+    }
+
+    #[test]
+    fn unified_settings_dropdown_emits_the_selected_value() {
+        let (mut app, _task) = ArdViewer::new();
+        app.settings_section = SettingsSection::General;
+        app.open_dropdown = Some(DropdownMenu::Theme);
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Settings.size(),
+            views::settings(&app, window::Id::unique()),
+        );
+
+        ui.click(iced::widget::Id::new("theme-option-dark"))
+            .expect("dark theme option should be clickable");
+
+        assert!(ui.into_messages().any(|message| matches!(
+            message,
+            Message::ThemePreferenceChanged(ThemePreference::Dark)
+        )));
+    }
+
+    #[test]
     fn session_connection_transitions_cover_disconnect_and_reconnect() {
         let (mut app, _task) = ArdViewer::new();
         let _ = app.handle_session_event(SessionEvent::State(ConnectionState::Connecting));
@@ -2230,6 +2314,108 @@ mod tests {
             assert!(snapshot.matches_image(format!(
                 "/tmp/ard-viewer-capabilities-v3-{mode}-connection-menu"
             ))?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "writes a visual QA snapshot to /tmp"]
+    fn render_native_interpolation_connection_parameter() -> Result<(), iced_test::Error> {
+        let (mut app, _task) = ArdViewer::new();
+        theme::set_dark(false);
+        let settings = iced::Settings {
+            fonts: vec![
+                include_bytes!("../assets/Inter-Variable.ttf")
+                    .as_slice()
+                    .into(),
+            ],
+            default_font: iced::Font::new("Inter"),
+            ..iced::Settings::default()
+        };
+        let mut ui = iced_test::Simulator::with_size(
+            settings,
+            WindowKind::Connection.size(),
+            views::connection(&app, window::Id::unique()),
+        );
+        let snapshot = ui.snapshot(&theme::app_theme())?;
+        assert!(snapshot.matches_image("/tmp/ard-viewer-native-interpolation-option-v10")?);
+        drop(ui);
+
+        let mut compact = iced_test::Simulator::with_size(
+            iced::Settings {
+                fonts: vec![
+                    include_bytes!("../assets/Inter-Variable.ttf")
+                        .as_slice()
+                        .into(),
+                ],
+                default_font: iced::Font::new("Inter"),
+                ..iced::Settings::default()
+            },
+            iced::Size::new(900.0, 520.0),
+            views::connection(&app, window::Id::unique()),
+        );
+        let compact_snapshot = compact.snapshot(&theme::app_theme())?;
+        assert!(
+            compact_snapshot
+                .matches_image("/tmp/ard-viewer-native-interpolation-option-compact-v4")?
+        );
+        drop(compact);
+
+        app.open_dropdown = Some(DropdownMenu::ConnectionQuality);
+        let mut grouped_quality = iced_test::Simulator::with_size(
+            iced::Settings {
+                fonts: vec![
+                    include_bytes!("../assets/Inter-Variable.ttf")
+                        .as_slice()
+                        .into(),
+                ],
+                default_font: iced::Font::new("Inter"),
+                ..iced::Settings::default()
+            },
+            WindowKind::Connection.size(),
+            views::connection(&app, window::Id::unique()),
+        );
+        let grouped_quality_snapshot = grouped_quality.snapshot(&theme::app_theme())?;
+        assert!(grouped_quality_snapshot.matches_image("/tmp/ard-viewer-video-quality-groups-v3")?);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "writes unified dropdown visual QA snapshots to /tmp"]
+    fn render_unified_dropdown_snapshots() -> Result<(), iced_test::Error> {
+        theme::set_dark(false);
+        for (name, section, dropdown) in [
+            ("theme", SettingsSection::General, DropdownMenu::Theme),
+            ("language", SettingsSection::General, DropdownMenu::Language),
+            (
+                "key-profile",
+                SettingsSection::KeyMapping,
+                DropdownMenu::KeyProfile,
+            ),
+            (
+                "display-quality",
+                SettingsSection::Display,
+                DropdownMenu::DisplayQuality,
+            ),
+        ] {
+            let (mut app, _task) = ArdViewer::new();
+            app.settings_section = section;
+            app.open_dropdown = Some(dropdown);
+            let mut ui = iced_test::Simulator::with_size(
+                iced::Settings {
+                    fonts: vec![
+                        include_bytes!("../assets/Inter-Variable.ttf")
+                            .as_slice()
+                            .into(),
+                    ],
+                    default_font: iced::Font::new("Inter"),
+                    ..iced::Settings::default()
+                },
+                WindowKind::Settings.size(),
+                views::settings(&app, window::Id::unique()),
+            );
+            let snapshot = ui.snapshot(&theme::app_theme())?;
+            assert!(snapshot.matches_image(format!("/tmp/ard-viewer-unified-dropdown-v1-{name}"))?);
         }
         Ok(())
     }

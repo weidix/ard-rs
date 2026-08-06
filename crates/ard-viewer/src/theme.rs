@@ -1,6 +1,5 @@
-use iced::widget::overlay::menu;
 use iced::widget::{
-    button, checkbox as iced_checkbox, container, pick_list as iced_pick_list, text_input,
+    button, checkbox as iced_checkbox, container, scrollable as iced_scrollable, text_input,
 };
 use iced::{Background, Border, Color, Shadow, Theme, border};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -483,6 +482,53 @@ pub fn context_menu_button(
     }
 }
 
+pub fn quality_selector_button(
+    open: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |_, status| {
+        let outlined = open || matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(palette().surface_active)),
+            text_color: palette().text,
+            border: Border {
+                color: if outlined {
+                    mix(palette().border, palette().text, 0.20)
+                } else {
+                    Color::TRANSPARENT
+                },
+                width: if outlined { 1.0 } else { 0.0 },
+                radius: CONTROL_RADIUS.into(),
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+pub fn quality_menu_button(
+    selected: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |_, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: (selected || hovered).then_some(Background::Color(mix(
+                palette().surface_active,
+                if selected {
+                    palette().accent
+                } else {
+                    palette().text
+                },
+                if selected { 0.18 } else { 0.08 },
+            ))),
+            text_color: palette().text,
+            border: Border {
+                radius: 5.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
 pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(
@@ -506,6 +552,29 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
     }
 }
 
+pub fn connection_parameter_input(_: &Theme, status: text_input::Status) -> text_input::Style {
+    let focused = matches!(status, text_input::Status::Focused { is_hovered: _ });
+    text_input::Style {
+        background: Background::Color(palette().surface_active),
+        border: Border {
+            color: if focused {
+                mix(palette().border, palette().text, 0.20)
+            } else {
+                Color::TRANSPARENT
+            },
+            width: if focused { 1.0 } else { 0.0 },
+            radius: CONTROL_RADIUS.into(),
+        },
+        placeholder: palette().text_muted,
+        value: palette().text,
+        selection: Color {
+            a: 0.34,
+            ..palette().accent
+        },
+        icon: palette().text_muted,
+    }
+}
+
 pub fn inline_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(Color::TRANSPARENT),
@@ -517,52 +586,6 @@ pub fn inline_input(_: &Theme, _: text_input::Status) -> text_input::Style {
             ..palette().accent
         },
         icon: palette().text_muted,
-    }
-}
-
-pub fn pick_list(_: &Theme, status: iced_pick_list::Status) -> iced_pick_list::Style {
-    let opened = matches!(status, iced_pick_list::Status::Opened { .. });
-    iced_pick_list::Style {
-        text_color: palette().text,
-        placeholder_color: palette().text_muted,
-        handle_color: if opened {
-            palette().text
-        } else {
-            palette().text_muted
-        },
-        background: Background::Color(palette().surface_active),
-        border: Border {
-            color: if opened {
-                mix(palette().border, palette().text, 0.20)
-            } else {
-                Color::TRANSPARENT
-            },
-            width: if opened { 1.0 } else { 0.0 },
-            radius: CONTROL_RADIUS.into(),
-        },
-    }
-}
-
-pub fn pick_list_menu(_: &Theme) -> menu::Style {
-    menu::Style {
-        background: Background::Color(palette().surface_active),
-        border: Border {
-            color: mix(palette().border, palette().text, 0.20),
-            width: 1.0,
-            radius: CONTROL_RADIUS.into(),
-        },
-        text_color: palette().text,
-        selected_text_color: palette().text,
-        selected_background: Background::Color(mix(
-            palette().surface_active,
-            palette().accent,
-            0.18,
-        )),
-        shadow: Shadow {
-            color: Color::from_rgba8(0, 0, 0, 0.45),
-            offset: iced::Vector::new(0.0, 6.0),
-            blur_radius: 18.0,
-        },
     }
 }
 
@@ -590,4 +613,21 @@ pub fn checkbox(_: &Theme, status: iced_checkbox::Status) -> iced_checkbox::Styl
         },
         text_color: Some(palette().text),
     }
+}
+
+pub fn connection_scrollable(
+    theme: &Theme,
+    status: iced_scrollable::Status,
+) -> iced_scrollable::Style {
+    let mut style = iced_scrollable::default(theme, status);
+    let scroller_color = if matches!(status, iced_scrollable::Status::Active { .. }) {
+        palette().text_dim
+    } else {
+        palette().text_muted
+    };
+
+    style.vertical_rail.background = None;
+    style.vertical_rail.scroller.background = Background::Color(scroller_color);
+    style.vertical_rail.scroller.border = Border::default();
+    style
 }

@@ -214,8 +214,17 @@ fn sample_sharp(uv: vec2<f32>) -> vec4<f32> {
     return clamp(color / weight_sum, vec4<f32>(0.0), vec4<f32>(1.0));
 }
 
+fn encoded_to_output(encoded: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        srgb_to_linear_component(encoded.r),
+        srgb_to_linear_component(encoded.g),
+        srgb_to_linear_component(encoded.b),
+        encoded.a
+    );
+}
+
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_interpolated(input: VertexOutput) -> @location(0) vec4<f32> {
     let source_footprint = vec2<f32>(textureDimensions(decoded_image)) * fwidth(input.uv);
     var encoded: vec4<f32>;
     if (max(source_footprint.x, source_footprint.y) > 1.0) {
@@ -223,10 +232,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     } else {
         encoded = sample_sharp(input.uv);
     }
-    return vec4<f32>(
-        srgb_to_linear_component(encoded.r),
-        srgb_to_linear_component(encoded.g),
-        srgb_to_linear_component(encoded.b),
-        encoded.a
-    );
+    return encoded_to_output(encoded);
+}
+
+@fragment
+fn fs_nearest(input: VertexOutput) -> @location(0) vec4<f32> {
+    let dimensions_u = textureDimensions(decoded_image);
+    let dimensions = vec2<f32>(dimensions_u);
+    let maximum = vec2<i32>(dimensions_u) - vec2<i32>(1);
+    let location = clamp(vec2<i32>(floor(input.uv * dimensions)), vec2<i32>(0), maximum);
+    return encoded_to_output(textureLoad(decoded_image, location, 0));
 }

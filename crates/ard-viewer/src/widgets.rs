@@ -1,7 +1,9 @@
-use iced::widget::{button, container, mouse_area, row, space, stack, text};
-use iced::{Alignment, Element, Fill, window};
+use ard_rs::ArdVideoQuality;
+use iced::widget::{button, column, container, mouse_area, row, space, stack, text};
+use iced::{Alignment, Element, Event, Fill, Length, Point, Rectangle, Size, Vector, window};
 
 use crate::Message;
+use crate::i18n::Language;
 use crate::icons::{Icon, icon};
 use crate::theme::{self, BODY_SIZE, CAPTION_SIZE, CONTROL_HEIGHT, ICON_SIZE};
 
@@ -226,4 +228,438 @@ pub fn icon_button(kind: Icon, message: Message) -> iced::widget::Button<'static
         .padding(0)
         .style(theme::secondary_button)
         .on_press(message)
+}
+
+pub struct DropdownOption {
+    pub label: String,
+    pub selected: bool,
+    pub message: Message,
+    pub id: Option<&'static str>,
+}
+
+impl DropdownOption {
+    pub fn new(label: impl Into<String>, selected: bool, message: Message) -> Self {
+        Self {
+            label: label.into(),
+            selected,
+            message,
+            id: None,
+        }
+    }
+
+    pub fn id(mut self, id: &'static str) -> Self {
+        self.id = Some(id);
+        self
+    }
+}
+
+pub struct DropdownSection {
+    pub label: Option<&'static str>,
+    pub options: Vec<DropdownOption>,
+}
+
+impl DropdownSection {
+    pub fn new(label: Option<&'static str>, options: Vec<DropdownOption>) -> Self {
+        Self { label, options }
+    }
+}
+
+pub fn quality_dropdown_sections(
+    language: Language,
+    selected: ArdVideoQuality,
+) -> Vec<DropdownSection> {
+    let option = |quality: ArdVideoQuality, id: &'static str| {
+        DropdownOption::new(
+            language.tr(quality.label()),
+            selected == quality,
+            Message::QualityChanged(quality),
+        )
+        .id(id)
+    };
+
+    vec![
+        DropdownSection::new(
+            Some("Zlib"),
+            vec![
+                option(ArdVideoQuality::Low, "quality-option-low"),
+                option(ArdVideoQuality::Medium, "quality-option-medium"),
+                option(ArdVideoQuality::High, "quality-option-high"),
+                option(ArdVideoQuality::Full, "quality-option-full"),
+            ],
+        ),
+        DropdownSection::new(
+            Some("MVS"),
+            vec![option(ArdVideoQuality::Adaptive, "quality-option-adaptive")],
+        ),
+    ]
+}
+
+pub fn dropdown(
+    selected_label: impl Into<String>,
+    sections: Vec<DropdownSection>,
+    width: impl Into<Length>,
+    text_size: f32,
+    open: bool,
+    on_toggle: Message,
+    on_dismiss: Message,
+) -> Element<'static, Message> {
+    let width = width.into();
+    let trigger = button(
+        container(
+            row![
+                text(selected_label.into())
+                    .size(text_size)
+                    .color(theme::palette().text)
+                    .width(Fill),
+                icon(
+                    if open {
+                        Icon::ChevronUp
+                    } else {
+                        Icon::ChevronDown
+                    },
+                    12.0,
+                    theme::palette().text_muted,
+                ),
+            ]
+            .width(Fill)
+            .align_y(Alignment::Center),
+        )
+        .height(Fill)
+        .width(Fill)
+        .align_y(Alignment::Center),
+    )
+    .width(width)
+    .height(CONTROL_HEIGHT)
+    .padding([0, 12])
+    .style(theme::quality_selector_button(open))
+    .on_press(on_toggle);
+
+    let mut items = column![].spacing(2);
+    for (index, section) in sections.into_iter().enumerate() {
+        if let Some(label) = section.label {
+            if index > 0 {
+                items = items.push(space().height(4));
+            }
+            items = items.push(
+                container(
+                    text(label)
+                        .size((text_size - 1.0).max(8.0))
+                        .color(theme::palette().text_dim),
+                )
+                .height(18)
+                .width(Fill)
+                .padding([0, 8])
+                .align_y(Alignment::Center),
+            );
+        }
+
+        for option in section.options {
+            let option_button = button(
+                container(
+                    text(option.label)
+                        .size(text_size)
+                        .color(theme::palette().text),
+                )
+                .height(Fill)
+                .width(Fill)
+                .align_y(Alignment::Center),
+            )
+            .height(28)
+            .width(Fill)
+            .padding([0, 8])
+            .style(theme::quality_menu_button(option.selected))
+            .on_press(option.message);
+            let mut item = container(option_button).height(28).width(Fill);
+            if let Some(id) = option.id {
+                item = item.id(id);
+            }
+            items = items.push(item);
+        }
+    }
+
+    let menu = container(items)
+        .width(Fill)
+        .padding(6)
+        .style(theme::context_menu_panel);
+
+    popover(trigger, menu, open, on_dismiss).into()
+}
+
+pub fn popover<'a>(
+    content: impl Into<Element<'a, Message>>,
+    popup: impl Into<Element<'a, Message>>,
+    open: bool,
+    on_dismiss: Message,
+) -> Popover<'a> {
+    Popover {
+        content: content.into(),
+        popup: popup.into(),
+        open,
+        on_dismiss,
+        gap: 4.0,
+    }
+}
+
+pub struct Popover<'a> {
+    content: Element<'a, Message>,
+    popup: Element<'a, Message>,
+    open: bool,
+    on_dismiss: Message,
+    gap: f32,
+}
+
+impl iced::advanced::Widget<Message, iced::Theme, iced::Renderer> for Popover<'_> {
+    fn diff(&mut self, tree: &mut iced::advanced::widget::Tree) {
+        tree.diff_children(&mut [self.content.as_widget_mut(), self.popup.as_widget_mut()]);
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &iced::Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: &Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+        renderer: &iced::Renderer,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            shell,
+            viewport,
+        );
+    }
+
+    fn draw(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> iced::advanced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'a>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<iced::advanced::overlay::Element<'a, Message, iced::Theme, iced::Renderer>> {
+        if !self.open {
+            return self.content.as_widget_mut().overlay(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                viewport,
+                translation,
+            );
+        }
+
+        Some(iced::advanced::overlay::Element::new(Box::new(
+            PopoverOverlay {
+                popup: &mut self.popup,
+                tree: &mut tree.children[1],
+                anchor: layout.bounds() + translation,
+                viewport: *viewport,
+                gap: self.gap,
+                on_dismiss: self.on_dismiss.clone(),
+            },
+        )))
+    }
+}
+
+impl<'a> From<Popover<'a>> for Element<'a, Message> {
+    fn from(popover: Popover<'a>) -> Self {
+        Element::new(popover)
+    }
+}
+
+struct PopoverOverlay<'a, 'b> {
+    popup: &'b mut Element<'a, Message>,
+    tree: &'b mut iced::advanced::widget::Tree,
+    anchor: Rectangle,
+    viewport: Rectangle,
+    gap: f32,
+    on_dismiss: Message,
+}
+
+impl iced::advanced::Overlay<Message, iced::Theme, iced::Renderer> for PopoverOverlay<'_, '_> {
+    fn layout(&mut self, renderer: &iced::Renderer, bounds: Size) -> iced::advanced::layout::Node {
+        let mut popup = self.popup.as_widget_mut().layout(
+            self.tree,
+            renderer,
+            &iced::advanced::layout::Limits::new(Size::ZERO, bounds)
+                .width(Length::Fixed(self.anchor.width)),
+        );
+        let size = popup.size();
+        let margin = 4.0;
+        let x = (self.anchor.x + self.anchor.width - size.width)
+            .clamp(margin, (bounds.width - size.width - margin).max(margin));
+        let below = self.anchor.y + self.anchor.height + self.gap;
+        let y = if below + size.height <= bounds.height - margin {
+            below
+        } else {
+            (self.anchor.y - self.gap - size.height).max(margin)
+        };
+        popup.move_to_mut(Point::new(x, y));
+        popup
+    }
+
+    fn update(
+        &mut self,
+        event: &Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+        renderer: &iced::Renderer,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+    ) {
+        let pressed = matches!(
+            event,
+            Event::Mouse(iced::mouse::Event::ButtonPressed(_))
+                | Event::Touch(iced::touch::Event::FingerPressed { .. })
+        );
+        let escape = matches!(
+            event,
+            Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            })
+        );
+        if escape || (pressed && !cursor.is_over(layout.bounds())) {
+            shell.publish(self.on_dismiss.clone());
+            shell.capture_event();
+            return;
+        }
+
+        self.popup.as_widget_mut().update(
+            self.tree,
+            event,
+            layout,
+            cursor,
+            renderer,
+            shell,
+            &self.viewport,
+        );
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+    ) {
+        self.popup.as_widget().draw(
+            self.tree,
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            &self.viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+        renderer: &iced::Renderer,
+    ) -> iced::advanced::mouse::Interaction {
+        self.popup.as_widget().mouse_interaction(
+            self.tree,
+            layout,
+            cursor,
+            &self.viewport,
+            renderer,
+        )
+    }
+
+    fn operate(
+        &mut self,
+        layout: iced::advanced::Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        self.popup
+            .as_widget_mut()
+            .operate(self.tree, layout, renderer, operation);
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        layout: iced::advanced::Layout<'a>,
+        renderer: &iced::Renderer,
+    ) -> Option<iced::advanced::overlay::Element<'a, Message, iced::Theme, iced::Renderer>> {
+        self.popup.as_widget_mut().overlay(
+            self.tree,
+            layout,
+            renderer,
+            &self.viewport,
+            Vector::ZERO,
+        )
+    }
 }

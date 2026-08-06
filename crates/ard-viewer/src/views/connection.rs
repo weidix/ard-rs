@@ -1,6 +1,5 @@
-use ard_rs::ArdVideoQuality;
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, space, stack, text,
+    button, checkbox, column, container, mouse_area, row, scrollable, space, stack, text,
 };
 use iced::{Alignment, Element, Fill, window};
 
@@ -9,10 +8,16 @@ use crate::theme::{
     self, BODY_SIZE, CAPTION_SIZE, CONTENT_PADDING_BOTTOM, CONTENT_PADDING_X, CONTROL_HEIGHT,
     CONTROL_PADDING_X, CONTROL_RADIUS, ICON_SIZE, MICRO_SIZE, TITLE_SIZE, WINDOW_RADIUS,
 };
-use crate::widgets::{icon_button, primary, secondary, window_chrome_with_title};
-use crate::{ArdViewer, Message};
+use crate::widgets::{
+    dropdown, icon_button, primary, quality_dropdown_sections, secondary, window_chrome_with_title,
+};
+use crate::{ArdViewer, DropdownMenu, Message};
 
 const TITLEBAR_HEIGHT: f32 = 44.0;
+const PARAMETER_CONTROL_WIDTH: f32 = 220.0;
+const PARAMETER_TEXT_SIZE: f32 = BODY_SIZE - 2.0;
+const PARAMETER_LABEL_SIZE: f32 = BODY_SIZE - 1.0;
+const PARAMETER_CAPTION_SIZE: f32 = CAPTION_SIZE - 2.0;
 
 pub fn connection(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.is_window_maximized(window_id);
@@ -414,63 +419,44 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     ]
     .spacing(18);
 
-    let qualities = ["低画质", "中画质", "高画质", "自适应 MVS", "全画质"];
+    let quality = quality_selector(app);
+    let frame_rate = iced::widget::text_input(app.language.tr("自动"), &app.frame_rate)
+        .on_input(Message::FrameRateChanged)
+        .width(PARAMETER_CONTROL_WIDTH)
+        .padding([10.0, CONTROL_PADDING_X])
+        .size(PARAMETER_TEXT_SIZE)
+        .style(theme::connection_parameter_input);
+    let interpolation = container(
+        checkbox(app.should_interpolate)
+            .label(app.language.tr("启用"))
+            .on_toggle(Message::ShouldInterpolateChanged)
+            .size(16)
+            .text_size(PARAMETER_TEXT_SIZE)
+            .style(theme::checkbox),
+    )
+    .width(PARAMETER_CONTROL_WIDTH)
+    .center_y(CONTROL_HEIGHT);
     let advanced = container(
         column![
             row![
                 icon(Icon::Sliders, 14.0, theme::palette().text_muted),
                 text(app.language.tr("连接参数"))
-                    .size(BODY_SIZE)
+                    .size(PARAMETER_TEXT_SIZE)
                     .color(theme::palette().text),
             ]
             .spacing(7)
             .align_y(Alignment::Center),
-            row![
-                column![
-                    text(app.language.tr("视频质量"))
-                        .size(CAPTION_SIZE)
-                        .color(theme::palette().text_muted),
-                    pick_list(
-                        Some(app.language.tr(app.quality.label())),
-                        qualities,
-                        |value| { app.language.tr(value).to_owned() }
-                    )
-                    .on_select(|value| Message::QualityChanged(match value {
-                        "低画质" | "Low" => ArdVideoQuality::Low,
-                        "中画质" | "Medium" => ArdVideoQuality::Medium,
-                        "高画质" | "High" => ArdVideoQuality::High,
-                        "全画质" | "Full" => ArdVideoQuality::Full,
-                        _ => ArdVideoQuality::Adaptive,
-                    }))
-                    .padding([9, 12])
-                    .text_size(BODY_SIZE)
-                    .style(theme::pick_list)
-                    .menu_style(theme::pick_list_menu),
-                ]
-                .spacing(5)
-                .width(Fill),
-                column![
-                    text(app.language.tr("帧率 (FPS)"))
-                        .size(CAPTION_SIZE)
-                        .color(theme::palette().text_muted),
-                    iced::widget::text_input(app.language.tr("自动"), &app.frame_rate)
-                        .on_input(Message::FrameRateChanged)
-                        .padding([10.0, CONTROL_PADDING_X])
-                        .size(BODY_SIZE)
-                        .style(theme::input),
-                ]
-                .spacing(5)
-                .width(Fill),
-            ]
-            .spacing(12),
+            connection_parameter_row(app.language.tr("视频质量"), quality),
+            connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate),
+            connection_parameter_row(app.language.tr("画面插值"), interpolation),
             text(
                 app.language
                     .tr("像素格式：服务器原生  ·  缩放：适应窗口  ·  自动重连：已启用")
             )
-            .size(CAPTION_SIZE)
+            .size(PARAMETER_CAPTION_SIZE)
             .color(theme::palette().text_muted),
         ]
-        .spacing(10),
+        .spacing(8),
     )
     .padding(12)
     .width(Fill)
@@ -515,25 +501,35 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             .height(CONTROL_HEIGHT),
     ]
     .spacing(10)
-    .align_y(Alignment::Center);
+    .align_y(Alignment::Center)
+    .height(CONTROL_HEIGHT);
 
-    let body = column![
-        heading,
-        address,
-        username,
-        password,
-        remembers,
-        advanced,
-        security,
-        text(&app.status)
-            .size(CAPTION_SIZE)
-            .color(theme::palette().text_warm),
-        space().height(Fill),
-        actions,
+    let mut content = column![
+        heading, address, username, password, remembers, advanced, security,
     ]
-    .spacing(15)
-    .height(Fill)
+    .spacing(12)
     .width(Fill);
+    if !app.status.is_empty() {
+        content = content.push(
+            text(&app.status)
+                .size(CAPTION_SIZE)
+                .color(theme::palette().text_warm),
+        );
+    }
+    let scrolling = scrollable(content)
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            iced::widget::scrollable::Scrollbar::new()
+                .width(3)
+                .scroller_width(3)
+                .margin(3),
+        ))
+        .style(theme::connection_scrollable)
+        .height(Fill)
+        .width(Fill);
+    let body = column![scrolling, actions]
+        .spacing(12)
+        .height(Fill)
+        .width(Fill);
 
     container(body)
         .padding(iced::Padding {
@@ -549,4 +545,33 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             iced::border::right(if maximized { 0.0 } else { WINDOW_RADIUS }),
         ))
         .into()
+}
+
+fn connection_parameter_row<'a>(
+    label: &'a str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![
+        text(label)
+            .size(PARAMETER_LABEL_SIZE)
+            .color(theme::palette().text_muted)
+            .width(Fill),
+        control.into(),
+    ]
+    .height(CONTROL_HEIGHT)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn quality_selector(app: &ArdViewer) -> Element<'_, Message> {
+    let open = app.open_dropdown == Some(DropdownMenu::ConnectionQuality);
+    dropdown(
+        app.language.tr(app.quality.label()),
+        quality_dropdown_sections(app.language, app.quality),
+        PARAMETER_CONTROL_WIDTH,
+        PARAMETER_TEXT_SIZE,
+        open,
+        Message::ToggleDropdown(DropdownMenu::ConnectionQuality),
+        Message::CloseDropdown,
+    )
 }

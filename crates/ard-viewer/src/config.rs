@@ -49,6 +49,7 @@ pub struct AppConfig {
     pub quality: String,
     pub frame_rate: String,
     pub frame_interval_ms: String,
+    pub should_interpolate: bool,
     pub key_profile: String,
     pub auto_adapt_keyboard: bool,
     pub capture_system_shortcuts: bool,
@@ -69,6 +70,7 @@ impl Default for AppConfig {
             quality: "adaptive".into(),
             frame_rate: String::new(),
             frame_interval_ms: "0".into(),
+            should_interpolate: true,
             key_profile: "macOS 默认".into(),
             auto_adapt_keyboard: true,
             capture_system_shortcuts: false,
@@ -296,4 +298,27 @@ pub fn theme_to_cache(value: ThemePreference) -> &'static str {
 
 pub fn language_from_cache(value: &str) -> Language {
     Language::from_code(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn legacy_config_enables_native_interpolation() {
+        let config: AppConfig = serde_json::from_str("{}").expect("legacy config parses");
+        assert!(config.should_interpolate);
+    }
+
+    #[test]
+    fn native_interpolation_choice_round_trips() {
+        let config: AppConfig = serde_json::from_str(r#"{"should_interpolate":false}"#)
+            .expect("interpolation config parses");
+        assert!(!config.should_interpolate);
+        let restored: AppConfig = serde_json::from_slice(
+            &serde_json::to_vec(&config).expect("interpolation config serializes"),
+        )
+        .expect("serialized interpolation config parses");
+        assert!(!restored.should_interpolate);
+    }
 }
