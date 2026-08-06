@@ -9,15 +9,22 @@ use crate::icons::{Icon, icon};
 use crate::session_renderer;
 use crate::session_runtime::ConnectionState;
 use crate::theme::{self, MICRO_SIZE, WINDOW_RADIUS};
-use crate::widgets::{window_drag_region, window_platform_controls};
+use crate::widgets::window_chrome_with_title;
 use crate::{
     ArdViewer, Message, SESSION_TOOLBAR_COLLAPSED_WIDTH, SESSION_TOOLBAR_WIDTH, SessionAction,
 };
 
 pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.session_fullscreen || app.is_window_maximized(window_id);
+    let endpoint = app
+        .remote_endpoint()
+        .unwrap_or_else(|_| app.address.trim().to_owned());
+    let detail = if app.username.trim().is_empty() {
+        None
+    } else {
+        Some(format!("用户 {}", app.username.trim()))
+    };
     stack![
-        window_drag_region(window_id),
         remote_canvas(
             app,
             maximized,
@@ -25,7 +32,7 @@ pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
             app.session_toolbar_x,
             app.session_toolbar_window_width,
         ),
-        window_platform_controls(window_id),
+        window_chrome_with_title(window_id, 32.0, endpoint, detail),
     ]
     .width(Fill)
     .height(Fill)

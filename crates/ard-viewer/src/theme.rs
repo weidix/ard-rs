@@ -41,8 +41,8 @@ const DARK: Palette = Palette {
 };
 
 const LIGHT: Palette = Palette {
-    background: Color::from_rgb8(249, 249, 249),
-    remote_canvas: Color::from_rgb8(249, 249, 249),
+    background: Color::from_rgb8(251, 251, 254),
+    remote_canvas: Color::from_rgb8(251, 251, 254),
     surface: Color::from_rgb8(242, 242, 242),
     surface_active: Color::from_rgb8(232, 232, 232),
     border: Color::from_rgb8(194, 194, 194),
@@ -283,9 +283,8 @@ pub fn secondary_button(_: &Theme, status: button::Status) -> button::Style {
         background: Some(Background::Color(background)),
         text_color: palette().text,
         border: Border {
-            color: palette().border,
-            width: 1.0,
             radius: CONTROL_RADIUS.into(),
+            ..Border::default()
         },
         ..button::Style::default()
     }
@@ -401,13 +400,8 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
             },
         ),
         border: Border {
-            color: if matches!(status, text_input::Status::Focused { is_hovered: _ }) {
-                palette().accent
-            } else {
-                palette().border
-            },
-            width: 1.0,
             radius: CONTROL_RADIUS.into(),
+            ..Border::default()
         },
         placeholder: palette().text_muted,
         value: palette().text,
@@ -425,20 +419,15 @@ pub fn inline_input(_: &Theme, _: text_input::Status) -> text_input::Style {
     }
 }
 
-pub fn pick_list(_: &Theme, status: iced_pick_list::Status) -> iced_pick_list::Style {
+pub fn pick_list(_: &Theme, _status: iced_pick_list::Status) -> iced_pick_list::Style {
     iced_pick_list::Style {
         text_color: palette().text,
         placeholder_color: palette().text_muted,
         handle_color: palette().text_muted,
         background: Background::Color(palette().surface_active),
         border: Border {
-            color: if matches!(status, iced_pick_list::Status::Active) {
-                palette().border
-            } else {
-                palette().text_muted
-            },
-            width: 1.0,
             radius: CONTROL_RADIUS.into(),
+            ..Border::default()
         },
     }
 }

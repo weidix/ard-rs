@@ -27,25 +27,38 @@ fn centered_icon(kind: Icon, size: f32, color: iced::Color) -> Element<'static, 
         .into()
 }
 
-pub fn window_chrome(window_id: window::Id) -> Element<'static, Message> {
-    window_chrome_with_drag_height(window_id, 32.0)
-}
-
-pub fn window_chrome_with_drag_height(
+pub fn window_chrome_with_title(
     window_id: window::Id,
     drag_height: f32,
+    title: impl Into<String>,
+    detail: Option<String>,
 ) -> Element<'static, Message> {
+    let leading = if cfg!(target_os = "macos") {
+        78.0
+    } else {
+        12.0
+    };
+    let label = row![
+        text(title.into())
+            .size(BODY_SIZE)
+            .color(theme::palette().text),
+        text(detail.unwrap_or_default())
+            .size(CAPTION_SIZE)
+            .color(theme::palette().text_muted),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
     stack![
         window_drag_region_with_height(window_id, drag_height),
+        container(label)
+            .padding([0.0, leading])
+            .height(drag_height)
+            .align_y(Alignment::Center),
         window_platform_controls(window_id),
     ]
     .width(Fill)
     .height(Fill)
     .into()
-}
-
-pub fn window_drag_region(window_id: window::Id) -> Element<'static, Message> {
-    window_drag_region_with_height(window_id, 32.0)
 }
 
 fn window_drag_region_with_height(window_id: window::Id, height: f32) -> Element<'static, Message> {

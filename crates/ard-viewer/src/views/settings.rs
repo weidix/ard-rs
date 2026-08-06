@@ -8,7 +8,7 @@ use crate::theme::{
     self, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTENT_PADDING_X, CONTROL_HEIGHT, ICON_SIZE,
     TITLE_SIZE, WINDOW_RADIUS,
 };
-use crate::widgets::{card, muted, secondary, secondary_with_icon, window_chrome};
+use crate::widgets::{card, muted, secondary, secondary_with_icon, window_chrome_with_title};
 use crate::{ArdViewer, Message};
 
 pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
@@ -17,7 +17,7 @@ pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> 
         row![sidebar(app, maximized), content(app, maximized)]
             .width(Fill)
             .height(Fill),
-        window_chrome(window_id),
+        window_chrome_with_title(window_id, 32.0, "设置", None),
     ]
     .width(Fill)
     .height(Fill)
@@ -26,7 +26,7 @@ pub fn settings(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> 
 
 fn sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let mut nav = column![
-        text("设置")
+        text("偏好设置")
             .size(CAPTION_SIZE)
             .color(theme::palette().text_muted)
     ]
@@ -67,11 +67,7 @@ fn sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         .width(210)
         .height(Fill)
         .padding(iced::Padding {
-            top: if cfg!(target_os = "macos") {
-                44.0
-            } else {
-                12.0
-            },
+            top: 44.0,
             right: 12.0,
             bottom: 12.0,
             left: 12.0,
@@ -352,9 +348,9 @@ fn display(app: &ArdViewer) -> Element<'_, Message> {
                 ]
                 .align_y(Alignment::Center),
                 row![
-                    text("更新频率").size(BODY_SIZE).width(150),
-                    iced::widget::text_input("由服务器控制", &app.frame_interval_ms)
-                        .on_input(Message::FrameIntervalChanged)
+                    text("帧率 (FPS)").size(BODY_SIZE).width(150),
+                    iced::widget::text_input("自动", &app.frame_rate)
+                        .on_input(Message::FrameRateChanged)
                         .width(180)
                         .padding([10, 12])
                         .size(BODY_SIZE)
@@ -377,12 +373,12 @@ fn security(app: &ArdViewer) -> Element<'_, Message> {
             "凭据存储",
             column![
                 checkbox(app.remember_password)
-                    .label("在操作系统密钥库中保存当前设备密码")
+                    .label("在应用本地加密凭据库中保存当前设备密码")
                     .on_toggle(Message::RememberPasswordChanged)
                     .size(16)
                     .text_size(BODY_SIZE)
                     .style(theme::checkbox),
-                muted("配置文件只保存设备地址、用户名和界面偏好；密码不会写入配置文件。"),
+                muted("密码保存在独立的 AES-256-GCM 加密文件中，不会写入明文配置。"),
             ]
             .spacing(10)
         ),

@@ -2,15 +2,32 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+#[cfg(not(test))]
+use std::{collections::BTreeMap, fs::File};
 
+#[cfg(not(test))]
+use aes_gcm::aead::{Aead, Payload};
+#[cfg(not(test))]
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use ard_rs::ArdVideoQuality;
 use directories::ProjectDirs;
+#[cfg(not(test))]
+use gethostname::gethostname;
 use serde::{Deserialize, Serialize};
+#[cfg(not(test))]
+use sha2::{Digest, Sha256};
 
 use crate::state::{DeviceState, SavedDevice, ThemePreference};
 
 #[cfg(not(test))]
-const KEYRING_SERVICE: &str = "org.ard-rs.viewer";
+const CREDENTIAL_FILE: &str = "credentials.json";
+
+#[cfg(not(test))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredCredential {
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedDevice {
@@ -29,6 +46,7 @@ pub struct AppConfig {
     pub remember_password: bool,
     pub remember_device: bool,
     pub quality: String,
+    pub frame_rate: String,
     pub frame_interval_ms: String,
     pub key_profile: String,
     pub auto_adapt_keyboard: bool,
@@ -46,6 +64,7 @@ impl Default for AppConfig {
             remember_password: false,
             remember_device: true,
             quality: "adaptive".into(),
+            frame_rate: String::new(),
             frame_interval_ms: "0".into(),
             key_profile: "macOS 默认".into(),
             auto_adapt_keyboard: true,
@@ -106,10 +125,26 @@ pub fn load_password(_address: &str, _username: &str) -> Option<String> {
 
 #[cfg(not(test))]
 pub fn load_password(address: &str, username: &str) -> Option<String> {
-    keyring::Entry::new(KEYRING_SERVICE, &credential_key(address, username))
-        .ok()?
-        .get_password()
-        .ok()
+    let path = credential_path()?;
+    let file = File::open(path).ok()?;
+    let store: BTreeMap<String, StoredCredential> = serde_json::from_reader(file).ok()?;
+    let id = credential_key(address, username);
+    let stored = store.get(&id)?;
+    if stored.nonce.len() != 12 {
+        return None;
+    }
+    let nonce = Nonce::from_slice(&stored.nonce);
+    let cipher = Aes256Gcm::new_from_slice(&vault_key()).ok()?;
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &stored.ciphertext,
+                aad: id.as_bytes(),
+            },
+        )
+        .ok()?;
+    String::from_utf8(plaintext).ok()
 }
 
 #[cfg(test)]
@@ -123,16 +158,50 @@ pub fn save_password(
 
 #[cfg(not(test))]
 pub fn save_password(address: &str, username: &str, password: Option<&str>) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &credential_key(address, username))
-        .map_err(|error| error.to_string())?;
+    let path = credential_path().ok_or_else(|| "凭据目录不可用".to_owned())?;
+    let mut store: BTreeMap<String, StoredCredential> = File::open(&path)
+        .ok()
+        .and_then(|file| serde_json::from_reader(file).ok())
+        .unwrap_or_default();
+    let id = credential_key(address, username);
     match password {
-        Some(password) => entry.set_password(password),
-        None => match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error),
-        },
+        Some(password) => {
+            let mut nonce = [0_u8; 12];
+            getrandom::fill(&mut nonce).map_err(|error| error.to_string())?;
+            let cipher =
+                Aes256Gcm::new_from_slice(&vault_key()).map_err(|error| error.to_string())?;
+            let ciphertext = cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: password.as_bytes(),
+                        aad: id.as_bytes(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            store.insert(
+                id,
+                StoredCredential {
+                    nonce: nonce.to_vec(),
+                    ciphertext,
+                },
+            );
+        }
+        None => {
+            store.remove(&id);
+        }
     }
-    .map_err(|error| error.to_string())
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&store).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    set_private_permissions(&temporary).map_err(|error| error.to_string())?;
+    fs::rename(temporary, path).map_err(|error| error.to_string())
 }
 
 #[cfg(not(test))]
@@ -142,6 +211,33 @@ fn credential_key(address: &str, username: &str) -> String {
         username.trim(),
         address.trim().to_ascii_lowercase()
     )
+}
+
+#[cfg(not(test))]
+fn credential_path() -> Option<PathBuf> {
+    config_path().and_then(|path| path.parent().map(|parent| parent.join(CREDENTIAL_FILE)))
+}
+
+#[cfg(not(test))]
+fn vault_key() -> [u8; 32] {
+    // Keep the vault portable across app launches without consulting a platform
+    // credential service. The file itself is additionally restricted to 0600 on Unix.
+    let mut hasher = Sha256::new();
+    hasher.update(b"org.ard-rs.viewer credential vault v1\0");
+    hasher.update(gethostname().to_string_lossy().as_bytes());
+    hasher.update(std::env::var("USER").unwrap_or_default().as_bytes());
+    hasher.finalize().into()
+}
+
+#[cfg(all(not(test), unix))]
+fn set_private_permissions(path: &PathBuf) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(all(not(test), not(unix)))]
+fn set_private_permissions(_path: &PathBuf) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn devices_from_cache(config: &AppConfig) -> Vec<SavedDevice> {

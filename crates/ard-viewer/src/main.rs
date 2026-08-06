@@ -42,10 +42,12 @@ struct ArdViewer {
     port: String,
     username: String,
     password: String,
+    password_visible: bool,
+    has_saved_password: bool,
     remember_password: bool,
     remember_device: bool,
     quality: ArdVideoQuality,
-    frame_interval_ms: String,
+    frame_rate: String,
     settings_section: SettingsSection,
     settings_transition: f32,
     key_profile: String,
@@ -107,6 +109,7 @@ enum Message {
     PortChanged(String),
     UsernameChanged(String),
     PasswordChanged(String),
+    TogglePasswordVisibility,
     RememberPasswordChanged(bool),
     RememberDeviceChanged(bool),
     SaveDevice,
@@ -115,7 +118,7 @@ enum Message {
     ExportShortcuts,
     SettingsSectionSelected(SettingsSection),
     QualityChanged(ArdVideoQuality),
-    FrameIntervalChanged(String),
+    FrameRateChanged(String),
     KeyProfileChanged(String),
     AutoAdaptChanged(bool),
     CaptureShortcutsChanged(bool),
@@ -174,11 +177,8 @@ impl ArdViewer {
         } else {
             cached.last_username.clone()
         };
-        let password = if cached.remember_password {
-            config::load_password(&endpoint, &username).unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let has_saved_password =
+            cached.remember_password && config::load_password(&endpoint, &username).is_some();
         let mappings = profile_mappings(&cached.key_profile);
         let app = Self {
             windows: BTreeMap::new(),
@@ -191,11 +191,17 @@ impl ArdViewer {
             previous_selected_device: 0,
             device_transition: 1.0,
             search: String::new(),
-            password,
+            password: String::new(),
+            password_visible: false,
+            has_saved_password,
             remember_password: cached.remember_password,
             remember_device: cached.remember_device,
             quality: config::quality_from_cache(&cached.quality),
-            frame_interval_ms: cached.frame_interval_ms,
+            frame_rate: if cached.frame_rate.is_empty() {
+                frame_rate_from_interval(&cached.frame_interval_ms)
+            } else {
+                cached.frame_rate.clone()
+            },
             settings_section: SettingsSection::KeyMapping,
             settings_transition: 1.0,
             key_profile: cached.key_profile,
@@ -369,11 +375,10 @@ impl ArdViewer {
                     self.selected_device = index;
                     (self.address, self.port) = split_endpoint(&device.address);
                     self.username.clone_from(&device.username);
-                    self.password = if self.remember_password {
+                    self.password.clear();
+                    self.has_saved_password = self.remember_password && {
                         let endpoint = format_endpoint(&self.address, &self.port);
-                        config::load_password(&endpoint, &self.username).unwrap_or_default()
-                    } else {
-                        String::new()
+                        config::load_password(&endpoint, &self.username).is_some()
                     };
                 }
             }
@@ -387,8 +392,18 @@ impl ArdViewer {
             Message::PortChanged(value) => {
                 self.port = value.chars().filter(char::is_ascii_digit).take(5).collect();
             }
-            Message::UsernameChanged(value) => self.username = value,
-            Message::PasswordChanged(value) => self.password = value,
+            Message::UsernameChanged(value) => {
+                self.username = value;
+                self.password.clear();
+                self.has_saved_password = false;
+            }
+            Message::PasswordChanged(value) => {
+                self.password = value;
+                self.has_saved_password = false;
+            }
+            Message::TogglePasswordVisibility => {
+                self.password_visible = !self.password_visible;
+            }
             Message::RememberPasswordChanged(value) => {
                 self.remember_password = value;
                 let address = self
@@ -397,6 +412,9 @@ impl ArdViewer {
                 if !value && let Err(error) = config::save_password(&address, &self.username, None)
                 {
                     self.status = format!("移除系统密钥库密码失败：{error}");
+                }
+                if !value {
+                    self.has_saved_password = false;
                 }
                 self.persist_config();
             }
@@ -416,7 +434,7 @@ impl ArdViewer {
                 {
                     self.selected_device = index;
                     self.devices[index].username = self.username.trim().to_owned();
-                    self.status = "设备已保存".into();
+                    self.status = "历史连接已更新".into();
                 } else {
                     let (name, _) = split_endpoint(&address);
                     self.devices.push(SavedDevice {
@@ -428,7 +446,7 @@ impl ArdViewer {
                     self.previous_selected_device = self.selected_device;
                     self.selected_device = self.devices.len() - 1;
                     self.device_transition = 0.0;
-                    self.status = "设备已保存".into();
+                    self.status = "已加入历史连接".into();
                 }
                 self.store_credentials();
                 self.persist_config();
@@ -443,8 +461,15 @@ impl ArdViewer {
                 self.quality = quality;
                 self.persist_config();
             }
-            Message::FrameIntervalChanged(value) => {
-                self.frame_interval_ms = value;
+            Message::FrameRateChanged(value) => {
+                let value: String = value.chars().filter(char::is_ascii_digit).take(3).collect();
+                self.frame_rate = value.parse::<u16>().map_or(value.clone(), |rate| {
+                    if rate == 0 {
+                        String::new()
+                    } else {
+                        rate.min(240).to_string()
+                    }
+                });
                 self.persist_config();
             }
             Message::KeyProfileChanged(value) => {
@@ -508,12 +533,26 @@ impl ArdViewer {
                     self.status = "请输入设备地址和用户名".into();
                 } else if self.remote_endpoint().is_err() {
                     self.status = "请输入有效端口（1–65535）".into();
-                } else if self.password.is_empty() {
+                } else if self.password.is_empty() && !self.has_saved_password {
                     self.status = "请输入密码".into();
                 } else {
+                    let endpoint = self.remote_endpoint().expect("endpoint validated above");
+                    let password = if self.password.is_empty() {
+                        config::load_password(&endpoint, &self.username).unwrap_or_default()
+                    } else {
+                        self.password.clone()
+                    };
+                    if password.is_empty() {
+                        self.has_saved_password = false;
+                        self.status = "保存的密码不可用，请重新输入".into();
+                        return Task::none();
+                    }
+                    if self.remember_device {
+                        self.upsert_history(&endpoint);
+                    }
                     self.store_credentials();
                     self.persist_config();
-                    self.start_session();
+                    self.start_session(password);
                     if let Some(id) = self.window_id(WindowKind::Session) {
                         return window::gain_focus(id);
                     }
@@ -535,7 +574,7 @@ impl ArdViewer {
                         .min(self.devices.len().saturating_sub(1));
                     self.previous_selected_device = self.selected_device;
                     if !self.status.starts_with("移除系统密钥库密码失败") {
-                        self.status = "已移除所选设备".into();
+                        self.status = "已移除所选历史连接".into();
                     }
                     self.persist_config();
                 }
@@ -806,6 +845,8 @@ impl ArdViewer {
         };
         let port_text = if has_embedded_port {
             parsed_port.as_str()
+        } else if self.port.trim().is_empty() {
+            "5900"
         } else {
             self.port.trim()
         };
@@ -828,18 +869,15 @@ impl ArdViewer {
 
     fn persist_config(&mut self) {
         let cached = config::AppConfig {
-            devices: if self.remember_device {
-                self.devices
-                    .iter()
-                    .map(|device| config::CachedDevice {
-                        name: device.name.clone(),
-                        address: device.address.clone(),
-                        username: device.username.clone(),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            devices: self
+                .devices
+                .iter()
+                .map(|device| config::CachedDevice {
+                    name: device.name.clone(),
+                    address: device.address.clone(),
+                    username: device.username.clone(),
+                })
+                .collect(),
             last_address: self
                 .remote_endpoint()
                 .unwrap_or_else(|_| self.address.trim().to_owned()),
@@ -847,7 +885,8 @@ impl ArdViewer {
             remember_password: self.remember_password,
             remember_device: self.remember_device,
             quality: config::quality_to_cache(self.quality).into(),
-            frame_interval_ms: normalized_frame_interval(&self.frame_interval_ms).to_string(),
+            frame_rate: self.frame_rate.clone(),
+            frame_interval_ms: frame_interval_from_rate(&self.frame_rate).to_string(),
             key_profile: self.key_profile.clone(),
             auto_adapt_keyboard: self.auto_adapt_keyboard,
             capture_system_shortcuts: self.capture_system_shortcuts,
@@ -860,16 +899,21 @@ impl ArdViewer {
     }
 
     fn store_credentials(&mut self) {
+        if self.remember_password && self.password.is_empty() {
+            return;
+        }
         let password = self.remember_password.then_some(self.password.as_str());
         let address = self
             .remote_endpoint()
             .unwrap_or_else(|_| self.address.trim().to_owned());
         if let Err(error) = config::save_password(&address, &self.username, password) {
             self.status = format!("系统密钥库不可用：{error}");
+        } else {
+            self.has_saved_password = password.is_some();
         }
     }
 
-    fn start_session(&mut self) {
+    fn start_session(&mut self, password: String) {
         self.disconnect_session();
         self.session_connection = ConnectionState::Connecting;
         self.session_metrics = StreamMetrics::default();
@@ -881,13 +925,33 @@ impl ArdViewer {
                 .remote_endpoint()
                 .expect("validated before starting a session"),
             username: self.username.trim().to_owned(),
-            password: self.password.as_bytes().to_vec(),
+            password: password.into_bytes(),
             quality: self.quality,
-            frame_interval: Duration::from_millis(normalized_frame_interval(
-                &self.frame_interval_ms,
-            )),
+            frame_interval: frame_duration_from_rate(&self.frame_rate),
         }));
         self.status = "正在当前 Session 窗口中连接…".into();
+    }
+
+    fn upsert_history(&mut self, endpoint: &str) {
+        if let Some(index) = self
+            .devices
+            .iter()
+            .position(|device| device.address.eq_ignore_ascii_case(endpoint))
+        {
+            self.devices[index].username = self.username.trim().to_owned();
+            self.devices[index].state = DeviceState::RecentlyUsed;
+            self.selected_device = index;
+            return;
+        }
+        let (name, _) = split_endpoint(endpoint);
+        self.devices.push(SavedDevice {
+            name,
+            address: endpoint.to_owned(),
+            username: self.username.trim().to_owned(),
+            state: DeviceState::RecentlyUsed,
+        });
+        self.previous_selected_device = self.selected_device;
+        self.selected_device = self.devices.len() - 1;
     }
 
     fn disconnect_session(&mut self) {
@@ -1083,8 +1147,34 @@ fn format_endpoint(host: &str, port: &str) -> String {
     }
 }
 
-fn normalized_frame_interval(value: &str) -> u64 {
-    value.trim().parse().unwrap_or(0)
+fn frame_interval_from_rate(value: &str) -> u64 {
+    let frames_per_second = value.trim().parse::<u64>().unwrap_or(0).min(240);
+    if frames_per_second == 0 {
+        0
+    } else {
+        (1000 / frames_per_second).max(1)
+    }
+}
+
+fn frame_duration_from_rate(value: &str) -> Duration {
+    let frames_per_second = value.trim().parse::<u16>().unwrap_or(0).min(240);
+    if frames_per_second == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(1.0 / f64::from(frames_per_second))
+    }
+}
+
+fn frame_rate_from_interval(value: &str) -> String {
+    let interval = value.trim().parse::<u64>().unwrap_or(0);
+    if interval == 0 {
+        String::new()
+    } else {
+        (1000.0 / interval as f64)
+            .round()
+            .clamp(1.0, 240.0)
+            .to_string()
+    }
 }
 
 fn session_event_subscription(
@@ -1351,6 +1441,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_port_uses_ard_default() {
+        let (mut app, _task) = ArdViewer::new();
+        app.address = "host.local".into();
+        app.port.clear();
+
+        assert_eq!(app.remote_endpoint(), Ok("host.local:5900".into()));
+    }
+
+    #[test]
+    fn frame_rate_is_converted_to_protocol_interval() {
+        assert_eq!(frame_interval_from_rate(""), 0);
+        assert_eq!(frame_interval_from_rate("30"), 33);
+        assert_eq!(frame_interval_from_rate("60"), 16);
+        assert_eq!(frame_interval_from_rate("240"), 4);
+        assert_eq!(
+            frame_duration_from_rate("60"),
+            Duration::from_nanos(16_666_667)
+        );
+        assert_eq!(frame_rate_from_interval("0"), "");
+        assert_eq!(frame_rate_from_interval("16"), "63");
+    }
+
+    #[test]
     fn session_canvas_fills_the_window() {
         let (mut app, _task) = ArdViewer::new();
         app.session_window_size = iced::Size::new(1440.0, 900.0);
@@ -1392,6 +1505,22 @@ mod tests {
         assert_eq!(app.selected_device, previous_len);
         assert_eq!(app.devices[previous_len].name, "new-host.local");
         assert_eq!(app.devices[previous_len].state, DeviceState::Saved);
+    }
+
+    #[test]
+    fn history_is_retained_when_auto_add_is_disabled() {
+        let (mut app, _task) = ArdViewer::new();
+        app.devices.push(SavedDevice {
+            name: "history-host".into(),
+            address: "history-host:5900".into(),
+            username: "tester".into(),
+            state: DeviceState::RecentlyUsed,
+        });
+
+        let _task = app.update(Message::RememberDeviceChanged(false));
+
+        assert_eq!(app.devices.len(), 1);
+        assert_eq!(app.devices[0].address, "history-host:5900");
     }
 
     #[test]
