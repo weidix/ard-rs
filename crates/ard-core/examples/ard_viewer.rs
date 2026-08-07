@@ -1798,12 +1798,6 @@ fn mouse_button_bit(button: MouseButton, modifiers: ModifiersState) -> Option<u8
 }
 
 fn is_paste_shortcut(event: &KeyEvent, modifiers: ModifiersState) -> bool {
-    // On Windows and Linux, the Super key belongs to the local desktop. In
-    // particular, Super+V opens the system clipboard history on Windows and
-    // must not be mistaken for the viewer's remote paste shortcut.
-    if modifiers.super_key() && !cfg!(target_os = "macos") {
-        return false;
-    }
     if matches!(event.logical_key, Key::Named(NamedKey::Paste)) {
         return true;
     }

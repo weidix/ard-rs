@@ -1126,8 +1126,6 @@ impl InputDispatcher {
             input,
             error,
         };
-        #[cfg(target_os = "windows")]
-        crate::windows_input::install(dispatcher.sender.clone());
         dispatcher
     }
 
@@ -1155,12 +1153,8 @@ impl InputState {
     pub fn set_input(&mut self, input: ArdClientInput) {
         self.input = Some(input.clone());
         self.dispatcher.set_input(Some(input));
-        #[cfg(target_os = "windows")]
-        crate::windows_input::set_input_ready(true);
     }
     pub fn clear_input(&mut self) {
-        #[cfg(target_os = "windows")]
-        crate::windows_input::set_input_ready(false);
         self.release_all();
         self.input = None;
         self.dispatcher.set_input(None);
@@ -1474,9 +1468,6 @@ pub fn mouse_button_bit(button: Button, modifiers: Modifiers) -> Option<u8> {
 }
 
 pub fn is_paste_shortcut(key: &Key, modifiers: Modifiers) -> bool {
-    if modifiers.logo() && !cfg!(target_os = "macos") {
-        return false;
-    }
     if matches!(key, Key::Named(Named::Paste)) {
         return true;
     }
@@ -1489,7 +1480,7 @@ pub fn is_paste_shortcut(key: &Key, modifiers: Modifiers) -> bool {
 pub fn is_system_shortcut(physical: Physical, key: &Key, modifiers: Modifiers) -> bool {
     let super_key = matches!(physical, Physical::Code(Code::SuperLeft | Code::SuperRight))
         || matches!(key, Key::Named(Named::Super));
-    if !cfg!(target_os = "windows") && (super_key || modifiers.logo()) {
+    if super_key || modifiers.logo() {
         return true;
     }
     let named = |expected| matches!(key, Key::Named(actual) if *actual == expected);
@@ -1518,7 +1509,7 @@ fn is_textual_key(key: &Key) -> bool {
 }
 
 fn key_event_keysym(key: &Key, physical: Physical, location: Location) -> Option<u32> {
-    apple_modifier_keysym(physical).or_else(|| {
+    remote_modifier_keysym(physical).or_else(|| {
         match key.as_ref() {
             Key::Character(text) => text
                 .chars()
@@ -1533,7 +1524,7 @@ fn key_event_keysym(key: &Key, physical: Physical, location: Location) -> Option
     })
 }
 
-fn apple_modifier_keysym(physical: Physical) -> Option<u32> {
+fn remote_modifier_keysym(physical: Physical) -> Option<u32> {
     let key = match physical {
         // Apple's RFB client and server use Alt keysyms for Command and Meta
         // keysyms for Option. Super keysyms are not interpreted as Command.
@@ -1935,24 +1926,29 @@ mod tests {
     }
 
     #[test]
-    fn control_click_and_shortcuts_map_correctly() {
+    fn control_click_uses_the_native_pointer_behavior() {
         let expected = if cfg!(target_os = "macos") {
             Some(0x02)
         } else {
             Some(0x01)
         };
         assert_eq!(mouse_button_bit(Button::Left, Modifiers::CTRL), expected);
-        assert_eq!(
-            is_system_shortcut(
-                Physical::Code(Code::SuperLeft),
-                &Key::Named(Named::Super),
-                Modifiers::NONE
-            ),
-            !cfg!(target_os = "windows")
-        );
+    }
+
+    #[test]
+    fn keyboard_shortcuts_use_the_same_rules_on_every_platform() {
+        assert!(is_system_shortcut(
+            Physical::Code(Code::SuperLeft),
+            &Key::Named(Named::Super),
+            Modifiers::NONE
+        ));
         assert!(is_paste_shortcut(
             &Key::Character("v".into()),
-            Modifiers::COMMAND
+            Modifiers::CTRL
+        ));
+        assert!(is_paste_shortcut(
+            &Key::Character("v".into()),
+            Modifiers::LOGO
         ));
     }
 
