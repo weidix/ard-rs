@@ -1460,10 +1460,9 @@ fn format_endpoint(host: &str, port: &str) -> String {
 
 fn frame_interval_from_rate(value: &str) -> u64 {
     let frames_per_second = value.trim().parse::<u64>().unwrap_or(0).min(240);
-    if frames_per_second == 0 {
-        0
-    } else {
-        (1000 / frames_per_second).max(1)
+    match frames_per_second {
+        0 => 0,
+        frames_per_second => (1000 / frames_per_second).max(1),
     }
 }
 

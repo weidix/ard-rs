@@ -1141,12 +1141,11 @@ impl InputDispatcher {
                 }
             })
             .expect("ARD input dispatcher should start");
-        let dispatcher = Self {
+        Self {
             sender,
             input,
             error,
-        };
-        dispatcher
+        }
     }
 
     fn set_input(&self, input: Option<ArdClientInput>) {
