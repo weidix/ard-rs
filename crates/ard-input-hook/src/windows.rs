@@ -16,19 +16,25 @@
 //! All other keys are passed on to the system and reach the application
 //! through its normal window input path.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Devices::HumanInterfaceDevice::{
+    HID_USAGE_GENERIC_KEYBOARD, HID_USAGE_PAGE_GENERIC,
+};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
     VK_MENU, VK_NUMLOCK, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT,
     VK_SNAPSHOT, VK_TAB,
+};
+use windows::Win32::UI::Input::{
+    GetRegisteredRawInputDevices, RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
@@ -65,10 +71,15 @@ static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 /// Handle that owns the hook thread.
 pub struct WindowsHook {
     thread: Option<JoinHandle<()>>,
+    raw_input: Mutex<RawInputKeyboardRegistration>,
 }
 
 impl WindowsHook {
     pub fn start(config: HookConfig) -> Result<(Self, Receiver<HookEvent>), HookError> {
+        let mut raw_input = RawInputKeyboardRegistration::capture()?;
+        if config.capture_enabled {
+            raw_input.suspend()?;
+        }
         let (sender, receiver) = sync_channel(256);
         *SENDER
             .lock()
@@ -96,10 +107,27 @@ impl WindowsHook {
                 "Windows hook thread did not start its message pump".into(),
             ));
         }
-        Ok((Self { thread: Some(thread) }, receiver))
+        Ok((
+            Self {
+                thread: Some(thread),
+                raw_input: Mutex::new(raw_input),
+            },
+            receiver,
+        ))
     }
 
     pub fn set_enabled(&self, enabled: bool) -> Result<(), HookError> {
+        let mut raw_input = self
+            .raw_input
+            .lock()
+            .map_err(|_| HookError::Other("Windows raw input state poisoned".into()))?;
+        if enabled {
+            raw_input.suspend()?;
+        } else {
+            // Stop suppressing keys before handing keyboard Raw Input back to winit.
+            ENABLED.store(false, Ordering::SeqCst);
+            raw_input.restore()?;
+        }
         ENABLED.store(enabled, Ordering::SeqCst);
         Ok(())
     }
@@ -119,7 +147,101 @@ impl Drop for WindowsHook {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        if let Ok(mut raw_input) = self.raw_input.lock() {
+            let _ = raw_input.restore();
+        }
     }
+}
+
+/// Winit registers the generic keyboard for process-wide Raw Input device
+/// events. Temporarily releasing that registration keeps the low-level hook
+/// authoritative while shortcut capture is armed. Normal focused-window
+/// keyboard messages do not depend on this registration.
+struct RawInputKeyboardRegistration {
+    saved: Vec<RAWINPUTDEVICE>,
+    suspended: bool,
+}
+
+impl RawInputKeyboardRegistration {
+    fn capture() -> Result<Self, HookError> {
+        let device_size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
+        let mut count = 0;
+        // SAFETY: a null output buffer asks Windows for the required count.
+        let status = unsafe { GetRegisteredRawInputDevices(None, &mut count, device_size) };
+        if status == u32::MAX {
+            return Err(last_error("GetRegisteredRawInputDevices(size) failed"));
+        }
+
+        let mut devices = vec![RAWINPUTDEVICE::default(); count as usize];
+        if count != 0 {
+            // SAFETY: the buffer has room for `count` RAWINPUTDEVICE values.
+            let status = unsafe {
+                GetRegisteredRawInputDevices(Some(devices.as_mut_ptr()), &mut count, device_size)
+            };
+            if status == u32::MAX {
+                return Err(last_error("GetRegisteredRawInputDevices failed"));
+            }
+            devices.truncate(count as usize);
+        }
+        devices.retain(is_generic_keyboard_registration);
+
+        Ok(Self {
+            saved: devices,
+            suspended: false,
+        })
+    }
+
+    fn suspend(&mut self) -> Result<(), HookError> {
+        if self.suspended || self.saved.is_empty() {
+            self.suspended = true;
+            return Ok(());
+        }
+        let removals: Vec<_> = self
+            .saved
+            .iter()
+            .map(|device| RAWINPUTDEVICE {
+                usUsagePage: device.usUsagePage,
+                usUsage: device.usUsage,
+                dwFlags: RIDEV_REMOVE,
+                hwndTarget: HWND::default(),
+            })
+            .collect();
+        register_raw_input_devices(&removals, "removing winit keyboard Raw Input")?;
+        self.suspended = true;
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<(), HookError> {
+        if !self.suspended {
+            return Ok(());
+        }
+        if !self.saved.is_empty() {
+            register_raw_input_devices(&self.saved, "restoring winit keyboard Raw Input")?;
+        }
+        self.suspended = false;
+        Ok(())
+    }
+}
+
+impl Drop for RawInputKeyboardRegistration {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn is_generic_keyboard_registration(device: &RAWINPUTDEVICE) -> bool {
+    device.usUsagePage == HID_USAGE_PAGE_GENERIC && device.usUsage == HID_USAGE_GENERIC_KEYBOARD
+}
+
+fn register_raw_input_devices(devices: &[RAWINPUTDEVICE], action: &str) -> Result<(), HookError> {
+    let device_size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
+    // SAFETY: `devices` is a valid contiguous RAWINPUTDEVICE slice.
+    unsafe { RegisterRawInputDevices(devices, device_size) }
+        .map_err(|error| HookError::Io(format!("{action} failed: {error}")))
+}
+
+fn last_error(context: &str) -> HookError {
+    HookError::Io(format!("{context}: {}", windows::core::Error::from_win32()))
 }
 
 fn hook_thread_main() {
@@ -174,8 +296,8 @@ unsafe extern "system" fn low_level_keyboard_proc(
     let released = matches!(message, WM_KEYUP | WM_SYSKEYUP);
     let mut suppress = false;
     if pressed || released {
-    let flags = info.flags.0;
-    let kind = classify_key(info.vkCode, flags);
+        let flags = info.flags.0;
+        let kind = classify_key(info.vkCode, flags);
         update_modifier_state(kind, info.vkCode, pressed, released);
         if ENABLED.load(Ordering::SeqCst) {
             suppress = should_suppress(kind);
