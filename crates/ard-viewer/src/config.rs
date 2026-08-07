@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::i18n::Language;
-use crate::state::{DeviceState, SavedDevice, ThemePreference};
+use crate::state::{DeviceState, SavedDevice, ThemePreference, ToolbarButton};
 
 #[cfg(not(test))]
 const CREDENTIAL_FILE: &str = "credentials.json";
@@ -56,8 +56,17 @@ pub struct AppConfig {
     pub capture_system_shortcuts: bool,
     pub reverse_scroll: bool,
     pub show_performance_hud: bool,
+    #[serde(default = "default_toolbar_buttons")]
+    pub toolbar_buttons: Vec<String>,
     pub theme: String,
     pub language: String,
+}
+
+fn default_toolbar_buttons() -> Vec<String> {
+    ToolbarButton::ALL
+        .iter()
+        .map(|button| toolbar_button_to_cache(*button).to_owned())
+        .collect()
 }
 
 impl Default for AppConfig {
@@ -78,6 +87,7 @@ impl Default for AppConfig {
             capture_system_shortcuts: false,
             reverse_scroll: false,
             show_performance_hud: true,
+            toolbar_buttons: default_toolbar_buttons(),
             theme: "system".into(),
             language: "zh-CN".into(),
         }
@@ -302,9 +312,58 @@ pub fn language_from_cache(value: &str) -> Language {
     Language::from_code(value)
 }
 
+pub fn toolbar_buttons_from_cache(config: &AppConfig) -> Vec<ToolbarButton> {
+    config
+        .toolbar_buttons
+        .iter()
+        .filter_map(|name| match name.as_str() {
+            "screenshot" => Some(ToolbarButton::Screenshot),
+            "app-switcher" => Some(ToolbarButton::AppSwitcher),
+            "mission-control" => Some(ToolbarButton::MissionControl),
+            "desktop" => Some(ToolbarButton::Desktop),
+            "zoom-out" => Some(ToolbarButton::ZoomOut),
+            "zoom-in" => Some(ToolbarButton::ZoomIn),
+            "actual-size" => Some(ToolbarButton::ActualSize),
+            "fit-to-window" => Some(ToolbarButton::FitToWindow),
+            "remote-keyboard" => Some(ToolbarButton::RemoteKeyboard),
+            "pointer" => Some(ToolbarButton::Pointer),
+            "clipboard" => Some(ToolbarButton::Clipboard),
+            "system-shortcut" => Some(ToolbarButton::SystemShortcut),
+            "undo" => Some(ToolbarButton::Undo),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn toolbar_buttons_to_cache(buttons: &[ToolbarButton]) -> Vec<String> {
+    buttons
+        .iter()
+        .map(|button| toolbar_button_to_cache(*button).to_owned())
+        .collect()
+}
+
+fn toolbar_button_to_cache(button: ToolbarButton) -> &'static str {
+    match button {
+        ToolbarButton::Screenshot => "screenshot",
+        ToolbarButton::AppSwitcher => "app-switcher",
+        ToolbarButton::MissionControl => "mission-control",
+        ToolbarButton::Desktop => "desktop",
+        ToolbarButton::ZoomOut => "zoom-out",
+        ToolbarButton::ZoomIn => "zoom-in",
+        ToolbarButton::ActualSize => "actual-size",
+        ToolbarButton::FitToWindow => "fit-to-window",
+        ToolbarButton::RemoteKeyboard => "remote-keyboard",
+        ToolbarButton::Pointer => "pointer",
+        ToolbarButton::Clipboard => "clipboard",
+        ToolbarButton::SystemShortcut => "system-shortcut",
+        ToolbarButton::Undo => "undo",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, toolbar_buttons_from_cache, toolbar_buttons_to_cache};
+    use crate::state::ToolbarButton;
 
     #[test]
     fn legacy_config_enables_native_interpolation() {
@@ -340,5 +399,39 @@ mod tests {
         )
         .expect("serialized sharp sampling config parses");
         assert!(restored.sharp_sampling);
+    }
+
+    #[test]
+    fn legacy_config_defaults_to_all_toolbar_buttons() {
+        let config: AppConfig = serde_json::from_str("{}").expect("legacy config parses");
+        assert_eq!(
+            toolbar_buttons_from_cache(&config),
+            ToolbarButton::ALL.to_vec()
+        );
+    }
+
+    #[test]
+    fn toolbar_button_visibility_round_trips() {
+        let config = AppConfig {
+            toolbar_buttons: vec!["screenshot".into(), "zoom-in".into(), "desktop".into()],
+            ..AppConfig::default()
+        };
+        let buttons = toolbar_buttons_from_cache(&config);
+        assert_eq!(
+            buttons,
+            vec![
+                ToolbarButton::Screenshot,
+                ToolbarButton::ZoomIn,
+                ToolbarButton::Desktop
+            ]
+        );
+        assert_eq!(
+            toolbar_buttons_to_cache(&buttons),
+            vec![
+                "screenshot".to_owned(),
+                "zoom-in".to_owned(),
+                "desktop".to_owned()
+            ]
+        );
     }
 }

@@ -2,6 +2,7 @@ use iced::widget::{checkbox, column, container, row, space, stack, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::icons::{Icon, icon};
+use crate::state::ToolbarButton;
 use crate::state::{SettingsSection, ThemePreference};
 use crate::theme::{
     self, BODY_SIZE, CAPTION_SIZE, CONTENT_PADDING_X, CONTROL_HEIGHT, CONTROL_RADIUS, ICON_SIZE,
@@ -206,6 +207,29 @@ fn general(app: &ArdViewer) -> Element<'_, Message> {
                 muted(app.language.tr("同时反转垂直和水平滚动方向。")),
             ]
             .spacing(8),
+        ),
+        settings_group(
+            app.language.tr("快捷按钮"),
+            column![
+                muted(app.language.tr("选择会话工具栏中显示哪些快捷按钮。")),
+                ToolbarButton::ALL
+                    .chunks(2)
+                    .fold(column![].spacing(8), |column, pair| {
+                        let mut row = row![].spacing(28);
+                        for button in pair {
+                            row = row.push(
+                                checkbox(app.toolbar_buttons.contains(button))
+                                    .label(button.label(app.language))
+                                    .on_toggle(move |_| Message::ToolbarButtonToggled(*button))
+                                    .size(16)
+                                    .text_size(BODY_SIZE)
+                                    .style(theme::checkbox),
+                            );
+                        }
+                        column.push(row)
+                    }),
+            ]
+            .spacing(10),
         ),
     ]
     .spacing(24)

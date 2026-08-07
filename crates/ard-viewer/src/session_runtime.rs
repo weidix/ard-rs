@@ -922,12 +922,21 @@ fn scale_channel(value: u32, shift: u8, max: u16) -> u8 {
     ((((value >> shift) & u32::from(max)) * 255 + u32::from(max) / 2) / u32::from(max)) as u8
 }
 
-pub fn fitted_viewport(bounds: Rectangle, frame: Size<u16>, zoom: f32) -> Rectangle {
+pub fn fitted_viewport(
+    bounds: Rectangle,
+    frame: Size<u16>,
+    zoom: f32,
+    actual_size: bool,
+) -> Rectangle {
     if frame.width == 0 || frame.height == 0 || bounds.width <= 0.0 || bounds.height <= 0.0 {
         return Rectangle::new(bounds.position(), Size::ZERO);
     }
     let fit = (bounds.width / f32::from(frame.width)).min(bounds.height / f32::from(frame.height));
-    let scale = fit * zoom.clamp(0.25, 4.0);
+    let scale = if actual_size {
+        1.0
+    } else {
+        fit * zoom.clamp(0.25, 4.0)
+    };
     let width = (f32::from(frame.width) * scale).round().max(1.0);
     let height = (f32::from(frame.height) * scale).round().max(1.0);
     Rectangle::new(
@@ -944,8 +953,9 @@ pub fn map_remote_position(
     point: Point,
     frame: Size<u16>,
     zoom: f32,
+    actual_size: bool,
 ) -> Option<(u16, u16)> {
-    let viewport = fitted_viewport(bounds, frame, zoom);
+    let viewport = fitted_viewport(bounds, frame, zoom, actual_size);
     if !viewport.contains(point) {
         return None;
     }
@@ -1190,6 +1200,20 @@ impl InputState {
         }
         self.dispatcher
             .submit(InputCommand::Clipboard(text.to_owned()))
+    }
+
+    /// Presses and releases a key combination on the remote, modifier first.
+    pub fn send_key_combo(&self, keysyms: &[u32]) -> Result<(), String> {
+        if self.input.is_none() {
+            return Err("远程输入尚未就绪".to_owned());
+        }
+        for &keysym in keysyms {
+            self.send_key(true, keysym)?;
+        }
+        for &keysym in keysyms.iter().rev() {
+            self.send_key(false, keysym)?;
+        }
+        Ok(())
     }
 
     pub fn handle(&mut self, event: InputEvent, capture_shortcuts: bool) -> Result<(), String> {
@@ -1978,12 +2002,45 @@ mod tests {
     fn coordinates_respect_letterboxing_and_zoom() {
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1000.0, 1000.0));
         assert_eq!(
-            map_remote_position(bounds, Point::new(500.0, 500.0), Size::new(1920, 1080), 1.0),
+            map_remote_position(
+                bounds,
+                Point::new(500.0, 500.0),
+                Size::new(1920, 1080),
+                1.0,
+                false
+            ),
             Some((960, 540))
         );
         assert_eq!(
-            map_remote_position(bounds, Point::new(500.0, 100.0), Size::new(1920, 1080), 1.0),
+            map_remote_position(
+                bounds,
+                Point::new(500.0, 100.0),
+                Size::new(1920, 1080),
+                1.0,
+                false
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn actual_size_viewport_uses_raw_pixels() {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1000.0, 1000.0));
+        let frame = Size::new(1920, 1080);
+        let fitted = fitted_viewport(bounds, frame, 1.0, false);
+        let actual = fitted_viewport(bounds, frame, 1.0, true);
+        assert!(fitted.width < actual.width);
+        assert_eq!(actual.width, 1920.0);
+        assert_eq!(actual.height, 1080.0);
+        assert_eq!(
+            map_remote_position(
+                bounds,
+                Point::new(actual.x + 10.0, actual.y + 10.0),
+                frame,
+                1.0,
+                true
+            ),
+            Some((10, 10))
         );
     }
 

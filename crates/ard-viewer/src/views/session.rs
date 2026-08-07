@@ -8,11 +8,10 @@ use iced::{Alignment, Element, Fill, Padding, window};
 use crate::icons::{Icon, icon};
 use crate::session_renderer;
 use crate::session_runtime::ConnectionState;
+use crate::state::ToolbarButton;
 use crate::theme::{self, MICRO_SIZE, WINDOW_RADIUS};
 use crate::widgets::window_chrome_with_title;
-use crate::{
-    ArdViewer, Message, SESSION_TOOLBAR_COLLAPSED_WIDTH, SESSION_TOOLBAR_WIDTH, SessionAction,
-};
+use crate::{ArdViewer, Message, SESSION_TOOLBAR_COLLAPSED_WIDTH, SessionAction};
 
 pub(crate) const SESSION_TITLEBAR_HEIGHT: f32 = 50.0;
 
@@ -46,7 +45,7 @@ pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
                 endpoint,
                 detail,
             ),
-            windowed_session_toolbar(app.effective_dark()),
+            windowed_session_toolbar(app, app.effective_dark()),
         ]
         .height(SESSION_TITLEBAR_HEIGHT);
         column![
@@ -73,6 +72,7 @@ fn remote_canvas(
         container(session_renderer::remote_display(
             runtime.mailbox(),
             app.session_zoom,
+            app.session_actual_size,
             runtime.should_interpolate(),
             runtime.sharp_sampling(),
         ))
@@ -141,7 +141,7 @@ fn fullscreen_session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static
     let toolbar_visible = toolbar_progress > 0.01;
     let toolbar: Element<'static, Message> = if toolbar_visible {
         container(
-            mouse_area(control_bar(app.session_toolbar_pinned, is_dark))
+            mouse_area(control_bar(app, is_dark))
                 .on_enter(Message::SessionToolbarInteraction)
                 .on_press(Message::SessionToolbarInteraction),
         )
@@ -152,15 +152,15 @@ fn fullscreen_session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static
         toolbar_handle(Icon::ChevronDown, Message::ShowSessionToolbar, is_dark).into()
     };
     let toolbar_width = if toolbar_visible {
-        SESSION_TOOLBAR_WIDTH
+        app.session_toolbar_width()
     } else {
         SESSION_TOOLBAR_COLLAPSED_WIDTH
     };
     positioned_session_toolbar(app, toolbar, toolbar_width, Alignment::Start)
 }
 
-fn windowed_session_toolbar(is_dark: bool) -> Element<'static, Message> {
-    container(windowed_toolbar_controls(is_dark))
+fn windowed_session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {
+    container(windowed_toolbar_controls(app, is_dark))
         .id("session-windowed-toolbar")
         .width(Fill)
         .height(Fill)
@@ -235,8 +235,8 @@ fn connection_progress(app: &ArdViewer) -> Element<'_, Message> {
         .into()
 }
 
-fn control_bar(pinned: bool, is_dark: bool) -> Element<'static, Message> {
-    let controls = toolbar_controls(pinned, is_dark);
+fn control_bar(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {
+    let controls = toolbar_controls(app, is_dark);
     let handle = container(embedded_toolbar_handle(is_dark))
         .width(SESSION_TOOLBAR_COLLAPSED_WIDTH)
         .height(14)
@@ -254,22 +254,25 @@ fn control_bar(pinned: bool, is_dark: bool) -> Element<'static, Message> {
         .into()
 }
 
-fn toolbar_controls(pinned: bool, is_dark: bool) -> Element<'static, Message> {
-    let action_button =
-        |kind, action| toolbar_button(kind, false, Message::SessionAction(action), is_dark);
-    let controls = row![
-        toolbar_drag_handle(is_dark),
-        action_button(Icon::Scan, SessionAction::Fit),
-        action_button(Icon::ZoomIn, SessionAction::Zoom),
-        action_button(Icon::Pointer, SessionAction::Input),
-        action_button(Icon::Keyboard, SessionAction::SystemShortcut),
-        action_button(Icon::Clipboard, SessionAction::Clipboard),
-        action_button(Icon::Undo, SessionAction::Undo),
-        toolbar_button(Icon::Fullscreen, false, Message::ToggleFullscreen, is_dark,),
-        toolbar_button(Icon::Pin, pinned, Message::ToggleSessionToolbarPin, is_dark,),
-    ]
-    .spacing(2)
-    .align_y(Alignment::Center);
+fn toolbar_controls(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {
+    let mut controls = row![toolbar_drag_handle(is_dark)];
+    for button in &app.toolbar_buttons {
+        controls = controls.push(quick_button(*button, app, is_dark));
+    }
+    controls = controls
+        .push(toolbar_button(
+            Icon::Fullscreen,
+            false,
+            Message::ToggleFullscreen,
+            is_dark,
+        ))
+        .push(toolbar_button(
+            Icon::Pin,
+            app.session_toolbar_pinned,
+            Message::ToggleSessionToolbarPin,
+            is_dark,
+        ));
+    let controls = controls.spacing(2).align_y(Alignment::Center);
 
     container(controls)
         .padding([3, 4])
@@ -277,21 +280,51 @@ fn toolbar_controls(pinned: bool, is_dark: bool) -> Element<'static, Message> {
         .into()
 }
 
-fn windowed_toolbar_controls(is_dark: bool) -> Element<'static, Message> {
-    let action_button =
-        |kind, action| toolbar_button(kind, false, Message::SessionAction(action), is_dark);
-    row![
-        action_button(Icon::Scan, SessionAction::Fit),
-        action_button(Icon::ZoomIn, SessionAction::Zoom),
-        action_button(Icon::Pointer, SessionAction::Input),
-        action_button(Icon::Keyboard, SessionAction::SystemShortcut),
-        action_button(Icon::Clipboard, SessionAction::Clipboard),
-        action_button(Icon::Undo, SessionAction::Undo),
-        toolbar_button(Icon::Fullscreen, false, Message::ToggleFullscreen, is_dark,),
-    ]
-    .spacing(2)
-    .align_y(Alignment::Center)
-    .into()
+fn windowed_toolbar_controls(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {
+    let mut controls = row![];
+    for button in &app.toolbar_buttons {
+        controls = controls.push(quick_button(*button, app, is_dark));
+    }
+    controls = controls.push(toolbar_button(
+        Icon::Fullscreen,
+        false,
+        Message::ToggleFullscreen,
+        is_dark,
+    ));
+    controls.spacing(2).align_y(Alignment::Center).into()
+}
+
+fn quick_button(
+    button: ToolbarButton,
+    app: &ArdViewer,
+    is_dark: bool,
+) -> iced::widget::Button<'static, Message> {
+    let selected = match button {
+        ToolbarButton::SystemShortcut => app.capture_system_shortcuts,
+        ToolbarButton::ActualSize => app.session_actual_size,
+        _ => false,
+    };
+    let action = match button {
+        ToolbarButton::Screenshot => SessionAction::Screenshot,
+        ToolbarButton::AppSwitcher => SessionAction::AppSwitcher,
+        ToolbarButton::MissionControl => SessionAction::MissionControl,
+        ToolbarButton::Desktop => SessionAction::Desktop,
+        ToolbarButton::ZoomOut => SessionAction::ZoomOut,
+        ToolbarButton::ZoomIn => SessionAction::ZoomIn,
+        ToolbarButton::ActualSize => SessionAction::ActualSize,
+        ToolbarButton::FitToWindow => SessionAction::FitToWindow,
+        ToolbarButton::RemoteKeyboard => SessionAction::RemoteKeyboard,
+        ToolbarButton::Pointer => SessionAction::Pointer,
+        ToolbarButton::Clipboard => SessionAction::Clipboard,
+        ToolbarButton::SystemShortcut => SessionAction::SystemShortcut,
+        ToolbarButton::Undo => SessionAction::Undo,
+    };
+    toolbar_button(
+        button.icon(),
+        selected,
+        Message::SessionAction(action),
+        is_dark,
+    )
 }
 
 fn toolbar_drag_handle(is_dark: bool) -> Element<'static, Message> {

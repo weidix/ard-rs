@@ -99,6 +99,23 @@ impl Language {
             "同时反转垂直和水平滚动方向。" => {
                 "Reverse both vertical and horizontal scrolling."
             }
+            "快捷按钮" => "Toolbar buttons",
+            "选择会话工具栏中显示哪些快捷按钮。" => {
+                "Choose which shortcuts appear in the session toolbar."
+            }
+            "截屏" => "Screenshot",
+            "App 切换" => "App Switcher",
+            "调度中心" => "Mission Control",
+            "桌面" => "Desktop",
+            "缩小" => "Zoom Out",
+            "放大" => "Zoom In",
+            "实际画面" => "Actual Size",
+            "缩放至窗口大小" => "Fit to Window",
+            "远程键盘" => "Remote Keyboard",
+            "键鼠输入" => "Pointer & Keyboard",
+            "剪贴板" => "Clipboard",
+            "系统快捷键" => "System Shortcuts",
+            "重置缩放" => "Reset Zoom",
             "配置本地按键如何发送到远程设备。" => {
                 "Configure how local keys are sent to the remote device."
             }
@@ -115,7 +132,9 @@ impl Language {
             "拖动可调整优先级" => "Drag to change priority",
             "常用选项" => "Common options",
             "自动适配远程键盘布局" => "Adapt to remote keyboard layout",
-            "在窗口获取焦点时屏蔽系统快捷键" => "Block system shortcuts while the window is focused",
+            "在窗口获取焦点时屏蔽系统快捷键" => {
+                "Block system shortcuts while the window is focused"
+            }
             "设置远程画面的质量和性能。" => {
                 "Configure remote display quality and performance."
             }
@@ -171,6 +190,16 @@ impl Language {
             "已添加常用映射" => "Mapping added",
             "已移除按键映射" => "Key mapping removed",
             "远程键鼠输入已启用" => "Remote keyboard and mouse input enabled",
+            "远程键盘已启用，输入将发送到远端" => {
+                "Remote keyboard enabled; input goes to the remote"
+            }
+            "已切换到实际画面（1:1）" => "Switched to actual size (1:1)",
+            "已向远端发送截屏指令" => "Screenshot request sent to remote",
+            "已切换到远端应用列表" => "Switched to remote app switcher",
+            "已打开远端调度中心" => "Opened remote Mission Control",
+            "已显示远端桌面" => "Showed remote desktop",
+            "快捷按钮已隐藏" => "Toolbar button hidden",
+            "快捷按钮已显示" => "Toolbar button shown",
             "窗口聚焦时系统快捷键将发送到远端" => {
                 "System shortcuts will be sent to the remote while the window is focused"
             }

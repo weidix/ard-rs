@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
-use ard_rs::ArdVideoQuality;
 use ard_input_hook::{HookConfig, HookEvent};
+use ard_rs::{ArdVideoQuality, XK_CONTROL_LEFT, XK_F1, XK_META_LEFT, XK_SHIFT_LEFT, XK_TAB, XK_UP};
 use iced::widget::{column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, Subscription, Task, Theme, window};
 
@@ -25,9 +25,11 @@ use session_runtime::{
     SessionRuntime, StreamMetrics, is_paste_shortcut, map_remote_position, reverse_scroll_delta,
 };
 
-use state::{DeviceState, KeyMapping, SavedDevice, SettingsSection, ThemePreference, WindowKind};
+use state::{
+    DeviceState, KeyMapping, SavedDevice, SettingsSection, ThemePreference, ToolbarButton,
+    WindowKind,
+};
 
-const SESSION_TOOLBAR_WIDTH: f32 = 286.0;
 const SESSION_TOOLBAR_COLLAPSED_WIDTH: f32 = 44.0;
 const SETTINGS_WINDOW_OFFSET: f32 = 32.0;
 const SESSION_IME_ID: &str = "session-ime-sink";
@@ -65,6 +67,7 @@ struct ArdViewer {
     capture_system_shortcuts: bool,
     reverse_scroll: bool,
     show_performance_hud: bool,
+    toolbar_buttons: Vec<ToolbarButton>,
     theme_preference: ThemePreference,
     language: Language,
     system_dark: bool,
@@ -72,6 +75,7 @@ struct ArdViewer {
     keyboard_hook: Option<ard_input_hook::KeyboardHook>,
     mappings: Vec<KeyMapping>,
     session_zoom: f32,
+    session_actual_size: bool,
     session_runtime: Option<SessionRuntime>,
     session_connection: ConnectionState,
     session_metrics: StreamMetrics,
@@ -155,6 +159,7 @@ enum Message {
     CaptureShortcutsChanged(bool),
     ReverseScrollChanged(bool),
     PerformanceHudChanged(bool),
+    ToolbarButtonToggled(ToolbarButton),
     ThemePreferenceChanged(ThemePreference),
     LanguageChanged(Language),
     SystemThemeChanged(iced::theme::Mode),
@@ -183,12 +188,19 @@ enum Message {
 
 #[derive(Debug, Clone, Copy)]
 enum SessionAction {
-    Fit,
-    Zoom,
+    FitToWindow,
+    ZoomOut,
+    ZoomIn,
+    ActualSize,
     Undo,
-    Input,
+    Pointer,
     Clipboard,
     SystemShortcut,
+    Screenshot,
+    AppSwitcher,
+    MissionControl,
+    Desktop,
+    RemoteKeyboard,
 }
 
 impl ArdViewer {
@@ -233,6 +245,7 @@ impl ArdViewer {
             sharp_sampling: cached.sharp_sampling,
             settings_section: SettingsSection::KeyMapping,
             settings_transition: 1.0,
+            toolbar_buttons: config::toolbar_buttons_from_cache(&cached),
             key_profile: cached.key_profile,
             auto_adapt_keyboard: cached.auto_adapt_keyboard,
             capture_system_shortcuts: cached.capture_system_shortcuts,
@@ -245,6 +258,7 @@ impl ArdViewer {
             keyboard_hook: None,
             mappings,
             session_zoom: 1.0,
+            session_actual_size: false,
             session_runtime: None,
             session_connection: ConnectionState::Idle,
             session_metrics: StreamMetrics::default(),
@@ -619,17 +633,26 @@ impl ArdViewer {
                     return Task::batch([window::set_mode(id, mode), window::set_level(id, level)]);
                 }
             }
-            Message::SessionAction(SessionAction::Fit) => {
+            Message::SessionAction(SessionAction::FitToWindow) => {
                 self.touch_session_toolbar();
                 self.session_zoom = 1.0;
+                self.session_actual_size = false;
             }
-            Message::SessionAction(SessionAction::Zoom) => {
+            Message::SessionAction(SessionAction::ZoomIn) => {
                 self.touch_session_toolbar();
-                self.session_zoom = if self.session_zoom >= 1.4 {
-                    0.6
-                } else {
-                    self.session_zoom + 0.1
-                }
+                self.session_actual_size = false;
+                self.session_zoom = (self.session_zoom * 1.25).min(4.0);
+            }
+            Message::SessionAction(SessionAction::ZoomOut) => {
+                self.touch_session_toolbar();
+                self.session_actual_size = false;
+                self.session_zoom = (self.session_zoom / 1.25).max(0.25);
+            }
+            Message::SessionAction(SessionAction::ActualSize) => {
+                self.touch_session_toolbar();
+                self.session_zoom = 1.0;
+                self.session_actual_size = true;
+                self.status = self.language.tr("已切换到实际画面（1:1）").into();
             }
             Message::Connect => {
                 self.device_context_menu = None;
@@ -685,11 +708,22 @@ impl ArdViewer {
             }
             Message::SessionAction(SessionAction::Undo) => {
                 self.session_zoom = 1.0;
+                self.session_actual_size = false;
                 self.touch_session_toolbar();
             }
-            Message::SessionAction(SessionAction::Input) => {
+            Message::SessionAction(SessionAction::Pointer) => {
                 self.touch_session_toolbar();
                 self.status = self.language.tr("远程键鼠输入已启用").into();
+                if let Some(id) = self.window_id(WindowKind::Session) {
+                    return Task::batch([
+                        window::gain_focus(id),
+                        iced::widget::operation::focus(iced::widget::Id::new(SESSION_IME_ID)),
+                    ]);
+                }
+            }
+            Message::SessionAction(SessionAction::RemoteKeyboard) => {
+                self.touch_session_toolbar();
+                self.status = self.language.tr("远程键盘已启用，输入将发送到远端").into();
                 if let Some(id) = self.window_id(WindowKind::Session) {
                     return Task::batch([
                         window::gain_focus(id),
@@ -711,6 +745,48 @@ impl ArdViewer {
                 } else {
                     self.language.tr("系统快捷键保留在本机").into()
                 };
+            }
+            Message::SessionAction(SessionAction::Screenshot) => {
+                self.touch_session_toolbar();
+                match self.session_input.send_key_combo(&[
+                    XK_META_LEFT,
+                    XK_SHIFT_LEFT,
+                    u32::from(b'3'),
+                ]) {
+                    Ok(()) => self.status = self.language.tr("已向远端发送截屏指令").into(),
+                    Err(error) => self.status = self.remote_input_error(&error),
+                }
+            }
+            Message::SessionAction(SessionAction::AppSwitcher) => {
+                self.touch_session_toolbar();
+                match self.session_input.send_key_combo(&[XK_META_LEFT, XK_TAB]) {
+                    Ok(()) => self.status = self.language.tr("已切换到远端应用列表").into(),
+                    Err(error) => self.status = self.remote_input_error(&error),
+                }
+            }
+            Message::SessionAction(SessionAction::MissionControl) => {
+                self.touch_session_toolbar();
+                match self.session_input.send_key_combo(&[XK_CONTROL_LEFT, XK_UP]) {
+                    Ok(()) => self.status = self.language.tr("已打开远端调度中心").into(),
+                    Err(error) => self.status = self.remote_input_error(&error),
+                }
+            }
+            Message::SessionAction(SessionAction::Desktop) => {
+                self.touch_session_toolbar();
+                match self.session_input.send_key_combo(&[XK_F1 + 10]) {
+                    Ok(()) => self.status = self.language.tr("已显示远端桌面").into(),
+                    Err(error) => self.status = self.remote_input_error(&error),
+                }
+            }
+            Message::ToolbarButtonToggled(button) => {
+                if let Some(index) = self.toolbar_buttons.iter().position(|b| *b == button) {
+                    self.toolbar_buttons.remove(index);
+                    self.status = self.language.tr("快捷按钮已隐藏").to_string();
+                } else {
+                    self.toolbar_buttons.push(button);
+                    self.status = self.language.tr("快捷按钮已显示").to_string();
+                }
+                self.persist_config();
             }
             Message::SessionToolbarTick(now) => {
                 if self.session_toolbar_visible
@@ -886,8 +962,7 @@ impl ArdViewer {
             );
             if self.keyboard_hook.is_some() {
                 subscriptions.push(
-                    iced::time::every(Duration::from_millis(2))
-                        .map(|_| Message::KeyboardHookPoll),
+                    iced::time::every(Duration::from_millis(2)).map(|_| Message::KeyboardHookPoll),
                 );
             }
             subscriptions.push(
@@ -933,6 +1008,22 @@ impl ArdViewer {
         self.session_toolbar_last_interaction = Instant::now();
     }
 
+    fn remote_input_error(&self, error: &str) -> String {
+        if self.language == Language::English {
+            format!("Remote input failed: {}", self.language.tr(error))
+        } else {
+            format!("远程输入失败：{error}")
+        }
+    }
+
+    /// Width of the floating full-screen toolbar shell: drag handle, the
+    /// selected quick buttons, then the always-present fullscreen and pin
+    /// buttons.
+    pub(crate) fn session_toolbar_width(&self) -> f32 {
+        let buttons = (self.toolbar_buttons.len() + 2) as f32;
+        8.0 + 22.0 + buttons * 30.0 + buttons * 2.0
+    }
+
     fn is_window_maximized(&self, id: window::Id) -> bool {
         self.maximized_windows.contains(&id)
     }
@@ -972,11 +1063,11 @@ impl ArdViewer {
     }
 
     fn clamp_session_toolbar_position(&mut self) {
-        const TOOLBAR_HALF_WIDTH: f32 = SESSION_TOOLBAR_WIDTH / 2.0;
+        let toolbar_half_width = self.session_toolbar_width() / 2.0;
         if let Some(x) = self.session_toolbar_x.as_mut() {
             *x = x.clamp(
-                TOOLBAR_HALF_WIDTH,
-                (self.session_toolbar_window_width - TOOLBAR_HALF_WIDTH).max(TOOLBAR_HALF_WIDTH),
+                toolbar_half_width,
+                (self.session_toolbar_window_width - toolbar_half_width).max(toolbar_half_width),
             );
         }
     }
@@ -1016,6 +1107,7 @@ impl ArdViewer {
             capture_system_shortcuts: self.capture_system_shortcuts,
             reverse_scroll: self.reverse_scroll,
             show_performance_hud: self.show_performance_hud,
+            toolbar_buttons: config::toolbar_buttons_to_cache(&self.toolbar_buttons),
             theme: config::theme_to_cache(self.theme_preference).into(),
             language: self.language.code().into(),
         };
@@ -1112,6 +1204,7 @@ impl ArdViewer {
         self.session_server_name.clear();
         self.session_error = None;
         self.session_zoom = 1.0;
+        self.session_actual_size = false;
         self.session_runtime = Some(SessionRuntime::start(SessionConfig {
             address: self
                 .remote_endpoint()
@@ -1211,6 +1304,7 @@ impl ArdViewer {
                     position,
                     iced::Size::new(self.session_metrics.width, self.session_metrics.height),
                     self.session_zoom,
+                    self.session_actual_size,
                 );
                 self.session_pointer_remote = position;
                 Some(InputEvent::CursorMoved(position))
@@ -2157,7 +2251,8 @@ mod tests {
             id,
             window::Event::Resized(iced::Size::new(600.0, 500.0)),
         ));
-        assert_eq!(app.session_toolbar_x, Some(457.0));
+        let expected = 600.0 - app.session_toolbar_width() / 2.0;
+        assert_eq!(app.session_toolbar_x, Some(expected));
 
         let _task = app.update(Message::SessionToolbarDragEnded);
         assert!(!app.session_toolbar_dragging);
@@ -2167,7 +2262,7 @@ mod tests {
     fn collapsed_and_expanded_toolbar_handles_share_the_same_axis() {
         let (mut app, _task) = ArdViewer::new();
         app.session_fullscreen = true;
-        app.session_toolbar_x = Some(215.0);
+        app.session_toolbar_x = Some(app.session_toolbar_width() / 2.0);
         let window_id = window::Id::unique();
         let mut expanded = iced_test::Simulator::with_size(
             iced::Settings::default(),
@@ -2435,11 +2530,18 @@ mod tests {
     #[test]
     fn session_buttons_change_zoom_shortcut_and_toolbar_state() {
         let (mut app, _task) = ArdViewer::new();
-        let _ = app.update(Message::SessionAction(SessionAction::Zoom));
+        let _ = app.update(Message::SessionAction(SessionAction::ZoomIn));
         assert!(app.session_zoom > 1.0);
 
-        let _ = app.update(Message::SessionAction(SessionAction::Fit));
+        let _ = app.update(Message::SessionAction(SessionAction::ZoomOut));
         assert_eq!(app.session_zoom, 1.0);
+
+        let _ = app.update(Message::SessionAction(SessionAction::FitToWindow));
+        assert_eq!(app.session_zoom, 1.0);
+        assert!(!app.session_actual_size);
+
+        let _ = app.update(Message::SessionAction(SessionAction::ActualSize));
+        assert!(app.session_actual_size);
 
         let shortcuts = app.capture_system_shortcuts;
         let _ = app.update(Message::SessionAction(SessionAction::SystemShortcut));
@@ -2449,6 +2551,12 @@ mod tests {
 
         let _ = app.update(Message::ToggleSessionToolbarPin);
         assert!(app.session_toolbar_pinned);
+
+        let _ = app.update(Message::ToolbarButtonToggled(ToolbarButton::Screenshot));
+        assert!(!app.toolbar_buttons.contains(&ToolbarButton::Screenshot));
+        let _ = app.update(Message::ToolbarButtonToggled(ToolbarButton::Screenshot));
+        assert!(app.toolbar_buttons.contains(&ToolbarButton::Screenshot));
+        assert_eq!(app.toolbar_buttons.len(), ToolbarButton::ALL.len());
     }
 
     #[test]

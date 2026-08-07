@@ -10,6 +10,7 @@ use crate::session_runtime::{FramePacket, SharedMailbox, TileSet, fitted_viewpor
 pub struct RemoteProgram {
     mailbox: SharedMailbox,
     zoom: f32,
+    actual_size: bool,
     should_interpolate: bool,
     sharp_sampling: bool,
 }
@@ -18,12 +19,14 @@ impl RemoteProgram {
     pub fn new(
         mailbox: SharedMailbox,
         zoom: f32,
+        actual_size: bool,
         should_interpolate: bool,
         sharp_sampling: bool,
     ) -> Self {
         Self {
             mailbox,
             zoom,
+            actual_size,
             should_interpolate,
             sharp_sampling,
         }
@@ -44,6 +47,7 @@ impl<Message> Program<Message> for RemoteProgram {
             mailbox: Arc::clone(&self.mailbox),
             bounds,
             zoom: self.zoom,
+            actual_size: self.actual_size,
             should_interpolate: self.should_interpolate,
             sharp_sampling: self.sharp_sampling,
         }
@@ -53,12 +57,14 @@ impl<Message> Program<Message> for RemoteProgram {
 pub fn remote_display<Message: 'static>(
     mailbox: SharedMailbox,
     zoom: f32,
+    actual_size: bool,
     should_interpolate: bool,
     sharp_sampling: bool,
 ) -> Element<'static, Message> {
     shader::Shader::new(RemoteProgram::new(
         mailbox,
         zoom,
+        actual_size,
         should_interpolate,
         sharp_sampling,
     ))
@@ -72,6 +78,7 @@ pub struct RemotePrimitive {
     mailbox: SharedMailbox,
     bounds: Rectangle,
     zoom: f32,
+    actual_size: bool,
     should_interpolate: bool,
     sharp_sampling: bool,
 }
@@ -96,6 +103,7 @@ impl shader::Primitive for RemotePrimitive {
         }
         pipeline.mailbox = Some(Arc::clone(&self.mailbox));
         pipeline.zoom = self.zoom;
+        pipeline.actual_size = self.actual_size;
         pipeline.should_interpolate = self.should_interpolate;
         pipeline.sharp_sampling = self.sharp_sampling;
         pipeline.scale_factor = viewport.scale_factor();
@@ -164,6 +172,7 @@ pub struct RemotePipeline {
     mailbox: Option<SharedMailbox>,
     bounds: Rectangle,
     zoom: f32,
+    actual_size: bool,
     should_interpolate: bool,
     sharp_sampling: bool,
     scale_factor: f32,
@@ -317,6 +326,7 @@ impl shader::Pipeline for RemotePipeline {
             mailbox: None,
             bounds: Rectangle::default(),
             zoom: 1.0,
+            actual_size: false,
             should_interpolate: true,
             sharp_sampling: false,
             scale_factor: 1.0,
@@ -577,6 +587,7 @@ impl RemotePipeline {
             bounds,
             Size::new(decoded.width as u16, decoded.height as u16),
             self.zoom,
+            self.actual_size,
         );
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return;
@@ -782,7 +793,7 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0, true, false),
+            remote_display::<()>(mailbox, 1.0, false, true, false),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
         assert!(snapshot.matches_image("/tmp/ard-viewer-iced-rgba-pipeline")?);
@@ -812,7 +823,7 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0, true, false),
+            remote_display::<()>(mailbox, 1.0, false, true, false),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
         assert!(snapshot.matches_image("/tmp/ard-viewer-iced-mvs-pipeline")?);
