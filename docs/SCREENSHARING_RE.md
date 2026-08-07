@@ -284,6 +284,19 @@ When the previous luma block is empty (`lumaCount == 0`), the differential
 coefficient expansion still consumes `newCount` records (positions
 1 through `newCount`), one more than the stored luma coefficients.
 
+### ExpandBlockRice AC phase shifts
+
+`ExpandBlockRice` descales AC coefficients differently in its two phases.
+The compact phase (zigzag scans 1–5) shifts by 1 when the limit exceeds 14,
+otherwise by 3 below the limit and 4 at/above it (instructions at
+`0x1C8953478`–`0x1C8953488`). The non-compact phase (scans 6+) has no such
+override: it shifts by 4 at/above the limit, by 3 below it when the limit
+exceeds 14, and by 0 otherwise (`0x1C89538C4`–`0x1C89538D8`). A decoder that
+reuses the compact formula for non-compact scans under-shifts mid-frequency
+coefficients by 4x on streams whose limits exceed 14 (for example the
+captured live session with limits 15/25), which destroys high-frequency
+detail in Rice/DCT tiles and shows up as tile-grid artifacts at font edges.
+
 ### Cursor rectangles inside FramebufferUpdate
 
 Screen Sharing's client rectangle dispatch treats two additional encodings as

@@ -591,6 +591,61 @@ fn decodes_mvs_rice_ac_coefficient_and_block_reuse() {
 }
 
 #[test]
+fn non_compact_rice_ac_uses_the_native_phase_shift() {
+    // ExpandBlockRice's compact phase (scans 1-5) descales AC coefficients
+    // by 1 when the limit exceeds 14, but the non-compact phase (scans 6+)
+    // descales by 3 below the limit. The captured real update uses limits
+    // 15/25, so this path decides whether high-frequency detail survives.
+    let mut packet = partial_mvs_packet_with_secondary(
+        &[(0, 1), (5, 3), (0, 1), (0x6d, 8)],
+        &[
+            (0, 1), // new coefficient block
+            (3, 2), // retain both chroma predictors
+            (0, 1),
+            (0, 1), // zero luma DC
+            (0, 1),
+            (0, 2), // skip scan 1
+            (0, 1),
+            (0, 2), // skip scan 2
+            (0, 1),
+            (0, 2), // skip scan 3
+            (0, 1),
+            (0, 2), // skip scan 4
+            (0, 1),
+            (0, 2), // skip scan 5
+            (1, 1), // coefficient present at scan 6
+            (0, 1), // zero prefix
+            (0, 2), // zero suffix -> magnitude 2
+            (0, 1),
+            (1, 2), // end-of-block selector
+            (0, 1), // end block
+        ],
+    );
+    packet[5] = 15; // luminance Rice limit
+    packet[6] = 15; // chrominance Rice limit
+
+    let mut decoder = Decoder::new_gpu_mvs(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    decoder
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &packet, &mut framebuffer)
+        .unwrap();
+    let frames = decoder.take_gpu_mvs_frames();
+    let tile = frames
+        .iter()
+        .flat_map(|frame| frame.tiles.iter())
+        .find(|update| update.width == 8 && update.height == 8)
+        .expect("one full tile")
+        .tile
+        .clone();
+    let ard_rs::MvsGpuTile::RiceDct(coefficients) = tile else {
+        panic!("expected a Rice/DCT tile");
+    };
+    // Magnitude 2 shifted by the native non-compact shift 3 -> coefficient 16
+    // at zigzag position 6 (natural index 3).
+    assert_eq!(coefficients[0][3], 16);
+}
+
+#[test]
 fn decodes_mvs_full_differential_and_both_cache_selectors() {
     let mut baseline = partial_mvs_packet_with_secondary(
         &[(0, 1), (5, 3), (0, 1), (0x6d, 8)],

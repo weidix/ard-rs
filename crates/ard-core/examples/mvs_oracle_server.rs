@@ -379,6 +379,25 @@ fn send_mvs_rectangle(
     stream.flush()
 }
 
+fn send_mvs_rectangles(
+    stream: &mut TcpStream,
+    rectangles: &[(u16, u16, u16, u16, Vec<u8>)],
+) -> std::io::Result<()> {
+    let mut update = Vec::new();
+    update.extend_from_slice(&[0, 0]);
+    update.extend_from_slice(&(rectangles.len() as u16).to_be_bytes());
+    for (x, y, width, height, payload) in rectangles {
+        update.extend_from_slice(&x.to_be_bytes());
+        update.extend_from_slice(&y.to_be_bytes());
+        update.extend_from_slice(&width.to_be_bytes());
+        update.extend_from_slice(&height.to_be_bytes());
+        update.extend_from_slice(&1011_i32.to_be_bytes());
+        update.extend_from_slice(payload);
+    }
+    stream.write_all(&update)?;
+    stream.flush()
+}
+
 fn main() -> std::io::Result<()> {
     let port = env::args().nth(1).unwrap_or_else(|| "5999".to_owned());
     let host = env::args().nth(2).unwrap_or_else(|| "127.0.0.1".to_owned());
@@ -430,7 +449,11 @@ fn main() -> std::io::Result<()> {
     stream.read_exact(&mut shared)?;
     println!("shared-session flag: {}", shared[0]);
 
-    let (width, height) = (64_u16, 64_u16);
+    let (width, height) = if env::args().nth(5).as_deref() == Some("real-capture") {
+        (3420_u16, 2224_u16)
+    } else {
+        (64_u16, 64_u16)
+    };
     let (update_width, update_height) = (width, height);
     let name = b"ard-rs MVS oracle";
     let mut init = Vec::new();
@@ -456,8 +479,42 @@ fn main() -> std::io::Result<()> {
         "dct-full" => mvs_full_dct(false),
         "dct-ac-full" => mvs_full_dct(true),
         "full-diff" => mvs_full_dct(true),
+        "real-capture" => {
+            let path = env::args().nth(6).unwrap_or_else(|| {
+                eprintln!("usage: ... real-capture FIXTURE_PATH");
+                std::process::exit(2);
+            });
+            std::fs::read(&path).expect("fixture path must contain the captured MVS payload")
+        }
         _ => mvs_white(update_width, update_height),
     };
+    if frame_kind == "real-capture" {
+        // Replay the captured sequence exactly: the quantization control
+        // rectangle first, then the framebuffer update, as one update with
+        // two rectangles so the native decoder installs the custom tables
+        // before decoding the partial update.
+        let bytes = std::fs::read(env::args().nth(6).expect("fixture path")).expect("fixture");
+        let mut cursor = 0_usize;
+        let mut rectangles = Vec::new();
+        while cursor + 16 <= bytes.len() {
+            let x = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]);
+            let y = u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
+            let width = u16::from_be_bytes([bytes[cursor + 4], bytes[cursor + 5]]);
+            let height = u16::from_be_bytes([bytes[cursor + 6], bytes[cursor + 7]]);
+            let length =
+                usize::try_from(u32::from_be_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap()))
+                    .expect("payload length");
+            let payload = bytes[cursor + 12..cursor + 12 + length].to_vec();
+            rectangles.push((x, y, width, height, payload));
+            cursor += 12 + length;
+        }
+        println!("replaying {} captured MVS rectangles", rectangles.len());
+        send_mvs_rectangles(&mut stream, &rectangles)?;
+        println!("sent {} captured MVS bytes", cursor);
+        let mut sink = [0_u8; 4096];
+        while stream.read(&mut sink)? != 0 {}
+        return Ok(());
+    }
     if frame_kind == "full-diff" {
         // Keep two compact luma coefficients in Screen Sharing's per-tile
         // differential baseline.

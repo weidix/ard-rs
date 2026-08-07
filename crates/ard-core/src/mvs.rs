@@ -1123,7 +1123,7 @@ fn decode_ac_rice(bits: &mut BitReader<'_>, coefficients: &mut [i16; 64], limit:
                 }
             };
             let magnitude = magnitude
-                .checked_shl(coefficient_shift(scan, limit))
+                .checked_shl(ac_coefficient_shift(scan, limit))
                 .ok_or(Error::LimitExceeded("ARD MVS AC Rice coefficient"))?;
             let magnitude = i16::try_from(magnitude)
                 .map_err(|_| Error::LimitExceeded("ARD MVS AC Rice coefficient"))?;
@@ -1137,7 +1137,7 @@ fn decode_ac_rice(bits: &mut BitReader<'_>, coefficients: &mut [i16; 64], limit:
             0 => scan += 1,
             2 | 3 => {
                 let magnitude = 1_i16
-                    .checked_shl(coefficient_shift(scan, limit))
+                    .checked_shl(ac_coefficient_shift(scan, limit))
                     .ok_or(Error::LimitExceeded("ARD MVS AC Rice coefficient"))?;
                 coefficients[ZIGZAG[scan]] = if selector == 2 { magnitude } else { -magnitude };
                 scan += 1;
@@ -1175,11 +1175,26 @@ fn decode_ac_rice(bits: &mut BitReader<'_>, coefficients: &mut [i16; 64], limit:
     Ok(())
 }
 
-fn coefficient_shift(scan: usize, limit: u8) -> u32 {
-    if scan < usize::from(limit) {
-        if limit >= 15 { 1 } else { 3 }
-    } else {
+fn ac_coefficient_shift(scan: usize, limit: u8) -> u32 {
+    // ExpandBlockRice applies different shifts to the two AC phases. The
+    // compact phase (scans 1-5) descales by 1 when the limit exceeds 14,
+    // otherwise by 3 below the limit and 4 at/above it. The non-compact
+    // phase (scans 6+) has no such override: it descales by 4 at/above the
+    // limit, by 3 below it when the limit exceeds 14, and by 0 otherwise.
+    if scan < 6 {
+        if limit > 14 {
+            1
+        } else if scan < usize::from(limit) {
+            3
+        } else {
+            4
+        }
+    } else if scan >= usize::from(limit) {
         4
+    } else if limit > 14 {
+        3
+    } else {
+        0
     }
 }
 
