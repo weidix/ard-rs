@@ -31,7 +31,7 @@ pub enum WindowKind {
 impl WindowKind {
     pub fn size(self) -> Size {
         match self {
-            Self::Connection => Size::new(900.0, 640.0),
+            Self::Connection => Size::new(900.0, 680.0),
             Self::Settings => Size::new(900.0, 680.0),
             Self::Session => Size::new(1280.0, 800.0),
         }

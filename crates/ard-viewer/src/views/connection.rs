@@ -447,6 +447,13 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     )
     .width(PARAMETER_CONTROL_WIDTH)
     .center_y(CONTROL_HEIGHT);
+    let parameter_rows = column![
+        connection_parameter_row(app.language.tr("视频质量"), quality),
+        connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate),
+        connection_parameter_row(app.language.tr("画面插值"), interpolation),
+        connection_parameter_row(app.language.tr("三次锐化采样"), sharp_sampling),
+    ]
+    .spacing(8);
     let advanced = container(
         column![
             row![
@@ -457,10 +464,16 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             ]
             .spacing(7)
             .align_y(Alignment::Center),
-            connection_parameter_row(app.language.tr("视频质量"), quality),
-            connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate),
-            connection_parameter_row(app.language.tr("画面插值"), interpolation),
-            connection_parameter_row(app.language.tr("三次锐化采样"), sharp_sampling),
+            scrollable(parameter_rows)
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    iced::widget::scrollable::Scrollbar::new()
+                        .width(3)
+                        .scroller_width(3)
+                        .margin(3),
+                ))
+                .style(theme::connection_scrollable)
+                .height(Fill)
+                .width(Fill),
             text(
                 app.language
                     .tr("像素格式：服务器原生  ·  缩放：适应窗口  ·  自动重连：已启用")
@@ -472,6 +485,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     )
     .padding(12)
     .width(Fill)
+    .height(Fill)
     .style(theme::shaped_panel(
         theme::palette().surface,
         CONTROL_RADIUS.into(),
@@ -520,6 +534,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         heading, address, username, password, remembers, advanced, security,
     ]
     .spacing(12)
+    .height(Fill)
     .width(Fill);
     if !app.status.is_empty() {
         content = content.push(
@@ -528,17 +543,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
                 .color(theme::palette().text_warm),
         );
     }
-    let scrolling = scrollable(content)
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            iced::widget::scrollable::Scrollbar::new()
-                .width(3)
-                .scroller_width(3)
-                .margin(3),
-        ))
-        .style(theme::connection_scrollable)
-        .height(Fill)
-        .width(Fill);
-    let body = column![scrolling, actions]
+    let body = column![content, actions]
         .spacing(12)
         .height(Fill)
         .width(Fill);
