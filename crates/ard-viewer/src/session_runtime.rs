@@ -1049,7 +1049,7 @@ impl Default for InputState {
 }
 
 #[derive(Debug)]
-enum InputCommand {
+pub(crate) enum InputCommand {
     Key { pressed: bool, keysym: u32 },
     Pointer { mask: u8, x: u16, y: u16 },
     PointerBatch(Vec<(u8, u16, u16)>),
@@ -1121,11 +1121,14 @@ impl InputDispatcher {
                 }
             })
             .expect("ARD input dispatcher should start");
-        Self {
+        let dispatcher = Self {
             sender,
             input,
             error,
-        }
+        };
+        #[cfg(target_os = "windows")]
+        crate::windows_input::install(dispatcher.sender.clone());
+        dispatcher
     }
 
     fn set_input(&self, input: Option<ArdClientInput>) {

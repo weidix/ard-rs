@@ -285,6 +285,10 @@ impl ArdViewer {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        #[cfg(target_os = "windows")]
+        if let Some(error) = windows_input::take_error() {
+            self.session_error = Some(error);
+        }
         match message {
             Message::WindowOpened(kind, id) => {
                 self.windows.insert(id, kind);
@@ -324,6 +328,12 @@ impl ArdViewer {
                 }
                 return window::is_maximized(id)
                     .map(move |maximized| Message::WindowMaximizedChanged(id, maximized));
+            }
+            Message::WindowEvent(id, window::Event::Unfocused) => {
+                if self.windows.get(&id) == Some(&WindowKind::Session) {
+                    #[cfg(target_os = "windows")]
+                    windows_input::set_session_focused(false);
+                }
             }
             Message::WindowEvent(_, _) => {}
             Message::WindowMaximizedChanged(id, maximized) => {
@@ -556,6 +566,8 @@ impl ArdViewer {
             }
             Message::CaptureShortcutsChanged(value) => {
                 self.capture_system_shortcuts = value;
+                #[cfg(target_os = "windows")]
+                windows_input::set_capture_system_shortcuts(value);
                 self.persist_config();
             }
             Message::ReverseScrollChanged(value) => {
@@ -690,6 +702,8 @@ impl ArdViewer {
             Message::SessionAction(SessionAction::SystemShortcut) => {
                 self.touch_session_toolbar();
                 self.capture_system_shortcuts = !self.capture_system_shortcuts;
+                #[cfg(target_os = "windows")]
+                windows_input::set_capture_system_shortcuts(self.capture_system_shortcuts);
                 self.persist_config();
                 self.status = if self.capture_system_shortcuts {
                     self.language.tr("系统快捷键将发送到远端").into()
@@ -800,6 +814,7 @@ impl ArdViewer {
             #[cfg(target_os = "windows")]
             Message::SessionWindowHandle(hwnd) => {
                 windows_input::set_session_window(hwnd);
+                windows_input::set_capture_system_shortcuts(self.capture_system_shortcuts);
             }
             Message::ClipboardRead(contents) => {
                 if let Some(text) = self.session_clipboard.observe_local(contents)
@@ -1242,15 +1257,23 @@ impl ArdViewer {
                 modifiers,
             }),
             iced::Event::InputMethod(iced::advanced::input_method::Event::Opened) => {
+                #[cfg(target_os = "windows")]
+                windows_input::set_ime_active(true);
                 Some(InputEvent::ImeOpened)
             }
             iced::Event::InputMethod(iced::advanced::input_method::Event::Preedit(text, _)) => {
+                #[cfg(target_os = "windows")]
+                windows_input::set_ime_active(!text.is_empty());
                 Some(InputEvent::ImePreedit(text))
             }
             iced::Event::InputMethod(iced::advanced::input_method::Event::Commit(text)) => {
+                #[cfg(target_os = "windows")]
+                windows_input::set_ime_active(false);
                 Some(InputEvent::ImeCommit(text))
             }
             iced::Event::InputMethod(iced::advanced::input_method::Event::Closed) => {
+                #[cfg(target_os = "windows")]
+                windows_input::set_ime_active(false);
                 Some(InputEvent::ImeClosed)
             }
             iced::Event::Window(window::Event::Unfocused) => Some(InputEvent::FocusLost),
