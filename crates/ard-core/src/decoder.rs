@@ -134,6 +134,13 @@ impl Decoder {
             self.pending_encryption_control = Some(control);
             return Ok(consumed);
         }
+        if encoding == Encoding::CursorPosition {
+            // Screen Sharing's 1100 rectangle carries the pointer hotspot in
+            // the rectangle header and has no payload. The viewer draws its
+            // own cursor overlay from this position; the core only needs to
+            // tolerate the rectangle so it does not abort the whole update.
+            return Ok(0);
+        }
         framebuffer.validate_rect(&rect)?;
         if rect.width == 0 || rect.height == 0 {
             if encoding == Encoding::ArdMvs {
@@ -150,7 +157,7 @@ impl Decoder {
             Encoding::ArdGrayscale => self.decode_apple_zlib(rect, payload, framebuffer, 1),
             Encoding::ArdThousands => self.decode_apple_zlib(rect, payload, framebuffer, 2),
             Encoding::ArdMvs => self.decode_mvs(rect, payload, framebuffer, transactional_mvs),
-            Encoding::DesktopSize | Encoding::ArdEncryption => {
+            Encoding::DesktopSize | Encoding::ArdEncryption | Encoding::CursorPosition => {
                 unreachable!("handled before rectangle validation")
             }
         }
@@ -172,7 +179,7 @@ impl Decoder {
             return Ok(0);
         }
         match encoding {
-            Encoding::DesktopSize => Ok(0),
+            Encoding::DesktopSize | Encoding::CursorPosition => Ok(0),
             Encoding::ArdEncryption => {
                 if payload.len() < ArdEncryptionControl::WIRE_LEN {
                     Err(Error::NeedMore {

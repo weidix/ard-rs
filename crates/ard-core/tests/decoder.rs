@@ -1536,6 +1536,31 @@ fn desktop_size_resets_the_framebuffer() {
 }
 
 #[test]
+fn cursor_position_rectangle_is_a_noop() {
+    // Screen Sharing sends the pointer hotspot as an 1100 rectangle inside a
+    // FramebufferUpdate; the native decoder treats it as a zero-payload
+    // control rectangle. The Rust decoder must consume it without touching
+    // the framebuffer or rejecting the update.
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    framebuffer.pixels_mut().fill(0x5a);
+    let cursor = Rectangle {
+        x: 640,
+        y: 480,
+        width: 1,
+        height: 1,
+        encoding: 1100,
+    };
+    assert_eq!(
+        decoder
+            .decode_rectangle(cursor, &[], &mut framebuffer)
+            .unwrap(),
+        0
+    );
+    assert!(framebuffer.pixels().iter().all(|&byte| byte == 0x5a));
+}
+
+#[test]
 fn decodes_zrle_compact_pixels_when_padding_is_low_byte() {
     let high_xrgb = PixelFormat {
         red_shift: 24,

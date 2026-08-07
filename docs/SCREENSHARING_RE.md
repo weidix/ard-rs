@@ -284,6 +284,23 @@ When the previous luma block is empty (`lumaCount == 0`), the differential
 coefficient expansion still consumes `newCount` records (positions
 1 through `newCount`), one more than the stored luma coefficients.
 
+### Cursor rectangles inside FramebufferUpdate
+
+Screen Sharing's client rectangle dispatch treats two additional encodings as
+ordinary FramebufferUpdate rectangles:
+
+| Encoding | Meaning | Payload |
+| ---: | --- | --- |
+| `1100` | pointer hotspot | zero (position is in the rectangle header) |
+| `-239` | cursor image | variable cursor bitmap, read directly by the handler |
+
+The server records `-239` and `1100` in `HandleSetEncodingsMessage` (flags at
+viewer offsets `0x9a` and `0x9b` in the tested build) and only emits cursor
+rectangles to viewers that advertise them. The native client still tolerates
+an unadvertised `1100` rectangle; the Rust decoder now consumes it as a
+zero-payload no-op instead of rejecting the whole FramebufferUpdate (which
+dropped every frame while the pointer moved and forced a reconnect).
+
 ## Native decoder oracle
 
 An isolated pure-Rust one-shot server in `crates/ard-core/examples/mvs_oracle_server.rs` was

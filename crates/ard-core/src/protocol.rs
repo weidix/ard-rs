@@ -745,6 +745,11 @@ pub enum Encoding {
     CopyRect = 1,
     Zlib = 6,
     Zrle = 16,
+    /// Apple cursor-position rectangle. The native client treats it as an
+    /// ordinary FramebufferUpdate rectangle: the position lives in the
+    /// rectangle header and the payload is empty. The server emits it when
+    /// the pointer moves, even outside the shared framebuffer.
+    CursorPosition = 1100,
     ArdHalftone = 1000,
     ArdGrayscale = 1001,
     ArdThousands = 1002,
@@ -760,6 +765,7 @@ impl Encoding {
             1 => Self::CopyRect,
             6 => Self::Zlib,
             16 => Self::Zrle,
+            1100 => Self::CursorPosition,
             1000 => Self::ArdHalftone,
             1001 => Self::ArdGrayscale,
             1002 => Self::ArdThousands,
