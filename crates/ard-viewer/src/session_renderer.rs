@@ -542,7 +542,8 @@ impl RemotePipeline {
                 self.mvs_bind_group.as_ref().expect("MVS bind group"),
                 &[],
             );
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            let (workgroups_x, workgroups_y) = mvs_dispatch_size(workgroups);
+            pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
         let Some(decoded) = &self.decoded else { return };
         let scale = self.scale_factor;
@@ -652,11 +653,22 @@ fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
 fn pack_dirty_gpu_tiles(tiles: &TileSet, records: &mut Vec<u32>, payload: &mut Vec<i32>) {
     records.clear();
     payload.clear();
-    records.reserve(tiles.dirty_len().saturating_mul(8));
+    records.reserve(1 + tiles.dirty_len().saturating_mul(8));
+    records.push(u32::try_from(tiles.dirty_len()).expect("tile count fits u32"));
     tiles.for_each_dirty(|update| pack_one_gpu_tile(update, records, payload));
     if payload.is_empty() {
         payload.push(0);
     }
+}
+
+fn mvs_dispatch_size(workgroups: u32) -> (u32, u32) {
+    const MAX_PER_DIMENSION: u32 = 65_535;
+
+    debug_assert!(workgroups > 0);
+    let workgroups_y = workgroups.div_ceil(MAX_PER_DIMENSION);
+    let workgroups_x = workgroups.div_ceil(workgroups_y);
+    assert!(workgroups_x <= MAX_PER_DIMENSION && workgroups_y <= MAX_PER_DIMENSION);
+    (workgroups_x, workgroups_y)
 }
 
 fn pack_one_gpu_tile(update: &MvsGpuTileUpdate, records: &mut Vec<u32>, payload: &mut Vec<i32>) {
@@ -707,7 +719,7 @@ mod tests {
 
     use ard_rs::{ArdVideoQuality, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, PixelFormat};
 
-    use super::remote_display;
+    use super::{mvs_dispatch_size, remote_display};
     use crate::session_runtime::{FrameMailbox, FramePacket, framebuffer_to_rgba};
 
     #[test]
@@ -720,6 +732,12 @@ mod tests {
         )
         .validate(&module)
         .expect("shader validates");
+    }
+
+    #[test]
+    fn mvs_dispatch_spreads_large_frames_across_two_dimensions() {
+        assert_eq!(mvs_dispatch_size(65_535), (65_535, 1));
+        assert_eq!(mvs_dispatch_size(118_984), (59_492, 2));
     }
 
     #[test]

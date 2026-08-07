@@ -74,9 +74,14 @@ fn ycbcr_to_rgb(sample: vec3<f32>) -> vec4<f32> {
 @compute @workgroup_size(8, 8, 1)
 fn decode_tiles(
     @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(num_workgroups) workgroups: vec3<u32>,
     @builtin(local_invocation_id) local: vec3<u32>,
 ) {
-    let record = group.x * 8u;
+    let tile = group.y * workgroups.x + group.x;
+    if (tile >= records[0]) {
+        return;
+    }
+    let record = 1u + tile * 8u;
     let width = records[record + 2u];
     let height = records[record + 3u];
     let invocation_is_active = local.x < width && local.y < height;
