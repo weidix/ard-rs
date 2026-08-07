@@ -1006,6 +1006,15 @@ pub enum InputEvent {
         modifiers: Modifiers,
     },
     ModifiersChanged(Modifiers),
+    /// A key event captured by the platform keyboard hook.  `keysym` is the
+    /// neutral X11/RFB keysym resolved by the hook; `raw` preserves the
+    /// platform key code, scan code, flags and native information for the
+    /// remote input layer.
+    RawKey {
+        pressed: bool,
+        keysym: Option<u32>,
+        raw: ard_input_hook::RawKeyEvent,
+    },
     ImeOpened,
     ImePreedit(String),
     ImeCommit(String),
@@ -1023,6 +1032,8 @@ pub struct InputState {
     scroll: ScrollAccumulator,
     modifiers: Modifiers,
     pressed_keys: HashMap<Physical, u32>,
+    /// Raw key code -> keysym for keys delivered by the platform hook.
+    pressed_raw: HashMap<u32, u32>,
     ime_suppressed: HashSet<Physical>,
     shortcut_suppressed: HashSet<Physical>,
     paste_suppressed: HashSet<Physical>,
@@ -1040,6 +1051,7 @@ impl Default for InputState {
             scroll: ScrollAccumulator::default(),
             modifiers: Modifiers::default(),
             pressed_keys: HashMap::new(),
+            pressed_raw: HashMap::new(),
             ime_suppressed: HashSet::new(),
             shortcut_suppressed: HashSet::new(),
             paste_suppressed: HashSet::new(),
@@ -1185,6 +1197,23 @@ impl InputState {
             InputEvent::ButtonReleased(button) => self.handle_button(button, false)?,
             InputEvent::Wheel(delta) => self.handle_wheel(delta)?,
             InputEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
+            InputEvent::RawKey {
+                pressed,
+                keysym,
+                raw,
+            } => {
+                self.modifiers = hook_modifiers_to_iced(&raw.modifiers);
+                if pressed {
+                    if let Some(keysym) = keysym {
+                        self.pressed_raw.insert(raw.key_code, keysym);
+                        self.send_key(true, keysym)?;
+                    }
+                } else if let Some(previous) = self.pressed_raw.remove(&raw.key_code) {
+                    self.send_key(false, previous)?;
+                } else if let Some(keysym) = keysym {
+                    self.send_key(false, keysym)?;
+                }
+            }
             InputEvent::KeyPressed {
                 key,
                 physical,
@@ -1332,8 +1361,15 @@ impl InputState {
 
     pub fn release_all(&mut self) {
         let keys = std::mem::take(&mut self.pressed_keys);
+        let raw_keys = std::mem::take(&mut self.pressed_raw);
         if self.input.is_some() {
             for keysym in keys.values().copied() {
+                let _ = self.dispatcher.submit(InputCommand::Key {
+                    pressed: false,
+                    keysym,
+                });
+            }
+            for keysym in raw_keys.into_values() {
                 let _ = self.dispatcher.submit(InputCommand::Key {
                     pressed: false,
                     keysym,
@@ -1506,6 +1542,25 @@ fn is_modifier_key(key: Physical) -> bool {
 }
 fn is_textual_key(key: &Key) -> bool {
     matches!(key, Key::Character(_))
+}
+
+/// Converts the platform hook's normalized modifier state into the iced
+/// modifier set used by the remote input layer.
+fn hook_modifiers_to_iced(modifiers: &ard_input_hook::Modifiers) -> Modifiers {
+    let mut result = Modifiers::NONE;
+    if modifiers.ctrl {
+        result |= Modifiers::CTRL;
+    }
+    if modifiers.alt {
+        result |= Modifiers::ALT;
+    }
+    if modifiers.shift {
+        result |= Modifiers::SHIFT;
+    }
+    if modifiers.meta {
+        result |= Modifiers::COMMAND;
+    }
+    result
 }
 
 fn key_event_keysym(key: &Key, physical: Physical, location: Location) -> Option<u32> {

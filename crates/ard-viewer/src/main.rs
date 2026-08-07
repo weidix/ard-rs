@@ -15,6 +15,7 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use ard_rs::ArdVideoQuality;
+use ard_input_hook::{HookConfig, HookEvent};
 use iced::widget::{column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, Subscription, Task, Theme, window};
 
@@ -66,6 +67,8 @@ struct ArdViewer {
     theme_preference: ThemePreference,
     language: Language,
     system_dark: bool,
+    session_window_focused: bool,
+    keyboard_hook: Option<ard_input_hook::KeyboardHook>,
     mappings: Vec<KeyMapping>,
     session_zoom: f32,
     session_runtime: Option<SessionRuntime>,
@@ -168,6 +171,7 @@ enum Message {
     SessionToolbarDragStarted,
     SessionToolbarDragEnded,
     ToggleSessionToolbarPin,
+    KeyboardHookPoll,
     SessionPoll,
     SessionClipboardPoll,
     SessionRawEvent(window::Id, iced::Event, iced::event::Status),
@@ -234,6 +238,8 @@ impl ArdViewer {
             theme_preference: config::theme_from_cache(&cached.theme),
             language: config::language_from_cache(&cached.language),
             system_dark: false,
+            session_window_focused: false,
+            keyboard_hook: None,
             mappings,
             session_zoom: 1.0,
             session_runtime: None,
@@ -313,7 +319,18 @@ impl ArdViewer {
                 return window::is_maximized(id)
                     .map(move |maximized| Message::WindowMaximizedChanged(id, maximized));
             }
-            Message::WindowEvent(_, window::Event::Unfocused) => {}
+            Message::WindowEvent(id, window::Event::Focused) => {
+                if self.windows.get(&id) == Some(&WindowKind::Session) {
+                    self.session_window_focused = true;
+                    self.sync_keyboard_hook();
+                }
+            }
+            Message::WindowEvent(id, window::Event::Unfocused) => {
+                if self.windows.get(&id) == Some(&WindowKind::Session) {
+                    self.session_window_focused = false;
+                    self.sync_keyboard_hook();
+                }
+            }
             Message::WindowEvent(_, _) => {}
             Message::WindowMaximizedChanged(id, maximized) => {
                 if maximized {
@@ -546,6 +563,7 @@ impl ArdViewer {
             Message::CaptureShortcutsChanged(value) => {
                 self.capture_system_shortcuts = value;
                 self.persist_config();
+                self.sync_keyboard_hook();
             }
             Message::ReverseScrollChanged(value) => {
                 self.reverse_scroll = value;
@@ -680,6 +698,7 @@ impl ArdViewer {
                 self.touch_session_toolbar();
                 self.capture_system_shortcuts = !self.capture_system_shortcuts;
                 self.persist_config();
+                self.sync_keyboard_hook();
                 self.status = if self.capture_system_shortcuts {
                     self.language.tr("系统快捷键将发送到远端").into()
                 } else {
@@ -786,6 +805,16 @@ impl ArdViewer {
                 }
                 return self.handle_session_raw_event(id, event, event_status);
             }
+            Message::KeyboardHookPoll => {
+                let events: Vec<_> = self
+                    .keyboard_hook
+                    .as_ref()
+                    .map(|hook| std::iter::from_fn(|| hook.try_recv()).collect())
+                    .unwrap_or_default();
+                for event in events {
+                    self.handle_hook_event(event);
+                }
+            }
             Message::ClipboardRead(contents) => {
                 if let Some(text) = self.session_clipboard.observe_local(contents)
                     && self.session_input.is_ready()
@@ -848,6 +877,12 @@ impl ArdViewer {
             subscriptions.push(
                 iced::time::every(Duration::from_millis(250)).map(Message::SessionToolbarTick),
             );
+            if self.keyboard_hook.is_some() {
+                subscriptions.push(
+                    iced::time::every(Duration::from_millis(2))
+                        .map(|_| Message::KeyboardHookPoll),
+                );
+            }
             subscriptions.push(
                 iced::time::every(Duration::from_millis(250))
                     .map(|_| Message::SessionClipboardPoll),
@@ -1108,6 +1143,8 @@ impl ArdViewer {
         if let Some(mut runtime) = self.session_runtime.take() {
             runtime.disconnect();
         }
+        self.keyboard_hook = None;
+        self.session_window_focused = false;
         self.session_input.clear_input();
         self.session_pointer_remote = None;
         self.session_connection = ConnectionState::Idle;
@@ -1253,6 +1290,74 @@ impl ArdViewer {
             });
         }
         Task::none()
+    }
+
+    /// Starts, stops, or re-arms the platform keyboard hook based on whether
+    /// shortcut capture is enabled and the session window holds focus.
+    fn sync_keyboard_hook(&mut self) {
+        let session_open = self.window_id(WindowKind::Session).is_some();
+        let should_hold = self.capture_system_shortcuts && session_open;
+        if should_hold && self.keyboard_hook.is_none() {
+            let config = HookConfig {
+                capture_enabled: self.session_window_focused,
+            };
+            match ard_input_hook::KeyboardHook::start(config) {
+                Ok(hook) => self.keyboard_hook = Some(hook),
+                Err(error) => {
+                    self.status = if self.language == Language::English {
+                        format!("System shortcut capture failed: {error}")
+                    } else {
+                        format!("系统快捷键捕获失败：{error}")
+                    };
+                }
+            }
+        } else if !should_hold {
+            // Dropping the handle stops the hook thread and releases the
+            // native hook, event tap, X11 grab or Wayland inhibitor.
+            self.keyboard_hook = None;
+        }
+        if let Some(hook) = &self.keyboard_hook
+            && let Err(error) = hook.set_enabled(self.session_window_focused)
+        {
+            self.status = if self.language == Language::English {
+                format!("System shortcut capture failed: {error}")
+            } else {
+                format!("系统快捷键捕获失败：{error}")
+            };
+        }
+    }
+
+    fn handle_hook_event(&mut self, event: HookEvent) {
+        match event {
+            HookEvent::Key(raw) => {
+                let input_event = InputEvent::RawKey {
+                    pressed: raw.pressed,
+                    keysym: raw.keysym,
+                    raw,
+                };
+                if let Err(error) = self.session_input.handle(input_event, true) {
+                    self.session_error = Some(if self.language == Language::English {
+                        format!("Remote input failed: {}", self.language.tr(&error))
+                    } else {
+                        format!("远程输入失败：{error}")
+                    });
+                }
+            }
+            HookEvent::Error(error) => {
+                self.status = if self.language == Language::English {
+                    format!("System shortcut capture stopped: {error}")
+                } else {
+                    format!("系统快捷键捕获已停止：{error}")
+                };
+                self.keyboard_hook = None;
+            }
+            HookEvent::InhibitActive => {
+                self.status = self.language.tr("系统快捷键抑制已生效").into();
+            }
+            HookEvent::InhibitInactive => {
+                self.status = self.language.tr("系统快捷键抑制已失效").into();
+            }
+        }
     }
 
     fn session_canvas_bounds(&self) -> iced::Rectangle {
