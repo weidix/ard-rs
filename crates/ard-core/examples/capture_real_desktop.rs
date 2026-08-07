@@ -379,8 +379,12 @@ fn rectangle_payload_len(encoding: i32, width: u16, height: u16, tail: &[u8]) ->
 }
 
 fn read_password_from_stdin() -> io::Result<Vec<u8>> {
+    // Ask on the terminal so an interactive run does not silently block;
+    // piped input still works because a single line is consumed either way.
+    eprint!("Password: ");
+    io::stderr().flush()?;
     let mut password = Vec::new();
-    io::stdin().read_to_end(&mut password)?;
+    io::stdin().read_until(b'\n', &mut password)?;
     while password
         .last()
         .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
