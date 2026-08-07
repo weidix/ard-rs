@@ -12,7 +12,7 @@
 use std::env;
 use std::error::Error as StdError;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -384,7 +384,7 @@ fn read_password_from_stdin() -> io::Result<Vec<u8>> {
     eprint!("Password: ");
     io::stderr().flush()?;
     let mut password = Vec::new();
-    io::stdin().read_until(b'\n', &mut password)?;
+    io::stdin().lock().read_until(b'\n', &mut password)?;
     while password
         .last()
         .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
