@@ -9,6 +9,8 @@ mod state;
 mod theme;
 mod views;
 mod widgets;
+#[cfg(target_os = "windows")]
+mod windows_input;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -77,6 +79,7 @@ struct ArdViewer {
     session_clipboard: ClipboardSync,
     session_window_size: iced::Size,
     session_pointer_remote: Option<(u16, u16)>,
+    session_window_focused: bool,
     ime_sink: String,
     session_fullscreen: bool,
     session_toolbar_visible: bool,
@@ -245,6 +248,7 @@ impl ArdViewer {
             session_clipboard: ClipboardSync::default(),
             session_window_size: WindowKind::Session.size(),
             session_pointer_remote: None,
+            session_window_focused: false,
             ime_sink: String::new(),
             session_fullscreen: false,
             session_toolbar_visible: true,
@@ -295,6 +299,7 @@ impl ArdViewer {
                 }
                 let closed = self.windows.remove(&id);
                 if closed == Some(WindowKind::Session) {
+                    self.session_window_focused = false;
                     self.disconnect_session();
                 }
                 if closed == Some(WindowKind::Connection) || self.windows.is_empty() {
@@ -312,6 +317,20 @@ impl ArdViewer {
                 }
                 return window::is_maximized(id)
                     .map(move |maximized| Message::WindowMaximizedChanged(id, maximized));
+            }
+            Message::WindowEvent(id, window::Event::Focused) => {
+                self.session_window_focused = self.windows.get(&id) == Some(&WindowKind::Session);
+                #[cfg(target_os = "windows")]
+                windows_input::set_session_focused(
+                    self.session_window_focused && self.session_input.is_ready(),
+                );
+            }
+            Message::WindowEvent(id, window::Event::Unfocused) => {
+                if self.windows.get(&id) == Some(&WindowKind::Session) {
+                    self.session_window_focused = false;
+                    #[cfg(target_os = "windows")]
+                    windows_input::set_session_focused(false);
+                }
             }
             Message::WindowEvent(_, _) => {}
             Message::WindowMaximizedChanged(id, maximized) => {
@@ -1129,6 +1148,8 @@ impl ArdViewer {
             SessionEvent::Connected { server_name, input } => {
                 self.session_server_name = server_name;
                 self.session_input.set_input(input);
+                #[cfg(target_os = "windows")]
+                windows_input::set_session_focused(self.session_window_focused);
                 self.session_error = None;
             }
             SessionEvent::Clipboard(text) => {
@@ -1173,12 +1194,12 @@ impl ArdViewer {
                 Some(InputEvent::CursorMoved(None))
             }
             iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button))
-                if event_status == iced::event::Status::Ignored =>
+                if should_forward_mouse_button(button, event_status) =>
             {
                 Some(InputEvent::ButtonPressed(button))
             }
             iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button))
-                if event_status == iced::event::Status::Ignored =>
+                if should_forward_mouse_button(button, event_status) =>
             {
                 Some(InputEvent::ButtonReleased(button))
             }
@@ -1386,6 +1407,10 @@ fn session_event_subscription(
             | iced::Event::Window(window::Event::Unfocused)
     )
     .then_some(Message::SessionRawEvent(id, event, status))
+}
+
+fn should_forward_mouse_button(button: iced::mouse::Button, status: iced::event::Status) -> bool {
+    status == iced::event::Status::Ignored || button == iced::mouse::Button::Right
 }
 
 fn close_confirmation<'a>(
@@ -1611,6 +1636,17 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_right_click_is_still_forwarded_to_the_remote_session() {
+        use iced::event::Status;
+        use iced::mouse::Button;
+
+        assert!(should_forward_mouse_button(Button::Right, Status::Captured));
+        assert!(should_forward_mouse_button(Button::Right, Status::Ignored));
+        assert!(!should_forward_mouse_button(Button::Left, Status::Captured));
+    }
+
     #[test]
     fn app_starts_in_connection_window_state() {
         let (app, _task) = ArdViewer::new();

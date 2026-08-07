@@ -1152,8 +1152,15 @@ impl InputState {
     pub fn set_input(&mut self, input: ArdClientInput) {
         self.input = Some(input.clone());
         self.dispatcher.set_input(Some(input));
+        #[cfg(target_os = "windows")]
+        crate::windows_input::set_input(self.input.clone());
     }
     pub fn clear_input(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            crate::windows_input::set_session_focused(false);
+            crate::windows_input::set_input(None);
+        }
         self.release_all();
         self.input = None;
         self.dispatcher.set_input(None);
@@ -1194,7 +1201,7 @@ impl InputState {
                 if !capture_shortcuts && is_paste_shortcut(&key, modifiers) {
                     return Ok(());
                 }
-                if !capture_shortcuts && is_system_shortcut(physical, &key, modifiers) {
+                if !capture_shortcuts && is_system_shortcut(&key, modifiers) {
                     self.suppress_shortcut(physical)?;
                     return Ok(());
                 }
@@ -1477,12 +1484,7 @@ pub fn is_paste_shortcut(key: &Key, modifiers: Modifiers) -> bool {
     matches!(key.as_ref(), Key::Character(text) if text.chars().next().is_some_and(|c| c.eq_ignore_ascii_case(&'v')))
 }
 
-pub fn is_system_shortcut(physical: Physical, key: &Key, modifiers: Modifiers) -> bool {
-    let super_key = matches!(physical, Physical::Code(Code::SuperLeft | Code::SuperRight))
-        || matches!(key, Key::Named(Named::Super));
-    if super_key || modifiers.logo() {
-        return true;
-    }
+pub fn is_system_shortcut(key: &Key, modifiers: Modifiers) -> bool {
     let named = |expected| matches!(key, Key::Named(actual) if *actual == expected);
     (modifiers.alt() && (named(Named::Tab) || named(Named::F4) || named(Named::Space)))
         || (modifiers.control()
@@ -1933,8 +1935,7 @@ mod tests {
             Some(0x01)
         };
         assert_eq!(mouse_button_bit(Button::Left, Modifiers::CTRL), expected);
-        assert!(is_system_shortcut(
-            Physical::Code(Code::SuperLeft),
+        assert!(!is_system_shortcut(
             &Key::Named(Named::Super),
             Modifiers::NONE
         ));
