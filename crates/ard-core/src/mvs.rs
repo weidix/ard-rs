@@ -26,17 +26,6 @@ const ZIGZAG: [usize; 64] = [
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-const IDCT_BASIS: [[i32; 8]; 8] = [
-    [11585, 11585, 11585, 11585, 11585, 11585, 11585, 11585],
-    [16069, 13623, 9102, 3196, -3196, -9102, -13623, -16069],
-    [15137, 6270, -6270, -15137, -15137, -6270, 6270, 15137],
-    [13623, -3196, -16069, -9102, 9102, 16069, 3196, -13623],
-    [11585, -11585, -11585, 11585, 11585, -11585, -11585, 11585],
-    [9102, -16069, 3196, 13623, -13623, -3196, 16069, -9102],
-    [6270, -15137, 15137, -6270, -6270, 15137, -15137, 6270],
-    [3196, -9102, 13623, -16069, 16069, -13623, 9102, -3196],
-];
-
 // The native full-update decoder initializes one derived AC table from
 // std_huff_tables.bits_ac_luminance/val_ac_luminance and uses it for both
 // chroma components. It does not select the JPEG chrominance AC table here.
@@ -538,8 +527,27 @@ impl MvsState {
                         );
                     }
                     let coefficients = Arc::new(coefficients);
+                    // Screen Sharing stores the refined tile in the DCT cache
+                    // as signed bytes: all 64 luminance coefficients, only the
+                    // first 15 Cr and first 20 Cb zigzag coefficients, and
+                    // zeroes beyond that. Recalls therefore render smoother
+                    // chroma than the freshly rendered tile. Mirroring the
+                    // truncation keeps later cache recalls pixel-identical to
+                    // the native decoder.
+                    let mut cached_coefficients = *coefficients.as_ref();
+                    for scan in 15..64 {
+                        cached_coefficients[2][ZIGZAG[scan]] = 0;
+                    }
+                    for scan in 20..64 {
+                        cached_coefficients[1][ZIGZAG[scan]] = 0;
+                    }
+                    for component in &mut cached_coefficients {
+                        for value in component {
+                            *value = i16::from(*value as i8);
+                        }
+                    }
                     self.insert_cache_tile(DctTile {
-                        coefficients: Arc::clone(&coefficients),
+                        coefficients: Arc::new(cached_coefficients),
                     });
                     let state = &mut self.tiles[global_tile];
                     // A full update is a refinement of the most recent
@@ -682,16 +690,24 @@ fn decode_full_differential_tile(
                 signed_delta(old, bits.read(3)? as u8)
             };
         }
-        // Scan 0 is the luma DC value copied above. The native decoder's
-        // coefficient expansion starts its differential AC loop at scan 1,
-        // even when the previous luma block has zero active coefficients.
-        for scan in old_count.max(1)..new_count {
-            let old = old_scan_values[scan.max(1)];
-            scan_values[scan] = if old == 0 {
+        // Scan 0 is the luma DC value copied above. The native coefficient
+        // expansion continues from the shared range (position 1 when the
+        // previous block is empty), so its loop covers new_count - old_count
+        // records. When the previous block has zero active coefficients this
+        // extends one position past new_count; that extra record is still
+        // consumed from the stream even though it falls outside the block.
+        let start = old_count.max(1);
+        let end = start + new_count - old_count;
+        for scan in start..end {
+            let old = old_scan_values[scan.min(63)];
+            let value = if old == 0 {
                 decode_dc_rice(bits)? as i8
             } else {
                 signed_delta(old, bits.read(4)? as u8)
             };
+            if scan < 64 {
+                scan_values[scan] = value;
+            }
         }
     } else {
         for scan in 1..shared_end {
@@ -1167,33 +1183,136 @@ fn coefficient_shift(scan: usize, limit: u8) -> u32 {
     }
 }
 
+// The inverse DCT reproduces Screen Sharing's `jpeg_idct_islow` exactly:
+// a two-pass transform whose column pass rounds through `(x + 1024) >> 11`
+// and whose row pass rounds through `(x + 131072) >> 18`, with all integer
+// arithmetic wrapping at 32 bits the way the ARM64 `mul`/`add` instructions
+// do. A single-pass exact sum rounds at a different precision and differs by
+// one level on a small fraction of AC-rich samples, which shows up as faint
+// speckle at font edges and in gradients.
+const FIX_0_298631336: i32 = 2446;
+const FIX_0_390180644: i32 = 3196;
+const FIX_0_541196100: i32 = 4433;
+const FIX_0_765366865: i32 = 6270;
+const FIX_0_899976223: i32 = 7373;
+const FIX_1_175875602: i32 = 9633;
+const FIX_1_501321110: i32 = 12_299;
+const FIX_1_847759065: i32 = 15_137;
+const FIX_1_961570560: i32 = 16_069;
+const FIX_2_053119869: i32 = 16_819;
+const FIX_2_562915447: i32 = 20_995;
+const FIX_3_072711026: i32 = 25_172;
+
+#[inline]
+fn descale(value: i32, bits: u32) -> i32 {
+    // DESCALE(x, n) in libjpeg: (x + (1 << (n - 1))) >> n. The add wraps at
+    // 32 bits exactly as it does on ARM64.
+    value.wrapping_add(1_i32 << (bits - 1)) >> bits
+}
+
+fn idct_pass(input: [i32; 8]) -> [i32; 8] {
+    // One 1-D stage of jpeg_idct_islow (jidctint.c). All additions and
+    // multiplications wrap at 32 bits to match the native decoder.
+    let mut z2 = input[2];
+    let mut z3 = input[6];
+    let z1 = z2.wrapping_add(z3).wrapping_mul(FIX_0_541196100);
+    let tmp2 = z1.wrapping_add(z3.wrapping_mul(-FIX_1_847759065));
+    let tmp3 = z1.wrapping_add(z2.wrapping_mul(FIX_0_765366865));
+
+    z2 = input[0];
+    z3 = input[4];
+    let tmp0 = z2.wrapping_add(z3).wrapping_shl(13);
+    let tmp1 = z2.wrapping_sub(z3).wrapping_shl(13);
+    let tmp10 = tmp0.wrapping_add(tmp3);
+    let tmp13 = tmp0.wrapping_sub(tmp3);
+    let tmp11 = tmp1.wrapping_add(tmp2);
+    let tmp12 = tmp1.wrapping_sub(tmp2);
+
+    let mut odd0 = input[7];
+    let mut odd1 = input[5];
+    let mut odd2 = input[3];
+    let mut odd3 = input[1];
+    let mut z1 = odd0.wrapping_add(odd3);
+    let mut z2 = odd1.wrapping_add(odd2);
+    let mut z3 = odd0.wrapping_add(odd2);
+    let z4 = odd1.wrapping_add(odd3);
+    let z5 = z3.wrapping_add(z4).wrapping_mul(FIX_1_175875602);
+    odd0 = odd0.wrapping_mul(FIX_0_298631336);
+    odd1 = odd1.wrapping_mul(FIX_2_053119869);
+    odd2 = odd2.wrapping_mul(FIX_3_072711026);
+    odd3 = odd3.wrapping_mul(FIX_1_501321110);
+    z1 = z1.wrapping_mul(-FIX_0_899976223);
+    z2 = z2.wrapping_mul(-FIX_2_562915447);
+    z3 = z3.wrapping_mul(-FIX_1_961570560);
+    let z4 = z4.wrapping_mul(-FIX_0_390180644);
+    z3 = z3.wrapping_add(z5);
+    let z4 = z4.wrapping_add(z5);
+    odd0 = odd0.wrapping_add(z1).wrapping_add(z3);
+    odd1 = odd1.wrapping_add(z2).wrapping_add(z4);
+    odd2 = odd2.wrapping_add(z2).wrapping_add(z3);
+    odd3 = odd3.wrapping_add(z1).wrapping_add(z4);
+
+    [
+        tmp10.wrapping_add(odd3),
+        tmp11.wrapping_add(odd2),
+        tmp12.wrapping_add(odd1),
+        tmp13.wrapping_add(odd0),
+        tmp13.wrapping_sub(odd0),
+        tmp12.wrapping_sub(odd1),
+        tmp11.wrapping_sub(odd2),
+        tmp10.wrapping_sub(odd3),
+    ]
+}
+
 fn inverse_dct(coefficients: &[i16; 64], quantization: &[u16; 64]) -> [i32; 64] {
-    // The transform is separable. Keeping the intermediate values in the
-    // same exact integer domain as the original two-dimensional sum reduces
-    // the arithmetic from 64 products per output sample to 16, without
-    // changing the final rounding or clamping.
-    let mut horizontal = [0_i64; 64];
-    for v in 0..8 {
-        for x in 0..8 {
-            let mut sum = 0_i64;
-            for (u, basis_row) in IDCT_BASIS.iter().enumerate() {
-                let index = v * 8 + u;
-                sum += i64::from(coefficients[index])
-                    * i64::from(quantization[index])
-                    * i64::from(basis_row[x]);
+    // Pass 1: process columns, storing the dequantized column transform in a
+    // workspace. Columns whose AC terms are all zero use the DC shortcut and
+    // store `dc << 2` exactly, mirroring the native zero-column branch.
+    let mut workspace = [0_i32; 64];
+    for x in 0..8 {
+        let mut column = [0_i32; 8];
+        for (u, slot) in column.iter_mut().enumerate() {
+            let index = u * 8 + x;
+            *slot = i32::from(coefficients[index]) * i32::from(quantization[index]);
+        }
+        if column[1..].iter().all(|&value| value == 0) {
+            let dc = column[0].wrapping_shl(2);
+            for v in 0..8 {
+                workspace[v * 8 + x] = dc;
             }
-            horizontal[v * 8 + x] = sum;
+            continue;
+        }
+        let output = idct_pass(column);
+        for v in 0..8 {
+            workspace[v * 8 + x] = descale(output[v], 11);
         }
     }
 
+    // Pass 2: process rows. The final descale has the same constant domain as
+    // the native `DESCALE(..., CONST_BITS + PASS1_BITS + 3)`.
     let mut output = [0_i32; 64];
     for y in 0..8 {
-        for x in 0..8 {
-            let mut sum = 0_i64;
-            for v in 0..8 {
-                sum += horizontal[v * 8 + x] * i64::from(IDCT_BASIS[v][y]);
+        let row = [
+            workspace[y * 8],
+            workspace[y * 8 + 1],
+            workspace[y * 8 + 2],
+            workspace[y * 8 + 3],
+            workspace[y * 8 + 4],
+            workspace[y * 8 + 5],
+            workspace[y * 8 + 6],
+            workspace[y * 8 + 7],
+        ];
+        if row[1..].iter().all(|&value| value == 0) {
+            let sample = descale(row[0], 5) + 128;
+            for x in 0..8 {
+                output[y * 8 + x] = sample.clamp(0, 255);
             }
-            output[y * 8 + x] = (((sum + (1_i64 << 29)) >> 30) as i32 + 128).clamp(0, 255);
+            continue;
+        }
+        let transformed = idct_pass(row);
+        for x in 0..8 {
+            let sample = descale(transformed[x], 18) + 128;
+            output[y * 8 + x] = sample.clamp(0, 255);
         }
     }
     output
@@ -1350,7 +1469,7 @@ impl<'a> BitReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitReader, IDCT_BASIS, MvsState, dc_sample, inverse_dct, predict_chroma_dc};
+    use super::{BitReader, MvsState, dc_sample, inverse_dct, predict_chroma_dc};
     use crate::Error;
 
     fn bits(bit_string: &str) -> Vec<u8> {
@@ -1442,26 +1561,86 @@ mod tests {
     }
 
     #[test]
-    fn separable_inverse_dct_matches_direct_integer_reference() {
-        let coefficients = core::array::from_fn(|index| ((index * 37 % 65) as i16) - 32);
-        let quantization = core::array::from_fn(|index| (index * 19 % 99 + 1) as u16);
-        let mut expected = [0_i32; 64];
-        for y in 0..8 {
-            for x in 0..8 {
-                let mut sum = 0_i64;
-                for (v, vertical_basis) in IDCT_BASIS.iter().enumerate() {
-                    for (u, horizontal_basis) in IDCT_BASIS.iter().enumerate() {
-                        let index = v * 8 + u;
-                        sum += i64::from(coefficients[index])
-                            * i64::from(quantization[index])
-                            * i64::from(horizontal_basis[x])
-                            * i64::from(vertical_basis[y]);
+    fn inverse_dct_matches_native_jpeg_idct_islow() {
+        // The native-oracle vector: coefficient 16 at zigzag position 1 with
+        // the default luminance quantization produces the row
+        // 159, 154, 145, 134, 122, 111, 102, 97 in Screen Sharing 6.1. The
+        // block is the same row repeated eight times because the column pass
+        // only receives the DC column.
+        let quantization = super::DEFAULT_LUMINANCE_QUANTIZATION;
+        let mut coefficients = [0; 64];
+        coefficients[1] = 16;
+        let output = inverse_dct(&coefficients, &quantization);
+        for row in 0..8 {
+            assert_eq!(
+                &output[row * 8..row * 8 + 8],
+                &[159, 154, 145, 134, 122, 111, 102, 97]
+            );
+        }
+    }
+
+    #[test]
+    fn inverse_dct_differs_from_direct_sum_by_at_most_one_level() {
+        // The native two-pass transform rounds the column and row passes
+        // separately, so it can differ from an exact single-pass sum by one
+        // level. A structural error (transposed basis, wrong descale, or a
+        // dropped DC shortcut) would produce much larger differences.
+        const BASIS: [[i64; 8]; 8] = [
+            [11585, 11585, 11585, 11585, 11585, 11585, 11585, 11585],
+            [16069, 13623, 9102, 3196, -3196, -9102, -13623, -16069],
+            [15137, 6270, -6270, -15137, -15137, -6270, 6270, 15137],
+            [13623, -3196, -16069, -9102, 9102, 16069, 3196, -13623],
+            [11585, -11585, -11585, 11585, 11585, -11585, -11585, 11585],
+            [9102, -16069, 3196, 13623, -13623, -3196, 16069, -9102],
+            [6270, -15137, 15137, -6270, -6270, 15137, -15137, 6270],
+            [3196, -9102, 13623, -16069, 16069, -13623, 9102, -3196],
+        ];
+        fn direct_sum(coefficients: &[i16; 64], quantization: &[u16; 64]) -> [i32; 64] {
+            let mut output = [0_i32; 64];
+            for y in 0..8 {
+                for x in 0..8 {
+                    let mut sum = 0_i64;
+                    for (v, vertical_basis) in BASIS.iter().enumerate() {
+                        for (u, horizontal_basis) in BASIS.iter().enumerate() {
+                            let index = v * 8 + u;
+                            sum += i64::from(coefficients[index])
+                                * i64::from(quantization[index])
+                                * horizontal_basis[x]
+                                * vertical_basis[y];
+                        }
                     }
+                    output[y * 8 + x] = (((sum + (1_i64 << 29)) >> 30) as i32 + 128).clamp(0, 255);
                 }
-                expected[y * 8 + x] = (((sum + (1_i64 << 29)) >> 30) as i32 + 128).clamp(0, 255);
+            }
+            output
+        }
+
+        let mut differing = 0_u32;
+        for seed in 0..24_u32 {
+            let coefficients = core::array::from_fn(|index| {
+                let value = ((index as i64 + i64::from(seed)) * 37 % 65) as i16 - 32;
+                if index % 7 == 0 { 0 } else { value }
+            });
+            let quantization = core::array::from_fn(|index| (index * 19 % 99 + 1) as u16);
+            let actual = inverse_dct(&coefficients, &quantization);
+            let expected = direct_sum(&coefficients, &quantization);
+            for index in 0..64 {
+                let difference = (actual[index] - expected[index]).abs();
+                assert!(
+                    difference <= 1,
+                    "index {index}: two-pass {} vs direct sum {}",
+                    actual[index],
+                    expected[index]
+                );
+                if difference != 0 {
+                    differing += 1;
+                }
             }
         }
-        assert_eq!(inverse_dct(&coefficients, &quantization), expected);
+        assert!(
+            differing < 200,
+            "single-pass rounding must only affect a small sample fraction, got {differing}"
+        );
     }
 
     #[test]

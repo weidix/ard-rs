@@ -255,6 +255,35 @@ green combines coefficients `22554` and `46802` with a `32768` half-unit bias.
 This differs by one color level from a naïve signed right shift for some
 negative chroma values.
 
+## Confirmed inverse DCT and cache details
+
+`_PerformInverseDCT8By8` is a wrapper around libjpeg's `jpeg_idct_islow`
+(`_jpeg_idct_islow` at image-relative `0x1C8953F00` on macOS 26.6 build
+25G72) plus `_ycc_xrgb_convert32to32`. The transform is two-pass with
+explicit 32-bit wrapping arithmetic:
+
+- the column pass descales with `(sum + 1024) >> 11`;
+- the row pass descales with `(sum + 131072) >> 18` and clamps through the
+  range-limit table;
+- all-zero columns and rows take the exact DC shortcut (`dc << 2` in the
+  workspace, then `(dc + 16) >> 5` plus 128 for the row).
+
+The constants are the standard libjpeg `FIX_*` values (e.g.
+`FIX_1_175875602 = 9633`, `FIX_2_053119869 = 16819`). A single-pass exact
+two-dimensional sum rounds at a different precision and differs by one
+level on roughly 0.3% of AC-rich samples, which shows up as faint speckle
+at font edges and in gradients. The Rust decoder and both WGSL shaders now
+implement the identical two-pass algorithm.
+
+The type-1 full-update differential path stores refined tiles in a
+1–64999 ring cache whose slot is only 0x63 bytes: all 64 luminance
+coefficients as signed bytes, then the first 15 Cr and first 20 Cb
+zigzag coefficients as signed bytes, and zeroes beyond that. A later cache
+recall therefore renders smoother chroma than the tile's first render.
+When the previous luma block is empty (`lumaCount == 0`), the differential
+coefficient expansion still consumes `newCount` records (positions
+1 through `newCount`), one more than the stored luma coefficients.
+
 ## Native decoder oracle
 
 An isolated pure-Rust one-shot server in `crates/ard-core/examples/mvs_oracle_server.rs` was

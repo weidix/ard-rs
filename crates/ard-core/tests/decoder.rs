@@ -94,6 +94,42 @@ fn packed_bits(fields: &[(u32, u8)]) -> Vec<u8> {
     bytes
 }
 
+// Canonical encoder for the native luminance AC table used by full-update
+// chroma records. This lets a test place a coefficient at an arbitrary
+// zigzag position without hand-computing Huffman codes.
+fn huffman_ac_symbol(symbol: u8) -> Vec<(u32, u8)> {
+    const BITS: [u8; 17] = [
+        0x00, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00,
+        0x01, 0x7d,
+    ];
+    const VALUES: [u8; 162] = [
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61,
+        0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52,
+        0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25,
+        0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45,
+        0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64,
+        0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83,
+        0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+        0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+        0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3,
+        0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8,
+        0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+    ];
+    let mut code = 0_u32;
+    let mut value_index = 0_usize;
+    for (length, &count) in BITS.iter().enumerate().skip(1) {
+        let count = usize::from(count);
+        for offset in 0..count {
+            if VALUES[value_index + offset] == symbol {
+                return vec![(code + offset as u32, length as u8)];
+            }
+        }
+        code = (code + count as u32) << 1;
+        value_index += count;
+    }
+    panic!("Huffman symbol {symbol:#x} not found");
+}
+
 fn partial_mvs_packet(primary_fields: &[(u32, u8)]) -> Vec<u8> {
     partial_mvs_packet_with_secondary(primary_fields, &[])
 }
@@ -686,6 +722,102 @@ fn decodes_mvs_full_differential_and_both_cache_selectors() {
 }
 
 #[test]
+fn full_differential_cache_recall_truncates_high_chroma_ac_like_native() {
+    // Screen Sharing's DCT cache stores only the first 15 Cr and first 20 Cb
+    // zigzag coefficients. A freshly rendered differential tile keeps all of
+    // them, but a later cache recall renders the truncated block. The test
+    // places a Cr coefficient at zigzag position 17 and checks that the
+    // recalled tile matches a reference tile whose Cr AC never existed.
+    let baseline = partial_mvs_packet_with_secondary(
+        &[(0, 1), (5, 3), (0, 1), (0x6d, 8)],
+        &[
+            (0, 1), // new coefficient block
+            (3, 2), // retain zero chroma predictors
+            (0, 1),
+            (0, 1), // zero DC
+            (0, 1),
+            (2, 2), // coefficient 16 at scan one under the zero limit
+            (0, 1),
+            (1, 2),
+            (0, 1), // end block
+        ],
+    );
+
+    let mut differential_with_high_cr = vec![
+        (1, 2), // differential DCT selector
+        (1, 6), // two luma coefficients
+        (0, 4), // refine the nonzero baseline AC at scan one
+        (0, 1),
+        (0, 1), // append a zero Rice record at scan two
+        (0, 1), // unchanged Cr DC
+    ];
+    differential_with_high_cr.extend(huffman_ac_symbol(0xf0)); // skip 16 scans
+    differential_with_high_cr.extend(huffman_ac_symbol(0x01)); // +1 at scan 17
+    differential_with_high_cr.push((1, 1)); // positive one-bit magnitude
+    differential_with_high_cr.extend(huffman_ac_symbol(0x00)); // Cr end of block
+    differential_with_high_cr.push((0, 1)); // unchanged Cb DC
+    differential_with_high_cr.extend(huffman_ac_symbol(0x00)); // Cb end of block
+    let differential_with_high_cr = full_mvs_packet([64, 64], &differential_with_high_cr);
+
+    let mut differential_without_cr = vec![
+        (1, 2),
+        (1, 6),
+        (0, 4),
+        (0, 1),
+        (0, 1),
+        (0, 1), // unchanged Cr DC
+    ];
+    differential_without_cr.extend(huffman_ac_symbol(0x00)); // Cr end of block
+    differential_without_cr.push((0, 1)); // unchanged Cb DC
+    differential_without_cr.extend(huffman_ac_symbol(0x00)); // Cb end of block
+    let differential_without_cr = full_mvs_packet([64, 64], &differential_without_cr);
+
+    let recall = partial_mvs_packet_with_secondary(
+        &[(0, 1), (6, 3), (0, 1), (0x6d, 8)],
+        &[(0, 8), (1, 8)], // explicit cache index 1
+    );
+
+    let mut first = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    first
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &baseline, &mut framebuffer)
+        .unwrap();
+    first
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &differential_with_high_cr,
+            &mut framebuffer,
+        )
+        .unwrap();
+    let full_render = framebuffer.rgba();
+    first
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &recall, &mut framebuffer)
+        .unwrap();
+    let truncated_recall = framebuffer.rgba();
+    assert_ne!(
+        full_render, truncated_recall,
+        "high Cr AC must be visible first"
+    );
+
+    let mut second = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut reference = Framebuffer::new(8, 8).unwrap();
+    second
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &baseline, &mut reference)
+        .unwrap();
+    second
+        .decode_rectangle(
+            rect(8, 8, Encoding::ArdMvs),
+            &differential_without_cr,
+            &mut reference,
+        )
+        .unwrap();
+    second
+        .decode_rectangle(rect(8, 8, Encoding::ArdMvs), &recall, &mut reference)
+        .unwrap();
+    assert_eq!(reference.rgba(), truncated_recall);
+}
+
+#[test]
 fn consecutive_full_differentials_keep_the_partial_rice_baseline() {
     let mut baseline = partial_mvs_packet_with_secondary(
         &[(0, 1), (5, 3), (0, 1), (0x6d, 8)],
@@ -922,6 +1054,7 @@ fn decodes_zero_limit_mvs_differential_baseline() {
         &[
             (1, 2),
             (0, 6), // new compact length one
+            (0, 4), // refine the baseline coefficient at scan one (discarded)
             (0, 1), // unchanged Cr DC
             (0, 1), // unchanged Cb DC
         ],
@@ -951,8 +1084,10 @@ fn decodes_mvs_full_ac_at_limit_one() {
     let packet = full_mvs_packet(
         [1, 1],
         &[
-            (1, 2),      // differential DCT selector
-            (0, 6),      // one luma coefficient: the DC value only
+            (1, 2), // differential DCT selector
+            (0, 6), // one luma coefficient: the DC value only
+            (0, 1),
+            (0, 1),      // zero Rice record for the empty baseline at scan one
             (0, 1),      // unchanged Cr DC baseline
             (0b1010, 4), // native luminance AC end-of-block
             (0, 1),      // unchanged Cb DC baseline
@@ -976,6 +1111,8 @@ fn decodes_mvs_differential_from_native_zero_baseline() {
         &[
             (1, 2), // differential DCT selector
             (0, 6), // one luma coefficient
+            (0, 1),
+            (0, 1), // zero Rice record for the empty baseline at scan one
             (0, 1), // unchanged Cr DC
             (0, 1), // unchanged Cb DC
         ],
@@ -1335,8 +1472,10 @@ fn decodes_mvs_full_differential_from_zero_initialized_baseline() {
     let packet = full_mvs_packet(
         [64, 64],
         &[
-            (1, 2),      // differential DCT selector
-            (0, 6),      // one luma coefficient: the DC value only
+            (1, 2), // differential DCT selector
+            (0, 6), // one luma coefficient: the DC value only
+            (0, 1),
+            (0, 1),      // zero Rice record for the empty baseline at scan one
             (0, 1),      // unchanged Cr DC baseline
             (0b1010, 4), // Cr AC end-of-block in the native luminance AC table
             (0, 1),      // unchanged Cb DC baseline
