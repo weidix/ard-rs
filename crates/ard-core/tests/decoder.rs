@@ -591,36 +591,31 @@ fn decodes_mvs_rice_ac_coefficient_and_block_reuse() {
 }
 
 #[test]
-fn non_compact_rice_ac_uses_the_native_phase_shift() {
-    // ExpandBlockRice's compact phase (scans 1-5) descales AC coefficients
-    // by 1 when the limit exceeds 14, but the non-compact phase (scans 6+)
-    // descales by 3 below the limit. The captured real update uses limits
-    // 15/25, so this path decides whether high-frequency detail survives.
-    let mut packet = partial_mvs_packet_with_secondary(
-        &[(0, 1), (5, 3), (0, 1), (0x6d, 8)],
-        &[
-            (0, 1), // new coefficient block
-            (3, 2), // retain both chroma predictors
-            (0, 1),
-            (0, 1), // zero luma DC
-            (0, 1),
-            (0, 2), // skip scan 1
-            (0, 1),
-            (0, 2), // skip scan 2
-            (0, 1),
-            (0, 2), // skip scan 3
-            (0, 1),
-            (0, 2), // skip scan 4
-            (0, 1),
-            (0, 2), // skip scan 5
-            (1, 1), // coefficient present at scan 6
-            (0, 1), // zero prefix
-            (0, 2), // zero suffix -> magnitude 2
-            (0, 1),
-            (1, 2), // end-of-block selector
-            (0, 1), // end block
-        ],
-    );
+fn rice_ac_shift_above_the_limit_uses_the_suffix_width() {
+    // ExpandBlockRice descales AC coefficients by the log2 of the
+    // scan/limit suffix width: with a limit above 14 the widths are 2 below
+    // the limit (shift 1) and 8 at/above it (shift 3). The previous decoder
+    // used shift 4 at/above the limit, doubling coefficients with limits
+    // 15+ and producing DCT noise. Verified pixel-identical against the
+    // native decoder on a real captured session.
+    let mut fields = vec![
+        (0, 1), // new coefficient block
+        (3, 2), // retain both chroma predictors
+        (0, 1),
+        (0, 1), // zero luma DC
+    ];
+    for _ in 1..18 {
+        fields.extend_from_slice(&[(0, 1), (0, 2)]); // skip scans 1..17
+    }
+    fields.extend_from_slice(&[
+        (0, 1), // scan 18: not present
+        (2, 2), // selector 2: positive coefficient
+        (0, 1),
+        (1, 2), // end-of-block selector
+        (0, 1), // end block
+    ]);
+    let mut packet =
+        partial_mvs_packet_with_secondary(&[(0, 1), (5, 3), (0, 1), (0x6d, 8)], &fields);
     packet[5] = 15; // luminance Rice limit
     packet[6] = 15; // chrominance Rice limit
 
@@ -640,9 +635,9 @@ fn non_compact_rice_ac_uses_the_native_phase_shift() {
     let ard_rs::MvsGpuTile::RiceDct(coefficients) = tile else {
         panic!("expected a Rice/DCT tile");
     };
-    // Magnitude 2 shifted by the native non-compact shift 3 -> coefficient 16
-    // at zigzag position 6 (natural index 3).
-    assert_eq!(coefficients[0][3], 16);
+    // Scan 18 is at/above the limit 15, so the suffix width is 8 and the
+    // coefficient is 1 << 3 = 8 (not 1 << 4 = 16) at natural index 26.
+    assert_eq!(coefficients[0][26], 8);
 }
 
 #[test]

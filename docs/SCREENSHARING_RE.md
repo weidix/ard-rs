@@ -286,16 +286,21 @@ coefficient expansion still consumes `newCount` records (positions
 
 ### ExpandBlockRice AC phase shifts
 
-`ExpandBlockRice` descales AC coefficients differently in its two phases.
-The compact phase (zigzag scans 1–5) shifts by 1 when the limit exceeds 14,
-otherwise by 3 below the limit and 4 at/above it (instructions at
-`0x1C8953478`–`0x1C8953488`). The non-compact phase (scans 6+) has no such
-override: it shifts by 4 at/above the limit, by 3 below it when the limit
-exceeds 14, and by 0 otherwise (`0x1C89538C4`–`0x1C89538D8`). A decoder that
-reuses the compact formula for non-compact scans under-shifts mid-frequency
-coefficients by 4x on streams whose limits exceed 14 (for example the
-captured live session with limits 15/25), which destroys high-frequency
-detail in Rice/DCT tiles and shows up as tile-grid artifacts at font edges.
+`ExpandBlockRice` descales AC coefficients by the log2 of a suffix width
+that depends on the scan position and the limit: with a limit above 14 the
+width is 2 below the limit and 8 at/above it (shifts 1 and 3); otherwise the
+width is 8 below the limit and 16 at/above it (shifts 3 and 4). The shift is
+selected at `0x1C89538C4`–`0x1C89538D8` (`csinc w17, w14, wzr, ge`;
+`cinc w1, w14, lt`; `csel w17, w17, w1, hi` with `w14 = 3`), and the suffix
+width itself is derived at `0x1C89535BC`–`0x1C89535CC`. A decoder that
+always shifts by 4 at/above the limit doubles coefficients whenever the
+limit exceeds 14, adding noise to Rice/DCT tiles. Verified pixel-identical
+against the native decoder on a real captured session (limits 15/25).
+
+Note: `dyld_info` misdisassembles `0x1C89538CC` (`0x1A8EB5C1`) as
+`cinc w1, w14, ge`; the instruction is `cinc w1, w14, lt` (verified against
+the assembler encoding). Rely on the empirically confirmed suffix-width
+rule rather than the printed condition.
 
 ### Cursor rectangles inside FramebufferUpdate
 
