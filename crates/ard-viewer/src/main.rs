@@ -700,7 +700,7 @@ impl ArdViewer {
                 self.persist_config();
                 self.sync_keyboard_hook();
                 self.status = if self.capture_system_shortcuts {
-                    self.language.tr("系统快捷键将发送到远端").into()
+                    self.language.tr("窗口聚焦时系统快捷键将发送到远端").into()
                 } else {
                     self.language.tr("系统快捷键保留在本机").into()
                 };

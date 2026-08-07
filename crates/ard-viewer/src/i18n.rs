@@ -114,7 +114,7 @@ impl Language {
             "拖动可调整优先级" => "Drag to change priority",
             "常用选项" => "Common options",
             "自动适配远程键盘布局" => "Adapt to remote keyboard layout",
-            "在全屏模式中捕获系统快捷键" => "Capture system shortcuts in fullscreen",
+            "在窗口获取焦点时屏蔽系统快捷键" => "Block system shortcuts while the window is focused",
             "设置远程画面的质量和性能。" => {
                 "Configure remote display quality and performance."
             }
@@ -170,7 +170,9 @@ impl Language {
             "已添加常用映射" => "Mapping added",
             "已移除按键映射" => "Key mapping removed",
             "远程键鼠输入已启用" => "Remote keyboard and mouse input enabled",
-            "系统快捷键将发送到远端" => "System shortcuts will be sent remotely",
+            "窗口聚焦时系统快捷键将发送到远端" => {
+                "System shortcuts will be sent to the remote while the window is focused"
+            }
             "系统快捷键保留在本机" => "System shortcuts will stay local",
             "已删除历史连接" => "Connection history entry deleted",
             "正在当前 Session 窗口中连接…" => {

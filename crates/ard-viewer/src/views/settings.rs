@@ -399,7 +399,7 @@ fn key_mapping(app: &ArdViewer) -> Element<'_, Message> {
                 .text_size(BODY_SIZE)
                 .style(theme::checkbox),
             checkbox(app.capture_system_shortcuts)
-                .label(app.language.tr("在全屏模式中捕获系统快捷键"))
+                .label(app.language.tr("在窗口获取焦点时屏蔽系统快捷键"))
                 .on_toggle(Message::CaptureShortcutsChanged)
                 .size(16)
                 .text_size(BODY_SIZE)
