@@ -501,9 +501,10 @@ fn main() -> std::io::Result<()> {
             let y = u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
             let width = u16::from_be_bytes([bytes[cursor + 4], bytes[cursor + 5]]);
             let height = u16::from_be_bytes([bytes[cursor + 6], bytes[cursor + 7]]);
-            let length =
-                usize::try_from(u32::from_be_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap()))
-                    .expect("payload length");
+            let length = usize::try_from(u32::from_be_bytes(
+                bytes[cursor + 8..cursor + 12].try_into().unwrap(),
+            ))
+            .expect("payload length");
             let payload = bytes[cursor + 12..cursor + 12 + length].to_vec();
             rectangles.push((x, y, width, height, payload));
             cursor += 12 + length;

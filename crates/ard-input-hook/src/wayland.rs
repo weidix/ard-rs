@@ -22,15 +22,15 @@
 //! the only way Wayland delivers keys.
 
 use std::io::ErrorKind;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use wayland_client::backend::WaylandError;
 use wayland_client::globals::{BindError, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_compositor, wl_registry, wl_seat, wl_surface};
-use wayland_client::backend::WaylandError;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
     zwp_keyboard_shortcuts_inhibit_manager_v1 as manager,
@@ -204,14 +204,14 @@ fn wayland_thread_main(state: Arc<WaylandState>, sender: SyncSender<HookEvent>) 
 
     let compositor: wl_compositor::WlCompositor =
         match globals.bind(&event_queue.handle(), 1..=1, ()) {
-        Ok(compositor) => compositor,
-        Err(error) => {
-            let _ = sender.try_send(HookEvent::Error(HookError::Unsupported(format!(
-                "wl_compositor is not available: {error}"
-            ))));
-            return;
-        }
-    };
+            Ok(compositor) => compositor,
+            Err(error) => {
+                let _ = sender.try_send(HookEvent::Error(HookError::Unsupported(format!(
+                    "wl_compositor is not available: {error}"
+                ))));
+                return;
+            }
+        };
     let seat: wl_seat::WlSeat = match globals.bind(&event_queue.handle(), 1..=1, ()) {
         Ok(seat) => seat,
         Err(error) => {
@@ -223,21 +223,21 @@ fn wayland_thread_main(state: Arc<WaylandState>, sender: SyncSender<HookEvent>) 
     };
     let manager: manager::ZwpKeyboardShortcutsInhibitManagerV1 =
         match globals.bind(&event_queue.handle(), 1..=1, ()) {
-        Ok(manager) => manager,
-        Err(BindError::NotPresent) => {
-            let _ = sender.try_send(HookEvent::Error(HookError::Unsupported(
-                "the compositor does not advertise zwp_keyboard_shortcuts_inhibit_manager_v1"
-                    .into(),
-            )));
-            return;
-        }
-        Err(error) => {
-            let _ = sender.try_send(HookEvent::Error(HookError::Io(format!(
-                "cannot bind zwp_keyboard_shortcuts_inhibit_manager_v1: {error}"
-            ))));
-            return;
-        }
-    };
+            Ok(manager) => manager,
+            Err(BindError::NotPresent) => {
+                let _ = sender.try_send(HookEvent::Error(HookError::Unsupported(
+                    "the compositor does not advertise zwp_keyboard_shortcuts_inhibit_manager_v1"
+                        .into(),
+                )));
+                return;
+            }
+            Err(error) => {
+                let _ = sender.try_send(HookEvent::Error(HookError::Io(format!(
+                    "cannot bind zwp_keyboard_shortcuts_inhibit_manager_v1: {error}"
+                ))));
+                return;
+            }
+        };
 
     let surface = compositor.create_surface(&event_queue.handle(), ());
 

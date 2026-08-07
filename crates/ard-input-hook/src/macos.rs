@@ -137,9 +137,11 @@ fn run_tap_thread(state: Arc<TapState>) {
         return;
     };
 
-    state.tap.store(&*tap as *const CFMachPort as usize, Ordering::SeqCst);
+    state
+        .tap
+        .store(&*tap as *const CFMachPort as usize, Ordering::SeqCst);
 
-        let run_loop = CFRunLoop::current().expect("macOS thread has a CFRunLoop");
+    let run_loop = CFRunLoop::current().expect("macOS thread has a CFRunLoop");
     let source = CFMachPort::new_run_loop_source(None, Some(&tap), 0)
         .expect("CFMachPortCreateRunLoopSource failed");
     // SAFETY: reading the framework's static mode string is safe for the
@@ -286,12 +288,8 @@ fn modifier_is_pressed(keycode: u32, flags: CGEventFlags) -> bool {
             flags.contains(CGEventFlags::MaskCommand)
         }
         keycodes::SHIFT | keycodes::RIGHT_SHIFT => flags.contains(CGEventFlags::MaskShift),
-        keycodes::CONTROL | keycodes::RIGHT_CONTROL => {
-            flags.contains(CGEventFlags::MaskControl)
-        }
-        keycodes::OPTION | keycodes::RIGHT_OPTION => {
-            flags.contains(CGEventFlags::MaskAlternate)
-        }
+        keycodes::CONTROL | keycodes::RIGHT_CONTROL => flags.contains(CGEventFlags::MaskControl),
+        keycodes::OPTION | keycodes::RIGHT_OPTION => flags.contains(CGEventFlags::MaskAlternate),
         _ => false,
     }
 }
@@ -333,7 +331,10 @@ mod tests {
 
     #[test]
     fn classifies_commands_tabs_escapes_and_print_screen() {
-        assert_eq!(classify_keycode(keycodes::COMMAND_LEFT), (KeyKind::WinLeft, true));
+        assert_eq!(
+            classify_keycode(keycodes::COMMAND_LEFT),
+            (KeyKind::WinLeft, true)
+        );
         assert_eq!(
             classify_keycode(keycodes::COMMAND_RIGHT),
             (KeyKind::WinRight, true)
@@ -351,7 +352,10 @@ mod tests {
     fn command_flags_change_tracks_press_and_release() {
         let down = CGEventFlags::MaskCommand | CGEventFlags::MaskShift;
         assert!(modifier_is_pressed(keycodes::COMMAND_LEFT, down));
-        assert!(!modifier_is_pressed(keycodes::COMMAND_RIGHT, CGEventFlags::MaskShift));
+        assert!(!modifier_is_pressed(
+            keycodes::COMMAND_RIGHT,
+            CGEventFlags::MaskShift
+        ));
         assert!(modifier_is_pressed(keycodes::SHIFT, down));
     }
 

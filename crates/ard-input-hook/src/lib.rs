@@ -16,14 +16,14 @@
 
 mod common;
 
-#[cfg(target_os = "windows")]
-mod windows;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(all(target_os = "linux", feature = "x11"))]
-mod x11;
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 mod wayland;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(all(target_os = "linux", feature = "x11"))]
+mod x11;
 
 pub use common::*;
 
@@ -101,7 +101,9 @@ impl KeyboardHook {
             PlatformHook::X11 { hook, .. } => hook.set_enabled(enabled),
             #[cfg(all(target_os = "linux", feature = "wayland"))]
             PlatformHook::Wayland { hook, .. } => hook.set_enabled(enabled),
-            _ => Err(HookError::Unsupported("no keyboard hook backend enabled".into())),
+            _ => Err(HookError::Unsupported(
+                "no keyboard hook backend enabled".into(),
+            )),
         }
     }
 

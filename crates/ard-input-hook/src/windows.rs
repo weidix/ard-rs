@@ -248,7 +248,9 @@ fn hook_thread_main() {
     // SAFETY: native Windows calls; the hook procedure and message pump live
     // entirely inside this thread.
     unsafe {
-        let module = GetModuleHandleW(None).ok().map(|handle| HINSTANCE(handle.0));
+        let module = GetModuleHandleW(None)
+            .ok()
+            .map(|handle| HINSTANCE(handle.0));
         match SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), module, 0) {
             Ok(hook) => {
                 HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
@@ -447,11 +449,17 @@ mod tests {
         let extended = LLKHF_EXTENDED.0;
         assert_eq!(classify_key(VK_LWIN.0 as u32, plain), KeyKind::WinLeft);
         assert_eq!(classify_key(VK_RWIN.0 as u32, plain), KeyKind::WinRight);
-        assert_eq!(classify_key(VK_SNAPSHOT.0 as u32, plain), KeyKind::PrintScreen);
+        assert_eq!(
+            classify_key(VK_SNAPSHOT.0 as u32, plain),
+            KeyKind::PrintScreen
+        );
         assert_eq!(classify_key(VK_TAB.0 as u32, plain), KeyKind::Tab);
         assert_eq!(classify_key(VK_ESCAPE.0 as u32, plain), KeyKind::Escape);
         assert_eq!(classify_key(VK_CONTROL.0 as u32, plain), KeyKind::CtrlLeft);
-        assert_eq!(classify_key(VK_CONTROL.0 as u32, extended), KeyKind::CtrlRight);
+        assert_eq!(
+            classify_key(VK_CONTROL.0 as u32, extended),
+            KeyKind::CtrlRight
+        );
         assert_eq!(classify_key(VK_MENU.0 as u32, plain), KeyKind::AltLeft);
         assert_eq!(classify_key(VK_MENU.0 as u32, extended), KeyKind::AltRight);
     }
@@ -477,7 +485,10 @@ mod tests {
 
     #[test]
     fn intercepted_keys_always_resolve_to_a_keysym() {
-        assert_eq!(keysym_for_kind(KeyKind::WinLeft), Some(keysyms::XK_ALT_LEFT));
+        assert_eq!(
+            keysym_for_kind(KeyKind::WinLeft),
+            Some(keysyms::XK_ALT_LEFT)
+        );
         assert_eq!(
             keysym_for_kind(KeyKind::PrintScreen),
             Some(keysyms::XK_PRINT)

@@ -9,18 +9,18 @@
 //! When disabled the grab is released and the root event mask is cleared, so
 //! the application regains its normal input path.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    ChangeWindowAttributesAux, ConnectionExt, EventMask, GetModifierMappingReply,
-    GetKeyboardMappingReply, GrabMode, GrabStatus, Keycode, Keysym,
-};
 use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{
+    ChangeWindowAttributesAux, ConnectionExt, EventMask, GetKeyboardMappingReply,
+    GetModifierMappingReply, GrabMode, GrabStatus, Keycode, Keysym,
+};
 use x11rb::{CURRENT_TIME, connect};
 
 use crate::common::{
@@ -54,10 +54,13 @@ impl X11Hook {
             .name("ard-input-hook-x11".into())
             .spawn(move || x11_thread_main(thread_state, sender))
             .map_err(|error| HookError::Io(format!("cannot start X11 hook thread: {error}")))?;
-        Ok((Self {
-            state,
-            thread: Some(thread),
-        }, receiver))
+        Ok((
+            Self {
+                state,
+                thread: Some(thread),
+            },
+            receiver,
+        ))
     }
 
     pub fn set_enabled(&self, enabled: bool) -> Result<(), HookError> {
@@ -189,21 +192,13 @@ fn x11_thread_main(state: Arc<X11State>, sender: SyncSender<HookEvent>) {
     }
 }
 
-fn grab_keyboard<C: Connection>(
-    connection: &C,
-    root: u32,
-    sender: &SyncSender<HookEvent>,
-) -> bool {
-    let grab = match connection.grab_keyboard(
-        false,
-        root,
-        CURRENT_TIME,
-        GrabMode::ASYNC,
-        GrabMode::ASYNC,
-    ) {
-        Ok(cookie) => cookie.reply(),
-        Err(error) => Err(error.into()),
-    };
+fn grab_keyboard<C: Connection>(connection: &C, root: u32, sender: &SyncSender<HookEvent>) -> bool {
+    let grab =
+        match connection.grab_keyboard(false, root, CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)
+        {
+            Ok(cookie) => cookie.reply(),
+            Err(error) => Err(error.into()),
+        };
     match grab {
         Ok(reply) if reply.status == GrabStatus::SUCCESS => {
             let aux = ChangeWindowAttributesAux::new()
@@ -290,7 +285,10 @@ fn keysym_for_keycode(
     } else {
         KEYMAP_COLUMN_UNSHIFTED
     };
-    keysyms.get(column.min(keysyms_per_keycode - 1)).copied().unwrap_or(0)
+    keysyms
+        .get(column.min(keysyms_per_keycode - 1))
+        .copied()
+        .unwrap_or(0)
 }
 
 fn classify_keysym(keysym: Keysym) -> KeyKind {
@@ -391,11 +389,8 @@ mod tests {
             sequence: 0,
             keysyms: vec![
                 // Keycode 8: '1' / '!'
-                0x31,
-                0x21,
-                // Keycode 9: Super_L / Super_L
-                0xffeb,
-                0xffeb,
+                0x31, 0x21, // Keycode 9: Super_L / Super_L
+                0xffeb, 0xffeb,
             ],
         };
         assert_eq!(keysym_for_keycode(Some(&keymap), 8, 0, 8), 0x31);
@@ -409,7 +404,10 @@ mod tests {
     fn keysyms_classify_modifiers_and_captured_keys() {
         assert_eq!(classify_keysym(keysyms::XK_SUPER_LEFT), KeyKind::WinLeft);
         assert_eq!(classify_keysym(keysyms::XK_ALT_LEFT), KeyKind::AltLeft);
-        assert_eq!(classify_keysym(keysyms::XK_CONTROL_RIGHT), KeyKind::CtrlRight);
+        assert_eq!(
+            classify_keysym(keysyms::XK_CONTROL_RIGHT),
+            KeyKind::CtrlRight
+        );
         assert_eq!(classify_keysym(keysyms::XK_TAB), KeyKind::Tab);
         assert_eq!(classify_keysym(keysyms::XK_ESCAPE), KeyKind::Escape);
         assert_eq!(classify_keysym(keysyms::XK_PRINT), KeyKind::PrintScreen);
@@ -418,7 +416,10 @@ mod tests {
 
     #[test]
     fn neutral_keysym_follows_the_remote_input_convention() {
-        assert_eq!(keysym_for_kind(KeyKind::WinLeft), Some(keysyms::XK_ALT_LEFT));
+        assert_eq!(
+            keysym_for_kind(KeyKind::WinLeft),
+            Some(keysyms::XK_ALT_LEFT)
+        );
         assert_eq!(
             keysym_for_kind(KeyKind::AltLeft),
             Some(keysyms::XK_META_LEFT)
@@ -433,12 +434,12 @@ mod tests {
             keysyms_per_keycode: 1,
             sequence: 0,
             keysyms: vec![
-                0x0000, // keycode 8 unused
-                keysyms::XK_SHIFT_LEFT, // 9
-                0x0000,              // 10
+                0x0000,                   // keycode 8 unused
+                keysyms::XK_SHIFT_LEFT,   // 9
+                0x0000,                   // 10
                 keysyms::XK_CONTROL_LEFT, // 11
-                0x0000,              // 12
-                keysyms::XK_SUPER_LEFT, // 13
+                0x0000,                   // 12
+                keysyms::XK_SUPER_LEFT,   // 13
             ],
         };
         // 8 modifiers x 1 keycode; Mod2/Mod4 rows carry shift/ctrl/super.
