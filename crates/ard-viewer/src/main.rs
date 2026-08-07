@@ -9,6 +9,8 @@ mod state;
 mod theme;
 mod views;
 mod widgets;
+#[cfg(target_os = "windows")]
+mod windows_input;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -171,6 +173,8 @@ enum Message {
     SessionPoll,
     SessionClipboardPoll,
     SessionRawEvent(window::Id, iced::Event, iced::event::Status),
+    #[cfg(target_os = "windows")]
+    SessionWindowHandle(Option<usize>),
     ClipboardRead(Option<String>),
     ImeSinkChanged(String),
 }
@@ -285,6 +289,12 @@ impl ArdViewer {
             Message::WindowOpened(kind, id) => {
                 self.windows.insert(id, kind);
                 if kind == WindowKind::Session {
+                    #[cfg(target_os = "windows")]
+                    return Task::batch([
+                        disable_implicit_titlebar_drag(id),
+                        register_windows_session_window(id),
+                    ]);
+                    #[cfg(not(target_os = "windows"))]
                     return disable_implicit_titlebar_drag(id);
                 }
             }
@@ -295,6 +305,8 @@ impl ArdViewer {
                 }
                 let closed = self.windows.remove(&id);
                 if closed == Some(WindowKind::Session) {
+                    #[cfg(target_os = "windows")]
+                    windows_input::set_session_window(None);
                     self.disconnect_session();
                 }
                 if closed == Some(WindowKind::Connection) || self.windows.is_empty() {
@@ -784,6 +796,10 @@ impl ArdViewer {
                     return Task::none();
                 }
                 return self.handle_session_raw_event(id, event, event_status);
+            }
+            #[cfg(target_os = "windows")]
+            Message::SessionWindowHandle(hwnd) => {
+                windows_input::set_session_window(hwnd);
             }
             Message::ClipboardRead(contents) => {
                 if let Some(text) = self.session_clipboard.observe_local(contents)
@@ -1525,6 +1541,20 @@ fn disable_implicit_titlebar_drag(id: window::Id) -> Task<Message> {
 #[cfg(not(target_os = "macos"))]
 fn disable_implicit_titlebar_drag(_id: window::Id) -> Task<Message> {
     Task::none()
+}
+
+#[cfg(target_os = "windows")]
+fn register_windows_session_window(id: window::Id) -> Task<Message> {
+    window::run(id, |window| {
+        use iced::window::raw_window_handle::RawWindowHandle;
+
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return None;
+        };
+        Some(handle.hwnd.get() as usize)
+    })
+    .map(Message::SessionWindowHandle)
 }
 
 #[cfg(target_os = "macos")]

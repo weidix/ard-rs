@@ -186,6 +186,28 @@ requests and decodes one encrypted full baseline, then enables type `9` for
 subsequent server-driven updates. Request-response polling remains available
 as an explicit compatibility mode.
 
+## Confirmed pointer-button masks
+
+Apple's client uses Cocoa button order instead of the conventional RFB
+middle/right order. On macOS 26.6 build 25G72, the exported constants are
+`kSSLeftButton = 0`, `kSSRightButton = 1`, and `kSSOtherButton = 2`.
+`-[SSEventSession stSendMouseButtonEvent:]` constructs the wire mask as
+`1 << button` at `0x1c890a66c`-`0x1c890a67c`, then passes it to
+`RFBPostMouseEventWithClickCount`. Its standard-message path stores that mask
+unchanged as byte 1 at `0x1c892dc68` and writes the six-byte type-`5` message
+at `0x1c892dc8c`. The resulting masks are therefore:
+
+| Cocoa button | ARD pointer mask |
+| --- | ---: |
+| left | `0x01` |
+| right | `0x02` |
+| middle/other | `0x04` |
+
+`-[SSFrameBufferView rightMouseDown:]` and `rightMouseUp:` load
+`kSSRightButton` before creating the button event, confirming that a native
+right click takes this path. Treating ARD as conventional RFB here swaps right
+and middle clicks on the remote Mac.
+
 ## MVS wire structure
 
 MVS (`1011`) is implemented by `DecodeMultiVariant.c` plus

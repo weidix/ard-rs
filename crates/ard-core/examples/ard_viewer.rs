@@ -1785,12 +1785,12 @@ fn mouse_button_bit(button: MouseButton, modifiers: ModifiersState) -> Option<u8
     // macOS commonly reports a trackpad Control-click as a left-button event
     // with the Control modifier instead of a native right-button event.
     if cfg!(target_os = "macos") && button == MouseButton::Left && modifiers.control_key() {
-        return Some(0x04);
+        return Some(0x02);
     }
     match button {
         MouseButton::Left => Some(0x01),
-        MouseButton::Middle => Some(0x02),
-        MouseButton::Right => Some(0x04),
+        MouseButton::Right => Some(0x02),
+        MouseButton::Middle => Some(0x04),
         MouseButton::Back | MouseButton::Other(1) => Some(0x20),
         MouseButton::Forward | MouseButton::Other(2) => Some(0x40),
         MouseButton::Other(_) => None,
@@ -2438,9 +2438,13 @@ mod tests {
     }
 
     #[test]
-    fn right_button_uses_the_rfb_button_three_mask() {
+    fn pointer_buttons_use_apple_cocoa_order() {
         assert_eq!(
             mouse_button_bit(MouseButton::Right, ModifiersState::default()),
+            Some(0x02)
+        );
+        assert_eq!(
+            mouse_button_bit(MouseButton::Middle, ModifiersState::default()),
             Some(0x04)
         );
         assert_eq!(
@@ -2453,7 +2457,7 @@ mod tests {
     fn macos_control_click_maps_to_remote_right_button() {
         let control = ModifiersState::CONTROL;
         let expected = if cfg!(target_os = "macos") {
-            Some(0x04)
+            Some(0x02)
         } else {
             Some(0x01)
         };

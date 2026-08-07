@@ -817,9 +817,9 @@ pub fn build_key_event(pressed: bool, keysym: u32) -> [u8; 8] {
 
 /// Builds the standard RFB client `PointerEvent` message.
 ///
-/// The button mask uses the RFB convention: bit 0/1/2 are left/middle/right,
-/// bits 3/4 are wheel up/down, and bits 5/6 are the commonly implemented
-/// horizontal/back-forward extensions.
+/// The button mask is serialized without reinterpretation. Standard RFB uses
+/// bit 0/1/2 for left/middle/right, while Apple's ARD implementation uses
+/// left/right/middle; callers must supply the server's expected ordering.
 pub fn build_pointer_event(button_mask: u8, x: u16, y: u16) -> [u8; 6] {
     let mut out = [0; 6];
     out[0] = 5;
