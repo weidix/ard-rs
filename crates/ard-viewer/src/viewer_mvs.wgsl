@@ -230,6 +230,11 @@ fn encoded_to_output(encoded: vec4<f32>) -> vec4<f32> {
 
 @fragment
 fn fs_interpolated(input: VertexOutput) -> @location(0) vec4<f32> {
+    return encoded_to_output(textureSample(decoded_image, image_sampler, input.uv));
+}
+
+@fragment
+fn fs_sharp(input: VertexOutput) -> @location(0) vec4<f32> {
     let source_footprint = vec2<f32>(textureDimensions(decoded_image)) * fwidth(input.uv);
     var encoded: vec4<f32>;
     if (max(source_footprint.x, source_footprint.y) > 1.0) {

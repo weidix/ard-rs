@@ -11,14 +11,21 @@ pub struct RemoteProgram {
     mailbox: SharedMailbox,
     zoom: f32,
     should_interpolate: bool,
+    sharp_sampling: bool,
 }
 
 impl RemoteProgram {
-    pub fn new(mailbox: SharedMailbox, zoom: f32, should_interpolate: bool) -> Self {
+    pub fn new(
+        mailbox: SharedMailbox,
+        zoom: f32,
+        should_interpolate: bool,
+        sharp_sampling: bool,
+    ) -> Self {
         Self {
             mailbox,
             zoom,
             should_interpolate,
+            sharp_sampling,
         }
     }
 }
@@ -38,6 +45,7 @@ impl<Message> Program<Message> for RemoteProgram {
             bounds,
             zoom: self.zoom,
             should_interpolate: self.should_interpolate,
+            sharp_sampling: self.sharp_sampling,
         }
     }
 }
@@ -46,11 +54,17 @@ pub fn remote_display<Message: 'static>(
     mailbox: SharedMailbox,
     zoom: f32,
     should_interpolate: bool,
+    sharp_sampling: bool,
 ) -> Element<'static, Message> {
-    shader::Shader::new(RemoteProgram::new(mailbox, zoom, should_interpolate))
-        .width(Fill)
-        .height(Fill)
-        .into()
+    shader::Shader::new(RemoteProgram::new(
+        mailbox,
+        zoom,
+        should_interpolate,
+        sharp_sampling,
+    ))
+    .width(Fill)
+    .height(Fill)
+    .into()
 }
 
 #[derive(Debug)]
@@ -59,6 +73,7 @@ pub struct RemotePrimitive {
     bounds: Rectangle,
     zoom: f32,
     should_interpolate: bool,
+    sharp_sampling: bool,
 }
 
 impl shader::Primitive for RemotePrimitive {
@@ -82,6 +97,7 @@ impl shader::Primitive for RemotePrimitive {
         pipeline.mailbox = Some(Arc::clone(&self.mailbox));
         pipeline.zoom = self.zoom;
         pipeline.should_interpolate = self.should_interpolate;
+        pipeline.sharp_sampling = self.sharp_sampling;
         pipeline.scale_factor = viewport.scale_factor();
         pipeline.bounds = self.bounds;
 
@@ -128,6 +144,7 @@ pub struct RemotePipeline {
     queue: wgpu::Queue,
     compute_pipeline: wgpu::ComputePipeline,
     interpolated_render_pipeline: wgpu::RenderPipeline,
+    sharp_render_pipeline: wgpu::RenderPipeline,
     nearest_render_pipeline: wgpu::RenderPipeline,
     compute_layout: wgpu::BindGroupLayout,
     render_layout: wgpu::BindGroupLayout,
@@ -148,6 +165,7 @@ pub struct RemotePipeline {
     bounds: Rectangle,
     zoom: f32,
     should_interpolate: bool,
+    sharp_sampling: bool,
     scale_factor: f32,
 }
 
@@ -262,6 +280,8 @@ impl shader::Pipeline for RemotePipeline {
         };
         let interpolated_render_pipeline =
             create_render_pipeline("ARD interpolated presentation pipeline", "fs_interpolated");
+        let sharp_render_pipeline =
+            create_render_pipeline("ARD sharp presentation pipeline", "fs_sharp");
         let nearest_render_pipeline =
             create_render_pipeline("ARD nearest presentation pipeline", "fs_nearest");
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -277,6 +297,7 @@ impl shader::Pipeline for RemotePipeline {
             queue: queue.clone(),
             compute_pipeline,
             interpolated_render_pipeline,
+            sharp_render_pipeline,
             nearest_render_pipeline,
             compute_layout,
             render_layout,
@@ -297,6 +318,7 @@ impl shader::Pipeline for RemotePipeline {
             bounds: Rectangle::default(),
             zoom: 1.0,
             should_interpolate: true,
+            sharp_sampling: false,
             scale_factor: 1.0,
         }
     }
@@ -590,7 +612,11 @@ impl RemotePipeline {
             1.0,
         );
         pass.set_pipeline(if self.should_interpolate {
-            &self.interpolated_render_pipeline
+            if self.sharp_sampling {
+                &self.sharp_render_pipeline
+            } else {
+                &self.interpolated_render_pipeline
+            }
         } else {
             &self.nearest_render_pipeline
         });
@@ -756,7 +782,7 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0, true),
+            remote_display::<()>(mailbox, 1.0, true, false),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
         assert!(snapshot.matches_image("/tmp/ard-viewer-iced-rgba-pipeline")?);
@@ -786,7 +812,7 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0, true),
+            remote_display::<()>(mailbox, 1.0, true, false),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
         assert!(snapshot.matches_image("/tmp/ard-viewer-iced-mvs-pipeline")?);

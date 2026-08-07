@@ -38,6 +38,7 @@ pub struct SessionConfig {
     pub quality: ArdVideoQuality,
     pub frame_interval: Duration,
     pub should_interpolate: bool,
+    pub sharp_sampling: bool,
 }
 
 impl Drop for SessionConfig {
@@ -288,6 +289,7 @@ pub struct SessionRuntime {
     mailbox: SharedMailbox,
     frame_wake: Arc<FrameWake>,
     should_interpolate: bool,
+    sharp_sampling: bool,
     cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -303,6 +305,7 @@ impl std::fmt::Debug for SessionRuntime {
 impl SessionRuntime {
     pub fn start(config: SessionConfig) -> Self {
         let should_interpolate = config.should_interpolate;
+        let sharp_sampling = config.sharp_sampling;
         let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
         let frame_wake = FrameWake::new();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -317,6 +320,7 @@ impl SessionRuntime {
             mailbox,
             frame_wake,
             should_interpolate,
+            sharp_sampling,
             cancel,
             worker: Some(worker),
         }
@@ -328,6 +332,10 @@ impl SessionRuntime {
 
     pub fn should_interpolate(&self) -> bool {
         self.should_interpolate
+    }
+
+    pub fn sharp_sampling(&self) -> bool {
+        self.sharp_sampling
     }
 
     pub fn drain_events(&self) -> Vec<SessionEvent> {

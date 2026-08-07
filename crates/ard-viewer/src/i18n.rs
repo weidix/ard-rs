@@ -69,6 +69,7 @@ impl Language {
             "视频质量" => "Video quality",
             "帧率 (FPS)" => "Frame rate (FPS)",
             "画面插值" => "Display interpolation",
+            "三次锐化采样" => "Bicubic sharp sampling",
             "启用" => "Enabled",
             "自动" => "Auto",
             "像素格式：服务器原生  ·  缩放：适应窗口  ·  自动重连：已启用" => {

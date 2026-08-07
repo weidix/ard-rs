@@ -74,6 +74,7 @@ fn remote_canvas(
             runtime.mailbox(),
             app.session_zoom,
             runtime.should_interpolate(),
+            runtime.sharp_sampling(),
         ))
         .height(Fill)
         .width(Fill)

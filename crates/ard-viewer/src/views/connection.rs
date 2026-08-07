@@ -437,6 +437,16 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     )
     .width(PARAMETER_CONTROL_WIDTH)
     .center_y(CONTROL_HEIGHT);
+    let sharp_sampling = container(
+        checkbox(app.sharp_sampling)
+            .label(app.language.tr("启用"))
+            .on_toggle(Message::SharpSamplingChanged)
+            .size(16)
+            .text_size(PARAMETER_TEXT_SIZE)
+            .style(theme::checkbox),
+    )
+    .width(PARAMETER_CONTROL_WIDTH)
+    .center_y(CONTROL_HEIGHT);
     let advanced = container(
         column![
             row![
@@ -450,6 +460,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             connection_parameter_row(app.language.tr("视频质量"), quality),
             connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate),
             connection_parameter_row(app.language.tr("画面插值"), interpolation),
+            connection_parameter_row(app.language.tr("三次锐化采样"), sharp_sampling),
             text(
                 app.language
                     .tr("像素格式：服务器原生  ·  缩放：适应窗口  ·  自动重连：已启用")

@@ -57,6 +57,7 @@ struct ArdViewer {
     open_dropdown: Option<DropdownMenu>,
     frame_rate: String,
     should_interpolate: bool,
+    sharp_sampling: bool,
     settings_section: SettingsSection,
     settings_transition: f32,
     key_profile: String,
@@ -148,6 +149,7 @@ enum Message {
     QualityChanged(ArdVideoQuality),
     FrameRateChanged(String),
     ShouldInterpolateChanged(bool),
+    SharpSamplingChanged(bool),
     KeyProfileChanged(String),
     AutoAdaptChanged(bool),
     CaptureShortcutsChanged(bool),
@@ -228,6 +230,7 @@ impl ArdViewer {
                 cached.frame_rate.clone()
             },
             should_interpolate: cached.should_interpolate,
+            sharp_sampling: cached.sharp_sampling,
             settings_section: SettingsSection::KeyMapping,
             settings_transition: 1.0,
             key_profile: cached.key_profile,
@@ -548,6 +551,10 @@ impl ArdViewer {
             }
             Message::ShouldInterpolateChanged(value) => {
                 self.should_interpolate = value;
+                self.persist_config();
+            }
+            Message::SharpSamplingChanged(value) => {
+                self.sharp_sampling = value;
                 self.persist_config();
             }
             Message::KeyProfileChanged(value) => {
@@ -1003,6 +1010,7 @@ impl ArdViewer {
             frame_rate: self.frame_rate.clone(),
             frame_interval_ms: frame_interval_from_rate(&self.frame_rate).to_string(),
             should_interpolate: self.should_interpolate,
+            sharp_sampling: self.sharp_sampling,
             key_profile: self.key_profile.clone(),
             auto_adapt_keyboard: self.auto_adapt_keyboard,
             capture_system_shortcuts: self.capture_system_shortcuts,
@@ -1113,6 +1121,7 @@ impl ArdViewer {
             quality: self.quality,
             frame_interval: frame_duration_from_rate(&self.frame_rate),
             should_interpolate: self.should_interpolate,
+            sharp_sampling: self.sharp_sampling,
         }));
         self.status = self.language.tr("正在当前 Session 窗口中连接…").into();
     }
@@ -2345,6 +2354,15 @@ mod tests {
 
         let _task = app.update(Message::ShouldInterpolateChanged(false));
         assert!(!app.should_interpolate);
+    }
+
+    #[test]
+    fn sharp_sampling_connection_parameter_defaults_to_off() {
+        let (mut app, _task) = ArdViewer::new();
+        assert!(!app.sharp_sampling);
+
+        let _task = app.update(Message::SharpSamplingChanged(true));
+        assert!(app.sharp_sampling);
     }
 
     #[test]
