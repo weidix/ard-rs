@@ -2490,18 +2490,36 @@ mod tests {
     }
 
     #[test]
-    fn quality_menu_remains_visible_when_connection_parameters_scroll() {
-        let (mut app, _task) = ArdViewer::new();
-        app.open_dropdown = Some(DropdownMenu::ConnectionQuality);
+    fn popover_escapes_scrollable_viewport() {
+        let options = vec![
+            widgets::DropdownOption::new("第一项", false, Message::CloseDropdown),
+            widgets::DropdownOption::new("第二项", false, Message::CloseDropdown),
+            widgets::DropdownOption::new("第三项", false, Message::CloseDropdown),
+            widgets::DropdownOption::new("最后一项", false, Message::CloseDropdown)
+                .id("popover-test-last"),
+        ];
+        let view = iced::widget::container(iced::widget::scrollable(iced::widget::column![
+            widgets::dropdown(
+                "选择",
+                vec![widgets::DropdownSection::new(None, options)],
+                220.0,
+                14.0,
+                true,
+                Message::CloseDropdown,
+                Message::CloseDropdown,
+            )
+        ]))
+        .width(240)
+        .height(80);
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
-            WindowKind::Connection.min_size(),
-            views::connection(&app, window::Id::unique()),
+            iced::Size::new(300.0, 300.0),
+            view,
         );
 
         let option = ui
-            .find(iced::widget::Id::new("quality-option-high-performance"))
-            .expect("AVC quality option should remain visible when parameters scroll");
+            .find(iced::widget::Id::new("popover-test-last"))
+            .expect("popover content should remain visible outside the scrollable viewport");
         assert!(
             option
                 .visible_bounds()
