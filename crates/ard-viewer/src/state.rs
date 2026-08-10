@@ -37,6 +37,13 @@ impl WindowKind {
             Self::Session => Size::new(1280.0, 800.0),
         }
     }
+
+    pub fn min_size(self) -> Size {
+        match self {
+            Self::Connection | Self::Settings => Size::new(760.0, 560.0),
+            Self::Session => Size::new(640.0, 480.0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3,6 +3,8 @@
 mod config;
 mod i18n;
 mod icons;
+#[allow(unsafe_code)]
+mod media;
 mod session_renderer;
 mod session_runtime;
 mod state;
@@ -1665,7 +1667,7 @@ fn open_window_at(kind: WindowKind, position: window::Position) -> Task<Message>
     let size = kind.size();
     let (_, task) = window::open(window::Settings {
         size,
-        min_size: Some(size),
+        min_size: Some(kind.min_size()),
         position,
         decorations: cfg!(target_os = "macos"),
         transparent: false,
@@ -2484,6 +2486,26 @@ mod tests {
         assert!(
             ui.into_messages()
                 .any(|message| matches!(message, Message::QualityChanged(ArdVideoQuality::Full)))
+        );
+    }
+
+    #[test]
+    fn quality_menu_remains_visible_when_connection_parameters_scroll() {
+        let (mut app, _task) = ArdViewer::new();
+        app.open_dropdown = Some(DropdownMenu::ConnectionQuality);
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            WindowKind::Connection.min_size(),
+            views::connection(&app, window::Id::unique()),
+        );
+
+        let option = ui
+            .find(iced::widget::Id::new("quality-option-high-performance"))
+            .expect("AVC quality option should remain visible when parameters scroll");
+        assert!(
+            option
+                .visible_bounds()
+                .is_some_and(|bounds| bounds.height > 0.0)
         );
     }
 

@@ -1,12 +1,18 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::avc::{
+    CLIENT_MEDIA_STREAM_MESSAGE_TYPE, ENCODING_AVC_MEDIA_STREAM, MEDIA_STREAM_MESSAGE_VERSION,
+    MediaStreamAnswer, MediaStreamCodec, MediaStreamConfiguration, MediaStreamFlags,
+    MediaStreamKeyMaterial, MediaStreamServerReply, MediaUdpEndpoints, build_media_stream_offer,
+    build_remote_endpoint_info, parse_negotiation_payload,
+};
 use crate::{
     ArdEncryptionControl, ArdMessageDispatcher, ArdScrollWheelEvent, ArdServerMessage,
     ArdVerifiedRecordStream, ArdViewerInformation, Decoder, Framebuffer, FramebufferFormat,
@@ -33,6 +39,9 @@ pub enum ArdVideoQuality {
     Low,
     Medium,
     High,
+    /// Apple AVC/H.264 or HEVC media stream over UDP/SRTP. The first RFB
+    /// encoding is 1010 so Screen Sharing selects its real-time path.
+    HighPerformance,
     #[default]
     Adaptive,
     Full,
@@ -104,6 +113,7 @@ impl ArdVideoQuality {
             Self::Low => &[1000, 6, 16, -223],
             Self::Medium => &[1001, 6, 16, -223],
             Self::High => &[1002, 6, 16, -223],
+            Self::HighPerformance => &[ENCODING_AVC_MEDIA_STREAM, 1011, 1002, 6, 16, -223],
             Self::Adaptive => &[1011, 1002, 6, 16, -223],
             Self::Full => &[6, 16, -223],
         }
@@ -114,6 +124,7 @@ impl ArdVideoQuality {
             Self::Low => "黑白",
             Self::Medium => "灰度",
             Self::High => "16位颜色",
+            Self::HighPerformance => "高性能 AVC",
             Self::Adaptive => "自适应 MVS",
             Self::Full => "全色",
         }
@@ -236,9 +247,26 @@ pub enum ArdClientEvent {
     Clipboard(String),
     Bell,
     StateChange,
+    /// The server accepted the AVC media path and the viewer can start its
+    /// UDP/SRTP decoder with the supplied video1 material.
+    MediaStream(ArdMediaStream),
     /// The transport was recreated after a read-side disconnect. The next
     /// call waits for the first frame from the new session.
     Reconnected,
+}
+
+/// Negotiated server-to-viewer AVC video stream parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArdMediaStream {
+    pub endpoints: MediaUdpEndpoints,
+    pub key_blob: Vec<u8>,
+    pub codec: MediaStreamCodec,
+}
+
+impl Drop for ArdMediaStream {
+    fn drop(&mut self) {
+        self.key_blob.fill(0);
+    }
 }
 
 enum OutboundMessage {
@@ -415,6 +443,21 @@ pub struct ArdClient {
     automatic_updates_started: bool,
     pending_events: VecDeque<ArdClientEvent>,
     reconnect_config: ArdClientConfig,
+    media_host: IpAddr,
+    media_offer_sent: bool,
+    pending_media_stream: Option<PendingMediaStream>,
+}
+
+#[derive(Debug)]
+struct PendingMediaStream {
+    endpoints: MediaUdpEndpoints,
+    video1_server_to_viewer: Vec<u8>,
+}
+
+impl Drop for PendingMediaStream {
+    fn drop(&mut self) {
+        self.video1_server_to_viewer.fill(0);
+    }
 }
 
 impl ArdClient {
@@ -438,6 +481,7 @@ impl ArdClient {
 
     fn connect_inner(config: &mut ArdClientConfig) -> Result<Self, ArdClientError> {
         let mut stream = TcpStream::connect(&config.address)?;
+        let media_host = stream.peer_addr()?.ip();
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(config.timeout))?;
         stream.set_write_timeout(Some(config.timeout))?;
@@ -552,7 +596,10 @@ impl ArdClient {
             .as_ref()
             .is_some_and(|extension| extension.supports_command(0x17));
         let requested_pixel_format = config.output_format.pixel_format(server_init.pixel_format);
-        let (mut decoder, mut framebuffer) = if config.video_quality == ArdVideoQuality::Adaptive {
+        let (mut decoder, mut framebuffer) = if matches!(
+            config.video_quality,
+            ArdVideoQuality::Adaptive | ArdVideoQuality::HighPerformance
+        ) {
             (
                 Decoder::new_gpu_mvs(requested_pixel_format)?,
                 Framebuffer::new_metadata_with_format(
@@ -648,6 +695,9 @@ impl ArdClient {
             automatic_updates_started: false,
             pending_events: VecDeque::new(),
             reconnect_config: config.clone(),
+            media_host,
+            media_offer_sent: false,
+            pending_media_stream: None,
         })
     }
 
@@ -687,6 +737,131 @@ impl ArdClient {
 
     pub fn drain_gpu_mvs_frames(&mut self, visit: impl FnMut(crate::MvsGpuFrame)) {
         self.decoder.drain_gpu_mvs_frames(visit);
+    }
+
+    fn handle_media_stream_reply(
+        &mut self,
+        reply: MediaStreamServerReply,
+    ) -> Result<Option<ArdClientEvent>, ArdClientError> {
+        match reply {
+            MediaStreamServerReply::Message1(message) => {
+                if message.video1_port == 0 {
+                    return Err(ArdClientError::Message(
+                        "AVC media stream did not provide a video1 UDP port".to_owned(),
+                    ));
+                }
+                if self.media_offer_sent {
+                    return Ok(None);
+                }
+
+                let mut session_id = [0_u8; 16];
+                getrandom::fill(&mut session_id).map_err(|error| {
+                    ArdClientError::Message(format!("AVC session random source failed: {error}"))
+                })?;
+                let mut audio_viewer_to_server = [0_u8; crate::avc::MEDIA_STREAM_KEY_LEN];
+                let mut audio_server_to_viewer = [0_u8; crate::avc::MEDIA_STREAM_KEY_LEN];
+                let mut video1_viewer_to_server = [0_u8; crate::avc::MEDIA_STREAM_KEY_LEN];
+                let mut video1_server_to_viewer = [0_u8; crate::avc::MEDIA_STREAM_KEY_LEN];
+                for key in [
+                    &mut audio_viewer_to_server,
+                    &mut audio_server_to_viewer,
+                    &mut video1_viewer_to_server,
+                    &mut video1_server_to_viewer,
+                ] {
+                    getrandom::fill(key).map_err(|error| {
+                        ArdClientError::Message(format!("AVC key random source failed: {error}"))
+                    })?;
+                }
+                let keys = MediaStreamKeyMaterial::new(
+                    &audio_viewer_to_server,
+                    &audio_server_to_viewer,
+                    &video1_viewer_to_server,
+                    &video1_server_to_viewer,
+                    None,
+                    None,
+                )?;
+                let call_id = format_uuid(session_id);
+                // ScreenSharing's negotiator expects a VCCallInfoBlob with a
+                // recognizable Apple build string. Keep the protocol profile
+                // stable even when the Rust client is running on another OS.
+                let endpoint_info = build_remote_endpoint_info("Mac16,12", "25G72");
+                let configuration = MediaStreamConfiguration {
+                    message_version: MEDIA_STREAM_MESSAGE_VERSION,
+                    flags: MediaStreamFlags::new(
+                        MediaStreamFlags::VIDEO1_60FPS
+                            | MediaStreamFlags::SEND_CURSOR
+                            | MediaStreamFlags::VIEWER_APP,
+                    ),
+                    session_id,
+                    audio_offer: build_media_stream_offer(&call_id, &endpoint_info, 7, 1)?,
+                    video1_offer: build_media_stream_offer(&call_id, &endpoint_info, 7, 2)?,
+                    video2_offer: None,
+                    keys,
+                };
+                let video1_key_blob = video1_server_to_viewer.to_vec();
+                let offer = configuration.encode()?;
+                debug_assert_eq!(offer[0], CLIENT_MEDIA_STREAM_MESSAGE_TYPE);
+                self.input.send_payload(offer)?;
+                drop(configuration);
+                session_id.fill(0);
+                audio_viewer_to_server.fill(0);
+                audio_server_to_viewer.fill(0);
+                video1_viewer_to_server.fill(0);
+                video1_server_to_viewer.fill(0);
+                self.media_offer_sent = true;
+                self.pending_media_stream = Some(PendingMediaStream {
+                    endpoints: MediaUdpEndpoints::from_message1(self.media_host, &message),
+                    video1_server_to_viewer: video1_key_blob.clone(),
+                });
+                if self.automatic_updates && !self.automatic_updates_started {
+                    let request = build_ard_auto_frame_update(
+                        self.automatic_frame_interval_ms,
+                        0,
+                        0,
+                        self.framebuffer.width(),
+                        self.framebuffer.height(),
+                    );
+                    self.input.send_payload(request.to_vec())?;
+                    self.automatic_updates_started = true;
+                } else if !self.automatic_updates {
+                    let request = build_framebuffer_update_request(
+                        true,
+                        0,
+                        0,
+                        self.framebuffer.width(),
+                        self.framebuffer.height(),
+                    );
+                    self.input.send_payload(request.to_vec())?;
+                }
+                // Message1 already gives us the video UDP endpoint and key.
+                // Start H.264 immediately; a later negotiator answer can
+                // replace the codec with HEVC by emitting a second event.
+                Ok(Some(ArdClientEvent::MediaStream(ArdMediaStream {
+                    endpoints: MediaUdpEndpoints::from_message1(self.media_host, &message),
+                    key_blob: video1_key_blob,
+                    codec: MediaStreamCodec::H264,
+                })))
+            }
+            MediaStreamServerReply::Answer(MediaStreamAnswer { answer_body, .. }) => {
+                let Some(mut pending) = self.pending_media_stream.take() else {
+                    return Ok(None);
+                };
+                let codec = parse_negotiation_payload(&answer_body)
+                    .ok()
+                    .and_then(|config| config.codec)
+                    .unwrap_or(MediaStreamCodec::H264);
+                let key_blob = core::mem::take(&mut pending.video1_server_to_viewer);
+                Ok(Some(ArdClientEvent::MediaStream(ArdMediaStream {
+                    endpoints: pending.endpoints,
+                    key_blob,
+                    codec,
+                })))
+            }
+            MediaStreamServerReply::Error(error) => Err(ArdClientError::Message(format!(
+                "server rejected AVC media stream (type={}, subcode={})",
+                error.error_type, error.error_sub_code
+            ))),
+        }
     }
 
     /// Reads the next decoded session event.
@@ -770,6 +945,11 @@ impl ArdClient {
                     ArdServerMessage::Bell => batch_events.push(ArdClientEvent::Bell),
                     ArdServerMessage::StateChange => batch_events.push(ArdClientEvent::StateChange),
                     ArdServerMessage::EncryptionControl(_) => {}
+                    ArdServerMessage::MediaStream(reply) => {
+                        if let Some(event) = self.handle_media_stream_reply(reply)? {
+                            batch_events.push(event);
+                        }
+                    }
                 }
             }
             if let Some(frame_event_position) = frame_event_position {
@@ -847,6 +1027,19 @@ fn spawn_input_writer(
             }
         }
     });
+}
+
+fn format_uuid(bytes: [u8; 16]) -> String {
+    format!(
+        "{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
+        u32::from_be_bytes(bytes[0..4].try_into().expect("UUID width")),
+        u16::from_be_bytes(bytes[4..6].try_into().expect("UUID width")),
+        u16::from_be_bytes(bytes[6..8].try_into().expect("UUID width")),
+        u16::from_be_bytes(bytes[8..10].try_into().expect("UUID width")),
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ])
+    )
 }
 
 fn read_exact_vector(stream: &mut TcpStream, len: usize) -> io::Result<Vec<u8>> {

@@ -2160,6 +2160,7 @@ fn start_receiver(
                     continue;
                 }
                 Ok(ArdClientEvent::Bell | ArdClientEvent::StateChange) => continue,
+                Ok(ArdClientEvent::MediaStream(_)) => continue,
                 Err(error) => {
                     eprintln!("ARD 接收失败：{error}");
                     let _ = proxy.send_event(ViewerEvent::Status(format!("连接已断开：{error}")));

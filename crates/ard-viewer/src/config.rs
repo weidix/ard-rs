@@ -277,6 +277,7 @@ pub fn quality_from_cache(value: &str) -> ArdVideoQuality {
         "low" => ArdVideoQuality::Low,
         "medium" => ArdVideoQuality::Medium,
         "high" => ArdVideoQuality::High,
+        "high-performance" => ArdVideoQuality::HighPerformance,
         "full" => ArdVideoQuality::Full,
         _ => ArdVideoQuality::Adaptive,
     }
@@ -287,6 +288,7 @@ pub fn quality_to_cache(value: ArdVideoQuality) -> &'static str {
         ArdVideoQuality::Low => "low",
         ArdVideoQuality::Medium => "medium",
         ArdVideoQuality::High => "high",
+        ArdVideoQuality::HighPerformance => "high-performance",
         ArdVideoQuality::Adaptive => "adaptive",
         ArdVideoQuality::Full => "full",
     }

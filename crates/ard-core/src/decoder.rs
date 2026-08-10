@@ -4,7 +4,7 @@ use crate::mvs::MvsState;
 use crate::wire::Cursor;
 use crate::{
     ArdEncryptionControl, Encoding, Error, Framebuffer, PixelFormat, Rectangle, Result,
-    parse_ard_encryption_control,
+    avc::MediaStreamServerReply, parse_ard_encryption_control,
 };
 
 const MAX_REUSABLE_ZRLE_SCRATCH: usize = 8 * 1024 * 1024;
@@ -35,6 +35,7 @@ pub struct Decoder {
     zrle_pixels_scratch: Vec<[u8; 4]>,
     mvs: MvsState,
     pending_encryption_control: Option<ArdEncryptionControl>,
+    pending_media_stream_replies: Vec<MediaStreamServerReply>,
     gpu_mvs_output: bool,
     pending_gpu_mvs_frames: Vec<crate::MvsGpuFrame>,
 }
@@ -57,6 +58,7 @@ impl Decoder {
             zrle_pixels_scratch: Vec::new(),
             mvs: MvsState::default(),
             pending_encryption_control: None,
+            pending_media_stream_replies: Vec::new(),
             gpu_mvs_output: false,
             pending_gpu_mvs_frames: Vec::new(),
         })
@@ -134,6 +136,17 @@ impl Decoder {
             self.pending_encryption_control = Some(control);
             return Ok(consumed);
         }
+        if encoding == Encoding::ArdAvcMediaStream {
+            if rect.x != 0 || rect.y != 0 {
+                return Err(Error::Invalid(
+                    "ARD AVC media-stream rectangle is not at the origin",
+                ));
+            }
+            let (message, consumed) = crate::avc::MediaStreamMessage1::parse_with_len(payload)?;
+            self.pending_media_stream_replies
+                .push(MediaStreamServerReply::Message1(message));
+            return Ok(consumed);
+        }
         if encoding == Encoding::CursorPosition {
             // Screen Sharing's 1100 rectangle carries the pointer hotspot in
             // the rectangle header and has no payload. The viewer draws its
@@ -160,6 +173,7 @@ impl Decoder {
             Encoding::DesktopSize | Encoding::ArdEncryption | Encoding::CursorPosition => {
                 unreachable!("handled before rectangle validation")
             }
+            Encoding::ArdAvcMediaStream => unreachable!("handled before rectangle validation"),
         }
     }
 
@@ -174,7 +188,10 @@ impl Decoder {
         let encoding =
             Encoding::from_i32(rect.encoding).ok_or(Error::UnsupportedEncoding(rect.encoding))?;
         if (rect.width == 0 || rect.height == 0)
-            && !matches!(encoding, Encoding::ArdMvs | Encoding::ArdEncryption)
+            && !matches!(
+                encoding,
+                Encoding::ArdMvs | Encoding::ArdEncryption | Encoding::ArdAvcMediaStream
+            )
         {
             return Ok(0);
         }
@@ -189,6 +206,10 @@ impl Decoder {
                 } else {
                     Ok(ArdEncryptionControl::WIRE_LEN)
                 }
+            }
+            Encoding::ArdAvcMediaStream => {
+                let (_, consumed) = crate::avc::MediaStreamMessage1::parse_with_len(payload)?;
+                Ok(consumed)
             }
             Encoding::CopyRect => fixed_payload_len(payload, 4),
             Encoding::Raw => {
@@ -229,6 +250,12 @@ impl Decoder {
 
     pub fn take_ard_encryption_control(&mut self) -> Option<ArdEncryptionControl> {
         self.pending_encryption_control.take()
+    }
+
+    /// Takes AVC media-stream control messages recovered from 1010
+    /// bootstrap rectangles. Encoded video is delivered over UDP.
+    pub fn take_media_stream_replies(&mut self) -> Vec<MediaStreamServerReply> {
+        core::mem::take(&mut self.pending_media_stream_replies)
     }
 
     /// Returns the two 8x8 quantization tables most recently supplied by an

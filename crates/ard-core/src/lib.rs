@@ -7,6 +7,7 @@
 //! version, security methods and framebuffer encodings.
 
 mod auth;
+pub mod avc;
 mod client;
 mod decoder;
 mod dispatcher;
@@ -20,9 +21,18 @@ mod transport;
 mod wire;
 
 pub use auth::{ArdType30ClientExchange, build_ard_type30_client_exchange};
+pub use avc::udp::AvcVideoStreamReceiver;
+pub use avc::{
+    AccessUnit, CLIENT_MEDIA_STREAM_MESSAGE_TYPE, ENCODING_AVC_MEDIA_STREAM, H264Depacketizer,
+    HevcDepacketizer, MEDIA_STREAM_KEY_LEN, MEDIA_STREAM_MESSAGE_VERSION, MediaStreamAnswer,
+    MediaStreamCodec, MediaStreamConfiguration, MediaStreamError, MediaStreamFlags,
+    MediaStreamKeyMaterial, MediaStreamMessage1, MediaStreamOffer, MediaStreamServerReply,
+    MediaUdpEndpoints, MediaUdpSession, RtpHeader, RtpPacket, SERVER_MEDIA_STREAM_MESSAGE_TYPE,
+    UdpStreamKind, parse_negotiation_payload,
+};
 pub use client::{
     ArdClient, ArdClientConfig, ArdClientError, ArdClientEvent, ArdClientInput, ArdFrameInfo,
-    ArdFrameOutput, ArdReconnectPolicy, ArdVideoQuality,
+    ArdFrameOutput, ArdMediaStream, ArdReconnectPolicy, ArdVideoQuality,
 };
 pub use decoder::{DecodeLimits, Decoder};
 pub use dispatcher::{ArdMessageDispatcher, ArdServerMessage};

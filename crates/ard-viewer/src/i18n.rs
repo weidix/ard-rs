@@ -159,6 +159,7 @@ impl Language {
             "黑白" => "Black & White",
             "灰度" => "Grayscale",
             "16位颜色" => "16-bit Color",
+            "高性能 AVC" => "High performance (AVC)",
             "自适应 MVS" | "自适应" => "Adaptive",
             "全色" => "Full Color",
             "跟随系统" => "System",

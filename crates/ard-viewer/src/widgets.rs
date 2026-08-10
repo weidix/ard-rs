@@ -303,6 +303,13 @@ pub fn quality_dropdown_sections(
             Some("MVS"),
             vec![option(ArdVideoQuality::Adaptive, "quality-option-adaptive")],
         ),
+        DropdownSection::new(
+            Some("AVC"),
+            vec![option(
+                ArdVideoQuality::HighPerformance,
+                "quality-option-high-performance",
+            )],
+        ),
     ]
 }
 
@@ -605,15 +612,10 @@ impl iced::advanced::Overlay<Message, iced::Theme, iced::Renderer> for PopoverOv
             return;
         }
 
-        self.popup.as_widget_mut().update(
-            self.tree,
-            event,
-            layout,
-            cursor,
-            renderer,
-            shell,
-            &self.viewport,
-        );
+        let bounds = layout.bounds();
+        self.popup
+            .as_widget_mut()
+            .update(self.tree, event, layout, cursor, renderer, shell, &bounds);
     }
 
     fn draw(
@@ -624,15 +626,10 @@ impl iced::advanced::Overlay<Message, iced::Theme, iced::Renderer> for PopoverOv
         layout: iced::advanced::Layout<'_>,
         cursor: iced::advanced::mouse::Cursor,
     ) {
-        self.popup.as_widget().draw(
-            self.tree,
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            &self.viewport,
-        );
+        let bounds = layout.bounds();
+        self.popup
+            .as_widget()
+            .draw(self.tree, renderer, theme, style, layout, cursor, &bounds);
     }
 
     fn mouse_interaction(
@@ -641,13 +638,10 @@ impl iced::advanced::Overlay<Message, iced::Theme, iced::Renderer> for PopoverOv
         cursor: iced::advanced::mouse::Cursor,
         renderer: &iced::Renderer,
     ) -> iced::advanced::mouse::Interaction {
-        self.popup.as_widget().mouse_interaction(
-            self.tree,
-            layout,
-            cursor,
-            &self.viewport,
-            renderer,
-        )
+        let bounds = layout.bounds();
+        self.popup
+            .as_widget()
+            .mouse_interaction(self.tree, layout, cursor, &bounds, renderer)
     }
 
     fn operate(

@@ -1,6 +1,8 @@
 use crate::protocol::{complete_framebuffer_update_len, parse_complete_framebuffer_update};
 use crate::wire::Cursor;
-use crate::{ArdEncryptionControl, Decoder, Error, Framebuffer, Result};
+use crate::{
+    ArdEncryptionControl, Decoder, Error, Framebuffer, Result, avc::MediaStreamServerReply,
+};
 
 /// One complete server message recovered from the decrypted record payload
 /// stream.
@@ -13,6 +15,9 @@ pub enum ArdServerMessage {
     /// The zero-sized 1103 rectangle inside a FramebufferUpdate. The decoder
     /// stores it separately so the session material can be unwrapped.
     EncryptionControl(ArdEncryptionControl),
+    /// AVC media-stream bootstrap/control data. The corresponding encoded
+    /// frames arrive on the negotiated UDP stream.
+    MediaStream(MediaStreamServerReply),
     Bell,
     ServerCutText(String),
     /// Native Screen Sharing's fixed-width user/session state notification.
@@ -134,12 +139,18 @@ impl ArdMessageDispatcher {
                     consumed = consumed
                         .checked_add(message_len)
                         .ok_or(Error::LimitExceeded("ARD buffered messages"))?;
-                    messages.push(ArdServerMessage::FramebufferUpdate {
-                        rectangle_count,
-                        bytes: message_len,
-                    });
+                    let media_replies = decoder.take_media_stream_replies();
+                    if media_replies.len() < rectangle_count {
+                        messages.push(ArdServerMessage::FramebufferUpdate {
+                            rectangle_count,
+                            bytes: message_len,
+                        });
+                    }
                     if let Some(control) = decoder.take_ard_encryption_control() {
                         messages.push(ArdServerMessage::EncryptionControl(control));
+                    }
+                    for reply in media_replies {
+                        messages.push(ArdServerMessage::MediaStream(reply));
                     }
                 }
                 2 => {
@@ -161,6 +172,17 @@ impl ArdMessageDispatcher {
                 0x14 => {
                     consumed += 8;
                     messages.push(ArdServerMessage::StateChange);
+                }
+                0x23 => {
+                    let (reply, message_len) = match MediaStreamServerReply::parse_framed(buffer) {
+                        Ok(reply) => reply,
+                        Err(Error::NeedMore { .. }) => return Ok((consumed, messages)),
+                        Err(error) => return Err(error),
+                    };
+                    consumed = consumed
+                        .checked_add(message_len)
+                        .ok_or(Error::LimitExceeded("ARD buffered messages"))?;
+                    messages.push(ArdServerMessage::MediaStream(reply));
                 }
                 other => return Err(Error::UnsupportedServerMessage(other)),
             }
@@ -213,6 +235,7 @@ impl ArdMessageDispatcher {
                     Ok(8)
                 }
             }
+            0x23 => MediaStreamServerReply::parse_framed(buffer).map(|(_, len)| len),
             other => Err(Error::UnsupportedServerMessage(other)),
         }
     }

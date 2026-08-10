@@ -662,3 +662,210 @@ complete modern Screen Sharing client.
 Until the remaining items are resolved, the implementation should be described
 as a real-session-tested ARD decoder rather than a complete Screen Sharing
 client.
+
+## AVC media stream (encoding 1010) findings
+
+Investigated on macOS 26.6 build 25G72 (Screen Sharing 6.1 / 760.4) on
+2026-08-08. The third video mode, `kSSVideoEncoding_AVCMediaStream = 1010`,
+is a dedicated real-time media path and is **not** a FramebufferUpdate
+rectangle encoding: it has its own RFB messages, UDP/RTP transport, SRTP
+encryption and H.264/HEVC payloads.
+
+### Negotiation entry (confirmed)
+
+The stock Screen Sharing profiles do **not** advertise `1010` in
+`SetEncodings`. The high-performance profile places `1010` first so the
+server selects the real-time path, then sends a dedicated RFB client message:
+
+| Wire offset | Size | Field |
+| ---: | ---: | --- |
+| `0x00` | 1 | message type `0x1c` (28) |
+| `0x02` | 2 | BE `messageSize` = total - 4 |
+| `0x04` | 2 | BE `messageVersion` = `0x0300` |
+| `0x06` | 4 | BE flags (bit0 video1 60fps, bit1 video2 60fps, bit2 send cursor, bit3 viewer app) |
+| `0x0a`/`0x0c`/`0x0e` | 2 each | BE lengths of the three key blobs (46/46/46) |
+| `0x14` | 16 | session UUID |
+| `0x24` | 46 | audio key server→viewer |
+| `0x52` | 46 | video1 offer |
+| `0x80` | 46 | audio key viewer→server |
+| `0xae` | 46 | video1 key server→viewer |
+| `0xdc` | 46 | video2 key viewer→server |
+| `0x10a` | 46 | video1 key viewer→server |
+| `0x138` | 46 | video2 offer |
+| `0x166` | 46 | audio offer |
+| `0x194` | 46 | video2 key server→viewer |
+
+Total with video2: 450 bytes; without video2 the builder emits only the first
+six slots (312 bytes) and gates the audio offer behind video2. Recovered from
+`_RFBMediaStreamServerConfiguration` (ScreenSharing.framework) and validated
+against `HandleServerMediaStreamConfiguration` in screensharingd, whose
+expected size formula is `216 + [0xa] + [0xc] + ([0xe] ? [0xe] + 0x5c : 0)`.
+
+### Corrected viewer offer layout (2026-08-08, disassembly-confirmed)
+
+The earlier 46-byte-slot reading above was wrong: 46 bytes is the **SRTP key**
+length; the offers are **variable-length binary plists**. The exact layout was
+recovered from `_RFBMediaStreamServerConfiguration` in ScreenSharing.framework
+(macOS 26.6 build 25G72) and its caller
+`-[SSSession stConfigureServerMediaStream]`:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| `0x00` | 1 | RFB client message type `0x1c` |
+| `0x02` | 2 | BE `messageSize` = total - 4 |
+| `0x04` | 2 | BE version `0x0300` |
+| `0x06` | 4 | BE flags (bit0 video1 60fps, bit1 video2 60fps, bit2 send cursor, bit3 viewer app) |
+| `0x0a` | 2 | BE audio offer length |
+| `0x0c` | 2 | BE video1 offer length |
+| `0x0e` | 2 | BE video2 offer length (0 when absent) |
+| `0x10` | 4 | reserved, zero |
+| `0x14` | 16 | session UUID |
+| `0x24` | 46 | audio key viewer→server |
+| `0x52` | 46 | audio key server→viewer |
+| `0x80` | n | audio offer (binary plist) |
+| +n | 46 | video1 key viewer→server |
+| +0x2e | 46 | video1 key server→viewer |
+| +0x5c | m | video1 offer (binary plist) |
+| +m | 46+46 | video2 keys (viewer→server, server→viewer) |
+| +0x5c | k | video2 offer (only when present) |
+
+Total without video2 = `0x80 + audio_len + 0x5c + video1_len`; with video2
+add `0x5c + video2_len`. The `messageSize` field equals that total minus 4
+(the native builder computes `0xd8 + audio + video1 + video2_extra`).
+The real negotiator offers observed on the wire are 433–550 bytes (audio/video1
+respectively), which is why the fixed-slot reading could not be right.
+
+The offer plist is produced by `AVCMediaStreamNegotiator -createOffer`
+(AVConference.framework). The dictionary contains at least:
+`CallID` (a UUID string), `RemoteEndpointInfo` (a serialized `VCCallInfoBlob`
+protobuf: `setCallID`, `setClientVersion`, `setDeviceType`, `setOsVersion`,
+`setFrameworkVersion`, `setAudioDeviceUID`, `setDeviceName`), plus three keys
+whose CFString constants sit at `__AUTH_CONST,__cfstring`
+`0x1f3529620` (33 chars), `0x1f3529640` (28 chars) and `0x1f3529660` (33 chars)
+in AVConference. Their values are an object from the negotiator settings ivar
+`0x30`, an integer from ivar `0x48`, and the media-stream direction integer.
+The exact constant strings are inside the dyld shared cache's coalesced
+`__cstring` region and were not resolved statically; the Rust offer builder
+uses best-effort names and must be validated against a live server.
+
+The offers are **binary plists** (`NSPropertyListBinaryFormat_v1_0`, format
+`0xc8`), produced by `AVCMediaStreamNegotiator -createOffer` with keys such as
+`CallID` and `RemoteEndpointInfo`. Their lengths are variable and are carried
+by the two-byte fields above.
+
+### Server replies
+
+The server answers over the TCP RFB session with dedicated messages built by
+`EncodeRFBMediaStreamMessage1` / `EncodeRFBMediaStreamAnswer` /
+`EncodeRFBMediaStreamErrorMessage` in screensharingd:
+
+* `Message1` (RFB server message type `0x23`, 35): 68-byte struct with the
+  AVC encoding marker `1010` at `0x1a`, UDP base port at `0x28`, base+1 at
+  `0x2e`, base+2 at `0x34` (audio), and HDR flags at `0x30`/`0x36`
+  (`0x02000000` = HDR). Message type confirmed from the viewer's
+  `_RFBViewerLibCallback` jump table (`0x23` → `handleAVCMediaEncoding:`).
+* `Message2` (answer): answer flags at `0x24`, three BE u16s at
+  `0x28`/`0x2a`/`0x2c`, then the negotiator answer body.
+* Error message: error type/subcode in the `0x1e` word.
+
+The exact TCP record envelope around these replies (the server wraps them via
+`SendOneBufferToViewer` with an 8-byte zero header, u32 length, u16 zero and
+u16 BE length fields) still needs one live-capture pass; the parsers accept
+both the raw 68-byte struct and the 16-byte-wrapped form.
+
+### UDP transport (confirmed)
+
+After `Message1`, the client binds one UDP socket per stream and talks to
+consecutive server ports: video1 = base, video2 = base+1, audio = base+2.
+Packets are RFC 3550 RTP. Payload encryption is SRTP AES-128-CM (RFC 3711):
+each 46-byte negotiated key is 16-byte master key + 14-byte master salt; the
+remaining 16 bytes are unused by AES-128-CM (reserved for the integrity layer).
+Confirmed from `SSUDPSender`/`AVCVideoStream` in ScreensharingAgent and the
+`AuthGetRandomBytes(0x2e)` key generation in the viewer.
+
+### Codec and frame format (confirmed)
+
+AVConference negotiates `rtpmap:123 H264/90000`, `rtpmap:126 X-H264/90000`
+and `rtpmap:100 HEVC/90000`, with `fmtp` carrying `profile-level-id` and
+`packetization-mode`. The RTP payloads are standard H.264 (RFC 6184 FU-A /
+STAP-A) and HEVC (RFC 7798 FU / AP) access units; the server encodes with
+VideoToolbox (`VTCompressionSessionCreate`, HEVC Main444 allowed) and pushes
+IOSurface-backed frames through `AVCVideoStream`. The viewer decodes with
+VideoToolbox in the same framework.
+
+### Control plane (confirmed)
+
+Mouse, keyboard, scroll and clipboard keep flowing over the TCP RFB session
+as ordinary RFB messages; the UDP media path carries only the encoded audio
+and video. `SSFrameBufferAVConferenceView` sends pointer events through the
+RFB connection.
+
+### Rust implementation
+
+`crates/ard-core/src/avc/` implements the negotiation wire format, the
+binary-plist negotiation payload parser, RTP de-packetization, SRTP
+AES-128-CM and the UDP receive path in pure Rust (no unsafe, bounded parsing).
+`crates/ard-viewer/src/media/vt.rs` provides the macOS VideoToolbox decode
+backend feeding the existing RGBA display path.
+
+### Remaining work
+
+* One live session capture to confirm the exact server-reply TCP envelope and
+  the real offer plist byte layout (milestone ④).
+* Windows MFT decode backend.
+* SRTP authentication (HMAC-SHA1) if the negotiated suite requires it.
+
+## Live capture follow-up (2026-08-08)
+
+A real capture run was completed against Screen Sharing 6.1 on macOS 26.6
+build 25G72 using the AVC oracle in
+`crates/ard-core/examples/avc_oracle_server.rs` (cross-compiled to musl and
+run in a Docker container on the `v6net` bridge so macOS accepts the
+connection). Two workflow discoveries made the capture practical:
+
+* **URL credentials bypass the login sheet.** `open "vnc://wei:x@IP:5901"`
+  lets Screen Sharing complete the ARD DH exchange without UI interaction;
+  the oracle accepts any credentials.
+* **The client's DH response is 128 bytes of encrypted credentials plus a
+  129-byte public key.** Reading 128+128 leaves the ClientInit byte
+  misaligned; 128+129 keeps the stream in sync (ClientInit = `0xc1`).
+
+### Confirmed client stream (plain ServerInit)
+
+After `SecurityResult` the native client sends:
+
+```text
+c1                                   ClientInit (shared)
+0a 00 00 01                          session options
+02 00 00 0d [13 encodings]           SetEncodings
+00 [pixel format]                    SetPixelFormat
+02 00 00 0d [13 encodings]           SetEncodings (again)
+03 [incremental=0, 1920x1080]        FramebufferUpdateRequest
+09 ...                               16-byte ARD update-request variant
+```
+
+The 13 encodings are `[1011, 1002, 6, 16, -239, 1104, 1100, -223, 1101,
+1105, 1107, 1109, 1110]` — **1010 (AVC) is never advertised**, and the client
+never sends the `0x1c` media-stream message on a plain RFB session, even when
+the server advertises every command bit in the extended ServerInit.
+
+### Why the stock client never negotiates AVC
+
+`screensharingd`'s `SendFrameBuffer` calls `InitializeUDPVideoStream`
+(which emits the media-stream Message1) and then checks
+`cmpl $0x3f2, 0x8c(%viewer)` — the AVC path requires the viewer's
+`preferredCodec == 1010`, which `HandleSetEncodingsMessage` records from the
+first encoding in the client's `SetEncodings`. The stock Screen Sharing
+profiles never lead with `1010`, so only a client that explicitly advertises
+AVC as its preferred codec (e.g. Remote Desktop Manager's ARD high-performance
+profile) reaches the `0x1c` exchange. The client side also has a
+FramebufferUpdate rectangle handler for encoding `1010` (`cmp w8, #0x3f2` in
+the rectangle dispatcher), which is how the server delivers Message1;
+replicating that rectangle's exact payload is the remaining oracle step.
+
+### Next capture target
+
+Repeat the oracle run with a client that advertises `1010` first (RDM or a
+modified client). The oracle already records the raw `0x1c` offer and binds
+the UDP ports; the remaining unconfirmed bytes are the server-reply TCP
+envelope and the offer plist layout.

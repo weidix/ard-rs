@@ -42,9 +42,19 @@ ard-viewer --quality full 192.168.1.20:5900 username
 # Apple MVS adaptive streaming and GPU tile decoding (the default)
 ard-viewer --quality adaptive 192.168.1.20:5900 username
 
+# macOS high-performance AVC/H.264 or HEVC over UDP/SRTP
+ard-viewer --quality high-performance 192.168.1.20:5900 username
+
 # Optional minimum server update interval; zero is native maximum rate
 ard-viewer --frame-interval-ms 16 192.168.1.20:5900 username
 ```
+
+High-performance mode advertises AVC (`1010`) as the preferred encoding, sends
+the media-stream offer, and decodes the negotiated video with macOS
+VideoToolbox. Keyboard, pointer, clipboard, and session control stay on the
+encrypted TCP RFB channel while video uses the negotiated UDP/RTP stream. On
+non-macOS platforms the setting falls back to adaptive MVS until a native AVC
+decoder backend is available.
 
 After encrypted transport activation, the client requests and decodes one
 non-incremental full-frame baseline, then sends Apple's automatic frame-update
@@ -144,6 +154,9 @@ on a VNC library or a native operating-system library.
   MVS tile/DCT output, viewer-side RGBA upload, mouse/keyboard/IME input, bidirectional
   clipboard synchronization, live FPS/traffic metrics, and
   Metal/D3D12/Vulkan presentation
+- high-performance AVC media mode (`1010`) with binary-plist negotiation,
+  SRTP/AES-CTR, RTP H.264/HEVC depacketization, and macOS VideoToolbox RGBA
+  presentation
 
 Apple MVS (`1011`) is identified as a distinct codec and is never fed to a VNC
 or zlib decoder. Its two bitstreams, Rice/DCT state, per-tile differential

@@ -292,6 +292,10 @@ pub struct SessionRuntime {
     sharp_sampling: bool,
     cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    #[cfg(target_os = "macos")]
+    avc_worker: Option<JoinHandle<()>>,
+    #[cfg(target_os = "macos")]
+    avc_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl std::fmt::Debug for SessionRuntime {
@@ -312,9 +316,22 @@ impl SessionRuntime {
         let worker_mailbox = Arc::clone(&mailbox);
         let worker_frame_wake = Arc::clone(&frame_wake);
         let worker_cancel = Arc::clone(&cancel);
+        #[cfg(target_os = "macos")]
+        let avc_stop = Arc::new(Mutex::new(None));
+        #[cfg(target_os = "macos")]
+        let worker_avc_stop = Arc::clone(&avc_stop);
         let worker = thread::Builder::new()
             .name("ard-session".into())
-            .spawn(move || run_receiver(config, worker_mailbox, worker_frame_wake, worker_cancel))
+            .spawn(move || {
+                run_receiver(
+                    config,
+                    worker_mailbox,
+                    worker_frame_wake,
+                    worker_cancel,
+                    #[cfg(target_os = "macos")]
+                    worker_avc_stop,
+                )
+            })
             .expect("ARD session worker thread should start");
         Self {
             mailbox,
@@ -323,6 +340,10 @@ impl SessionRuntime {
             sharp_sampling,
             cancel,
             worker: Some(worker),
+            #[cfg(target_os = "macos")]
+            avc_worker: None,
+            #[cfg(target_os = "macos")]
+            avc_stop,
         }
     }
 
@@ -356,6 +377,57 @@ impl SessionRuntime {
     pub fn disconnect(&mut self) {
         self.cancel.store(true, Ordering::Release);
         self.worker.take();
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(mut avc_stop) = self.avc_stop.lock()
+                && let Some(stop) = avc_stop.take()
+            {
+                stop.store(true, Ordering::Release);
+            }
+            self.avc_worker.take();
+        }
+    }
+
+    /// Start the AVC media stream video path (encoding 1010) on top of an
+    /// already established RFB session. The negotiated UDP endpoints, the
+    /// video1 server-to-viewer SRTP key and the negotiated codec come from
+    /// `ard_rs::avc`. Frames are decoded with VideoToolbox and pushed into
+    /// the same mailbox as the rectangle/MVS paths.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    pub fn start_avc_media_stream(
+        &mut self,
+        endpoints: ard_rs::avc::MediaUdpEndpoints,
+        key_blob: Vec<u8>,
+        codec: ard_rs::avc::MediaStreamCodec,
+        quality: ArdVideoQuality,
+    ) {
+        use crate::media::spawn_avc_video_pipeline;
+
+        let mailbox = Arc::clone(&self.mailbox);
+        let frame_wake = Arc::clone(&self.frame_wake);
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Ok(mut current) = self.avc_stop.lock() {
+            if let Some(previous) = current.take() {
+                previous.store(true, Ordering::Release);
+            }
+            *current = Some(Arc::clone(&stop));
+        }
+        if let Some(previous) = self.avc_worker.take() {
+            let _ = previous.join();
+        }
+        let handle = spawn_avc_video_pipeline(endpoints, key_blob, codec, stop, move |frame| {
+            if let Ok(mut mailbox) = mailbox.lock() {
+                mailbox.replace_latest(FramePacket::from_rgba(
+                    u16::try_from(frame.width).unwrap_or(u16::MAX),
+                    u16::try_from(frame.height).unwrap_or(u16::MAX),
+                    frame.rgba,
+                    quality,
+                ));
+                frame_wake.notify();
+            }
+        });
+        self.avc_worker = Some(handle);
     }
 }
 
@@ -370,9 +442,20 @@ fn run_receiver(
     mailbox: SharedMailbox,
     frame_wake: Arc<FrameWake>,
     cancel: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")] avc_stop_registry: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 ) {
     let mut reconnecting = false;
     let mut attempts = 0;
+    let requested_quality =
+        if !cfg!(target_os = "macos") && config.quality == ArdVideoQuality::HighPerformance {
+            ArdVideoQuality::Adaptive
+        } else {
+            config.quality
+        };
+    #[cfg(target_os = "macos")]
+    let mut avc_stop: Option<Arc<AtomicBool>> = None;
+    #[cfg(target_os = "macos")]
+    let mut avc_worker: Option<JoinHandle<()>> = None;
     while !cancel.load(Ordering::Acquire) {
         push_event(
             &mailbox,
@@ -390,7 +473,7 @@ fn run_receiver(
             config.username.as_bytes().to_vec(),
             config.password.clone(),
         );
-        client_config.video_quality = config.quality;
+        client_config.video_quality = requested_quality;
         client_config.timeout = Duration::from_secs(2);
         client_config.frame_interval = config.frame_interval;
         let mut client = match ArdClient::connect(client_config) {
@@ -430,11 +513,20 @@ fn run_receiver(
         let mut meter = RateMeter::new();
         loop {
             if cancel.load(Ordering::Acquire) {
+                #[cfg(target_os = "macos")]
+                if let Some(stop) = avc_stop.take() {
+                    stop.store(true, Ordering::Release);
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(worker) = avc_worker.take() {
+                    let _ = worker.join();
+                }
                 return;
             }
             match client.next_event() {
                 Ok(ArdClientEvent::Frame(info)) => {
-                    let gpu_mvs = queue_frame(&mailbox, &frame_wake, &mut client, config.quality);
+                    let gpu_mvs =
+                        queue_frame(&mailbox, &frame_wake, &mut client, requested_quality);
                     let metrics = meter.record(
                         info.framebuffer_updates,
                         info.wire_bytes,
@@ -456,9 +548,85 @@ fn run_receiver(
                 Ok(ArdClientEvent::Clipboard(text)) => {
                     push_event(&mailbox, &frame_wake, SessionEvent::Clipboard(text));
                 }
+                Ok(ArdClientEvent::MediaStream(media)) => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Some(stop) = avc_stop.take() {
+                            stop.store(true, Ordering::Release);
+                        }
+                        if let Some(worker) = avc_worker.take() {
+                            let _ = worker.join();
+                        }
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let pipeline_stop = Arc::clone(&stop);
+                        let pipeline_mailbox = Arc::clone(&mailbox);
+                        let pipeline_wake = Arc::clone(&frame_wake);
+                        let mut media_meter = RateMeter::new();
+                        let handle = crate::media::spawn_avc_video_pipeline(
+                            media.endpoints,
+                            media.key_blob.clone(),
+                            media.codec,
+                            pipeline_stop,
+                            move |frame| {
+                                if let Ok(mut mailbox) = pipeline_mailbox.lock() {
+                                    let width = u16::try_from(frame.width).unwrap_or(u16::MAX);
+                                    let height = u16::try_from(frame.height).unwrap_or(u16::MAX);
+                                    let metrics = media_meter.record(
+                                        1,
+                                        frame.encoded_bytes,
+                                        width,
+                                        height,
+                                        false,
+                                    );
+                                    mailbox.replace_latest(FramePacket::from_rgba(
+                                        width,
+                                        height,
+                                        frame.rgba,
+                                        ArdVideoQuality::HighPerformance,
+                                    ));
+                                    if let Some(metrics) = metrics {
+                                        mailbox.metrics = metrics;
+                                    } else {
+                                        mailbox.metrics.width = width;
+                                        mailbox.metrics.height = height;
+                                        mailbox.metrics.gpu_mvs = false;
+                                    }
+                                    mailbox.metrics_dirty = true;
+                                }
+                                pipeline_wake.notify();
+                            },
+                        );
+                        avc_stop = Some(stop);
+                        avc_worker = Some(handle);
+                        if let Ok(mut registered) = avc_stop_registry.lock() {
+                            *registered = avc_stop.clone();
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = media;
+                        push_event(
+                            &mailbox,
+                            &frame_wake,
+                            SessionEvent::RenderFailed("当前平台没有可用的 AVC 硬件解码器".into()),
+                        );
+                    }
+                }
                 Ok(ArdClientEvent::Bell | ArdClientEvent::StateChange) => {}
                 Ok(ArdClientEvent::Reconnected) => unreachable!("automatic reconnect is disabled"),
                 Err(error) => {
+                    #[cfg(target_os = "macos")]
+                    if let Some(stop) = avc_stop.take() {
+                        stop.store(true, Ordering::Release);
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Some(worker) = avc_worker.take() {
+                        let _ = worker.join();
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Ok(mut registered) = avc_stop_registry.lock() {
+                        registered.take();
+                    }
                     push_event(
                         &mailbox,
                         &frame_wake,

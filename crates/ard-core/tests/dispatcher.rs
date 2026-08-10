@@ -1,3 +1,4 @@
+use ard_rs::avc::{MediaStreamMessage1, MediaStreamServerReply};
 use ard_rs::{
     ArdMessageDispatcher, ArdServerMessage, Decoder, Encoding, Error, Framebuffer, PixelFormat,
     Rectangle,
@@ -70,6 +71,67 @@ fn mvs_rect(width: u16, height: u16) -> (Rectangle, Vec<u8>) {
         },
         white_mvs_rectangle(),
     )
+}
+
+#[test]
+fn dispatcher_routes_avc_bootstrap_without_faking_a_frame() {
+    let message = MediaStreamMessage1 {
+        encoding: 1010,
+        video1_port: 5901,
+        video2_port: None,
+        audio_port: None,
+        video1_hdr: false,
+        video2_hdr: false,
+        stream_count: 1,
+    };
+    let rect = Rectangle {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        encoding: Encoding::ArdAvcMediaStream as i32,
+    };
+    let update = framebuffer_update(&[(rect, message.encode())]);
+    let mut dispatcher = ArdMessageDispatcher::new(1024, 1024).unwrap();
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    let messages = dispatcher
+        .push(&update, &mut decoder, &mut framebuffer)
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(
+        messages.first(),
+        Some(ArdServerMessage::MediaStream(
+            MediaStreamServerReply::Message1(_)
+        ))
+    ));
+}
+
+#[test]
+fn dispatcher_accepts_raw_avc_server_message() {
+    let message = MediaStreamMessage1 {
+        encoding: 1010,
+        video1_port: 5901,
+        video2_port: Some(5902),
+        audio_port: Some(5903),
+        video1_hdr: false,
+        video2_hdr: false,
+        stream_count: 1,
+    };
+    let mut framed = vec![0x23];
+    framed.extend_from_slice(&message.encode());
+    let mut dispatcher = ArdMessageDispatcher::new(1024, 1024).unwrap();
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    let messages = dispatcher
+        .push(&framed, &mut decoder, &mut framebuffer)
+        .unwrap();
+    assert!(matches!(
+        messages.as_slice(),
+        [ArdServerMessage::MediaStream(
+            MediaStreamServerReply::Message1(_)
+        )]
+    ));
 }
 
 #[test]

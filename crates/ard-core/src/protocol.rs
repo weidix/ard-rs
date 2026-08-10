@@ -753,6 +753,9 @@ pub enum Encoding {
     ArdHalftone = 1000,
     ArdGrayscale = 1001,
     ArdThousands = 1002,
+    /// Apple AVC media-stream bootstrap rectangle. The rectangle payload is
+    /// a `RFBMediaStreamMessage1` and the actual video arrives over UDP.
+    ArdAvcMediaStream = 1010,
     ArdMvs = 1011,
     ArdEncryption = 1103,
     DesktopSize = -223,
@@ -769,6 +772,7 @@ impl Encoding {
             1000 => Self::ArdHalftone,
             1001 => Self::ArdGrayscale,
             1002 => Self::ArdThousands,
+            1010 => Self::ArdAvcMediaStream,
             1011 => Self::ArdMvs,
             1103 => Self::ArdEncryption,
             -223 => Self::DesktopSize,
