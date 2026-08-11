@@ -13,18 +13,17 @@ use std::time::{Duration, Instant};
 use crate::{Error, Result};
 
 use super::MAX_RTP_PACKET;
+use super::negotiation::MediaStreamCodec;
 use super::rtp::{AccessUnit, H264Depacketizer, HevcDepacketizer, RtpPacket, RtpReorderBuffer};
-use super::srtp::SrtpContext;
+use super::srtp::{SrtcpContext, SrtpContext};
 use super::wire::MediaStreamMessage1;
 
-const RTCP_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
-/// Native AVC's 22-byte receiver report/keep-alive. The server does not keep
-/// the video RTP stream flowing until it receives this exact packet shape.
-const AVC_RTCP_HEARTBEAT: [u8; 22] = [
-    0x80, 0xc0, 0x00, 0x01, 0xb5, 0xff, 0x00, 0x3e, 0x80, 0x00, 0x00, 0x01, 0xd6, 0x33, 0xcd, 0x7a,
-    0xac, 0x7e, 0x44, 0x4b, 0xd3, 0xd0,
-];
-
+const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+/// Native AVC partitions one desktop frame into four horizontal slices. Each
+/// slice uses an adjacent SSRC with independent SRTP/RTP state, while all four
+/// share one interleaved video decoder reference chain.
+pub const AVC_VIDEO_SLICE_COUNT: usize = 4;
+const MAX_PENDING_ACCESS_UNIT_GROUPS: usize = 64;
 /// Which media stream a UDP socket carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpStreamKind {
@@ -127,19 +126,19 @@ impl MediaUdpSession {
 /// one video stream. Drives `visit` once per completed access unit.
 pub struct AvcVideoStreamReceiver {
     session: MediaUdpSession,
-    srtp: SrtpContext,
-    depacketizer: VideoDepacketizer,
+    streams: Vec<InboundVideoStream>,
+    feedback: Vec<FeedbackStream>,
     expected_payload_type: u8,
-    expected_ssrc: u32,
+    base_remote_ssrc: u32,
     buffer: Vec<u8>,
     decrypted_buffer: Vec<u8>,
-    reorder: RtpReorderBuffer,
-    ready_frames: VecDeque<AccessUnit>,
+    ready_frames: VecDeque<(usize, AccessUnit)>,
+    pending_frames: AccessUnitGroupQueue,
     packets_received: usize,
     decrypted_packets: usize,
     heartbeats_sent: usize,
     frames: usize,
-    last_heartbeat: Instant,
+    last_feedback: Instant,
 }
 
 enum VideoDepacketizer {
@@ -147,42 +146,195 @@ enum VideoDepacketizer {
     Hevc(HevcDepacketizer),
 }
 
+impl VideoDepacketizer {
+    fn new(codec: MediaStreamCodec) -> Self {
+        match codec {
+            MediaStreamCodec::H264 => Self::H264(H264Depacketizer::new()),
+            MediaStreamCodec::Hevc => Self::Hevc(HevcDepacketizer::new_with_donl()),
+        }
+    }
+
+    fn push(&mut self, packet: &RtpPacket<'_>) -> Result<Option<AccessUnit>> {
+        match self {
+            Self::H264(depacketizer) => depacketizer.push(packet),
+            Self::Hevc(depacketizer) => depacketizer.push(packet),
+        }
+    }
+}
+
+struct InboundVideoStream {
+    srtp: SrtpContext,
+    reorder: RtpReorderBuffer,
+    depacketizer: VideoDepacketizer,
+}
+
+impl InboundVideoStream {
+    fn new(key_blob: &[u8], ssrc: u32, codec: MediaStreamCodec) -> Result<Self> {
+        Ok(Self {
+            srtp: SrtpContext::from_key_blob_with_derived_ssrc(key_blob, ssrc)?,
+            reorder: RtpReorderBuffer::with_codec(codec),
+            depacketizer: VideoDepacketizer::new(codec),
+        })
+    }
+
+    fn push_decrypted_packet(&mut self, packet: &[u8]) -> Result<Vec<AccessUnit>> {
+        let ready_packets = self.reorder.push(packet)?;
+        let mut completed = Vec::new();
+        for packet in ready_packets {
+            let packet = RtpPacket::parse(&packet)?;
+            if let Some(unit) = self.depacketizer.push(&packet)? {
+                completed.push(unit);
+            }
+        }
+        Ok(completed)
+    }
+}
+
+struct FeedbackStream {
+    remote_ssrc: u32,
+    srtcp: SrtcpContext,
+}
+
+struct PendingAccessUnitGroup {
+    timestamp: u32,
+    slices: [Option<AccessUnit>; AVC_VIDEO_SLICE_COUNT],
+}
+
+struct AccessUnitGroupQueue {
+    groups: VecDeque<PendingAccessUnitGroup>,
+    last_released_timestamp: Option<u32>,
+}
+
+impl AccessUnitGroupQueue {
+    fn new() -> Self {
+        Self {
+            groups: VecDeque::new(),
+            last_released_timestamp: None,
+        }
+    }
+
+    fn push(&mut self, slice_index: usize, unit: AccessUnit) -> Vec<(usize, AccessUnit)> {
+        if slice_index >= AVC_VIDEO_SLICE_COUNT
+            || self.last_released_timestamp.is_some_and(|last| {
+                unit.timestamp == last || !timestamp_is_newer(unit.timestamp, last)
+            })
+        {
+            return Vec::new();
+        }
+        let position = if let Some(position) = self
+            .groups
+            .iter()
+            .position(|group| group.timestamp == unit.timestamp)
+        {
+            position
+        } else {
+            let position = self
+                .groups
+                .iter()
+                .position(|group| timestamp_is_newer(group.timestamp, unit.timestamp))
+                .unwrap_or(self.groups.len());
+            self.groups.insert(
+                position,
+                PendingAccessUnitGroup {
+                    timestamp: unit.timestamp,
+                    slices: std::array::from_fn(|_| None),
+                },
+            );
+            position
+        };
+        let slot = &mut self.groups[position].slices[slice_index];
+        if slot.is_some() {
+            return Vec::new();
+        }
+        *slot = Some(unit);
+
+        let mut ready = Vec::new();
+        // AVConference schedules completed frames from every interleaved RTP
+        // stream by RTP timestamp, retaining stream-index order for ties. It
+        // does not require all streams to contribute to every timestamp: an
+        // unchanged desktop band is legitimately absent. Keep the newest
+        // timestamp as a small jitter window, but release a complete group
+        // immediately and never discard a sparse group at the queue bound.
+        while self.groups.len() > 1
+            || self
+                .groups
+                .front()
+                .is_some_and(|group| group.slices.iter().all(Option::is_some))
+            || self.groups.len() > MAX_PENDING_ACCESS_UNIT_GROUPS
+        {
+            let group = self
+                .groups
+                .pop_front()
+                .expect("release condition requires a group");
+            self.last_released_timestamp = Some(group.timestamp);
+            ready.extend(
+                group
+                    .slices
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, unit)| unit.map(|unit| (index, unit))),
+            );
+        }
+        ready
+    }
+}
+
+fn timestamp_is_newer(candidate: u32, reference: u32) -> bool {
+    candidate != reference && candidate.wrapping_sub(reference) < 0x8000_0000
+}
+
+/// Borrowed session credentials for one bidirectional AVC media stream.
+pub struct AvcStreamCrypto<'a> {
+    pub server_to_viewer_key_blob: &'a [u8],
+    pub viewer_to_server_key_blob: &'a [u8],
+    pub remote_ssrc: u32,
+    pub local_ssrc: u32,
+}
+
 impl AvcVideoStreamReceiver {
     pub fn new(
         endpoints: &MediaUdpEndpoints,
         kind: UdpStreamKind,
-        key_blob: &[u8],
-        codec: super::negotiation::MediaStreamCodec,
+        crypto: AvcStreamCrypto<'_>,
+        codec: MediaStreamCodec,
         payload_type: u8,
-        remote_ssrc: u32,
     ) -> Result<Self> {
         let session = MediaUdpSession::connect(endpoints, kind)?;
-        let srtp = SrtpContext::from_key_blob_with_derived_ssrc(key_blob, remote_ssrc)?;
-        let depacketizer = match codec {
-            super::negotiation::MediaStreamCodec::H264 => {
-                VideoDepacketizer::H264(H264Depacketizer::new())
-            }
-            super::negotiation::MediaStreamCodec::Hevc => {
-                VideoDepacketizer::Hevc(HevcDepacketizer::new_with_donl())
-            }
-        };
+        let mut streams = Vec::with_capacity(AVC_VIDEO_SLICE_COUNT);
+        let mut feedback = Vec::with_capacity(AVC_VIDEO_SLICE_COUNT);
+        for layer in 0..AVC_VIDEO_SLICE_COUNT as u32 {
+            let remote_ssrc = crypto.remote_ssrc.wrapping_add(layer);
+            let local_ssrc = crypto.local_ssrc.wrapping_add(layer);
+            streams.push(InboundVideoStream::new(
+                crypto.server_to_viewer_key_blob,
+                remote_ssrc,
+                codec,
+            )?);
+            feedback.push(FeedbackStream {
+                remote_ssrc,
+                srtcp: SrtcpContext::from_key_blob_with_sender_ssrc(
+                    crypto.viewer_to_server_key_blob,
+                    local_ssrc,
+                )?,
+            });
+        }
         let mut receiver = Self {
             session,
-            srtp,
-            depacketizer,
+            streams,
+            feedback,
             expected_payload_type: payload_type,
-            expected_ssrc: remote_ssrc,
+            base_remote_ssrc: crypto.remote_ssrc,
             buffer: vec![0u8; MAX_RTP_PACKET],
             decrypted_buffer: Vec::with_capacity(MAX_RTP_PACKET),
-            reorder: RtpReorderBuffer::with_codec(codec),
             ready_frames: VecDeque::new(),
+            pending_frames: AccessUnitGroupQueue::new(),
             packets_received: 0,
             decrypted_packets: 0,
             heartbeats_sent: 0,
             frames: 0,
-            last_heartbeat: Instant::now(),
+            last_feedback: Instant::now(),
         };
-        receiver.send_heartbeat()?;
+        receiver.send_initial_heartbeats()?;
         Ok(receiver)
     }
 
@@ -202,10 +354,10 @@ impl AvcVideoStreamReceiver {
         self.heartbeats_sent
     }
 
-    /// Block on one datagram; returns the decoded access unit when a frame
-    /// completes, or `Ok(None)` for mid-frame packets.
-    pub fn receive(&mut self) -> Result<Option<AccessUnit>> {
-        self.send_heartbeat_if_due()?;
+    /// Block on one datagram; returns the slice index and completed encoded
+    /// access unit, or `Ok(None)` for a mid-frame packet.
+    pub fn receive(&mut self) -> Result<Option<(usize, AccessUnit)>> {
+        self.send_feedback_if_due()?;
         if let Some(frame) = self.ready_frames.pop_front() {
             return Ok(Some(frame));
         }
@@ -215,7 +367,6 @@ impl AvcVideoStreamReceiver {
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut =>
             {
-                self.send_heartbeat()?;
                 return Ok(None);
             }
             Err(_) => return Err(Error::Invalid("RTP receive failed")),
@@ -241,11 +392,11 @@ impl AvcVideoStreamReceiver {
                 encrypted_packet.header.ssrc,
             )
         };
-        // The host emits adjacent SSRCs for auxiliary/sub-stream layers on
-        // the same UDP endpoint. The negotiated answer identifies the base
-        // stream; mixing their independent sequence spaces breaks replay and
-        // RTP reordering state.
-        if ssrc != self.expected_ssrc {
+        // Native AVC advertises one base SSRC but sends four adjacent vertical
+        // desktop slices, each with independent sequence/replay state and a
+        // matching local feedback SSRC.
+        let stream_index = ssrc.wrapping_sub(self.base_remote_ssrc) as usize;
+        if stream_index >= self.streams.len() {
             return Ok(None);
         }
         self.packets_received += 1;
@@ -255,44 +406,49 @@ impl AvcVideoStreamReceiver {
         self.decrypted_buffer.clear();
         self.decrypted_buffer
             .extend_from_slice(&self.buffer[..body_len]);
-        self.srtp.decrypt_authenticated_rtp_packet_in_place(
+        let stream = &mut self.streams[stream_index];
+        stream.srtp.decrypt_authenticated_rtp_packet_in_place(
             &mut self.decrypted_buffer,
             &authentication_tag,
             sequence,
             payload_offset,
         )?;
         self.decrypted_packets += 1;
-        let ready_packets = self.reorder.push(&self.decrypted_buffer)?;
-        let mut frame = None;
-        for packet in ready_packets {
-            let packet = RtpPacket::parse(&packet)?;
-            let completed = match &mut self.depacketizer {
-                VideoDepacketizer::H264(depacketizer) => depacketizer.push(&packet)?,
-                VideoDepacketizer::Hevc(depacketizer) => depacketizer.push(&packet)?,
-            };
-            if let Some(completed) = completed {
-                self.frames += 1;
-                if frame.is_none() {
-                    frame = Some(completed);
-                } else {
-                    self.ready_frames.push_back(completed);
-                }
-            }
+        let completed = stream.push_decrypted_packet(&self.decrypted_buffer)?;
+        for completed in completed {
+            self.frames += 1;
+            self.ready_frames
+                .extend(self.pending_frames.push(stream_index, completed));
         }
-        Ok(frame)
+        Ok(self.ready_frames.pop_front())
     }
 
-    fn send_heartbeat_if_due(&mut self) -> Result<()> {
-        if self.last_heartbeat.elapsed() >= RTCP_HEARTBEAT_INTERVAL {
-            self.send_heartbeat()?;
+    fn send_feedback_if_due(&mut self) -> Result<()> {
+        if self.last_feedback.elapsed() >= RTCP_REPORT_INTERVAL {
+            self.send_receiver_reports()?;
         }
         Ok(())
     }
 
-    fn send_heartbeat(&mut self) -> Result<()> {
-        self.session.send(&AVC_RTCP_HEARTBEAT).map_err(io_error)?;
-        self.heartbeats_sent += 1;
-        self.last_heartbeat = Instant::now();
+    fn send_initial_heartbeats(&mut self) -> Result<()> {
+        for feedback in &mut self.feedback {
+            let heartbeat = feedback.srtcp.protect_heartbeat()?;
+            self.session.send(&heartbeat).map_err(io_error)?;
+            self.heartbeats_sent += 1;
+        }
+        self.last_feedback = Instant::now();
+        Ok(())
+    }
+
+    fn send_receiver_reports(&mut self) -> Result<()> {
+        for feedback in &mut self.feedback {
+            let report = feedback
+                .srtcp
+                .protect_receiver_report(feedback.remote_ssrc)?;
+            self.session.send(&report).map_err(io_error)?;
+            self.heartbeats_sent += 1;
+        }
+        self.last_feedback = Instant::now();
         Ok(())
     }
 }
@@ -311,7 +467,8 @@ fn io_error(error: std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::is_rtcp;
+    use super::{AVC_VIDEO_SLICE_COUNT, AccessUnitGroupQueue, is_rtcp};
+    use crate::media_stream::AccessUnit;
 
     #[test]
     fn distinguishes_rtcp_from_rtp() {
@@ -322,8 +479,56 @@ mod tests {
     }
 
     #[test]
-    fn native_heartbeat_has_the_expected_wire_length() {
-        assert_eq!(super::AVC_RTCP_HEARTBEAT.len(), 22);
-        assert!(is_rtcp(&super::AVC_RTCP_HEARTBEAT));
+    fn native_desktop_uses_four_video_slices() {
+        assert_eq!(AVC_VIDEO_SLICE_COUNT, 4);
+    }
+
+    fn unit(timestamp: u32, value: u8) -> AccessUnit {
+        AccessUnit {
+            timestamp,
+            nal_units: vec![vec![value]],
+        }
+    }
+
+    #[test]
+    fn completed_slices_are_released_in_reference_chain_order() {
+        let mut queue = AccessUnitGroupQueue::new();
+        assert!(queue.push(3, unit(100, 3)).is_empty());
+        assert!(queue.push(0, unit(100, 0)).is_empty());
+        assert!(queue.push(2, unit(100, 2)).is_empty());
+        let ready = queue.push(1, unit(100, 1));
+        assert_eq!(
+            ready
+                .iter()
+                .map(|(index, unit)| (*index, unit.nal_units[0][0]))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn newer_timestamp_releases_sparse_older_group_in_stream_order() {
+        let mut queue = AccessUnitGroupQueue::new();
+        assert!(queue.push(0, unit(100, 0)).is_empty());
+        assert!(queue.push(2, unit(100, 2)).is_empty());
+        let ready = queue.push(1, unit(200, 1));
+        assert_eq!(
+            ready
+                .iter()
+                .map(|(index, unit)| (*index, unit.timestamp))
+                .collect::<Vec<_>>(),
+            vec![(0, 100), (2, 100)]
+        );
+    }
+
+    #[test]
+    fn complete_newest_group_is_released_without_waiting_for_next_timestamp() {
+        let mut queue = AccessUnitGroupQueue::new();
+        for index in 0..AVC_VIDEO_SLICE_COUNT - 1 {
+            assert!(queue.push(index, unit(100, index as u8)).is_empty());
+        }
+        let ready = queue.push(AVC_VIDEO_SLICE_COUNT - 1, unit(100, 3));
+        assert_eq!(ready.len(), AVC_VIDEO_SLICE_COUNT);
+        assert!(ready.iter().all(|(_, unit)| unit.timestamp == 100));
     }
 }

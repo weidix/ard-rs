@@ -181,6 +181,10 @@ impl<'a> RtpPacket<'a> {
 pub(crate) struct RtpReorderBuffer {
     packets: Vec<Vec<u8>>,
     last_released_sequence: Option<u16>,
+    /// Last released packet when the current access unit crossed the bounded
+    /// reorder window. The following burst may legitimately begin with a FU
+    /// continuation rather than a new NAL start.
+    continuation: Option<(u16, u32)>,
     codec: MediaStreamCodec,
     marker_pending: bool,
 }
@@ -190,6 +194,7 @@ impl RtpReorderBuffer {
         Self {
             packets: Vec::with_capacity(MAX_RTP_REORDER_PACKETS),
             last_released_sequence: None,
+            continuation: None,
             codec,
             marker_pending: false,
         }
@@ -252,7 +257,12 @@ impl RtpReorderBuffer {
         else {
             return false;
         };
-        if first.header.timestamp != marker_timestamp || !packet_can_start_nal(&first, self.codec) {
+        let resumes_released_fragment = self.continuation.is_some_and(|(sequence, timestamp)| {
+            first.header.sequence == sequence.wrapping_add(1) && first.header.timestamp == timestamp
+        });
+        if first.header.timestamp != marker_timestamp
+            || (!resumes_released_fragment && !packet_can_start_nal(&first, self.codec))
+        {
             return false;
         }
         self.packets.windows(2).all(|packets| {
@@ -280,11 +290,14 @@ impl RtpReorderBuffer {
                 .sequence;
             sequence_order(left_sequence, right_sequence)
         });
-        self.last_released_sequence = self.packets.last().and_then(|packet| {
-            RtpPacket::parse(packet)
-                .ok()
-                .map(|packet| packet.header.sequence)
-        });
+        let last = self
+            .packets
+            .last()
+            .and_then(|packet| RtpPacket::parse(packet).ok())
+            .map(|packet| packet.header);
+        self.last_released_sequence = last.map(|header| header.sequence);
+        self.continuation =
+            last.and_then(|header| (!header.marker).then_some((header.sequence, header.timestamp)));
         self.marker_pending = false;
         std::mem::take(&mut self.packets)
     }
@@ -526,7 +539,12 @@ impl H264Depacketizer {
                     self.assembler.reset();
                 }
                 self.fragment = None;
-                self.assembler.push(ts, vec![payload.to_vec()], marker)?
+                // Apple also sends an `avc1` sample entry containing `avcC`
+                // as a standalone RTP unit immediately before the IDR. Its
+                // first byte is not a usable NAL header, so extract SPS/PPS
+                // here just as we do for the first STAP-B aggregate item.
+                let units = avcc_parameter_sets(payload).unwrap_or_else(|| vec![payload.to_vec()]);
+                self.assembler.push(ts, units, marker)?
             }
             28 | 29 => {
                 // FU-A / FU-B.
@@ -960,6 +978,36 @@ mod tests {
     }
 
     #[test]
+    fn releases_hevc_fu_larger_than_reorder_window() {
+        let mut reorder = RtpReorderBuffer::with_codec(MediaStreamCodec::Hevc);
+        let mut depacketizer = HevcDepacketizer::new();
+        let mut completed = None;
+
+        for index in 0..70u16 {
+            let start = index == 0;
+            let end = index == 69;
+            let fu_header = 1 | if start { 0x80 } else { 0 } | if end { 0x40 } else { 0 };
+            let datagram = rtp(
+                1000 + index,
+                9000,
+                end,
+                &[0x62, 0x01, fu_header, index as u8],
+            );
+            for ready in reorder.push(&datagram).expect("reorder") {
+                completed = depacketizer
+                    .push(&RtpPacket::parse(&ready).expect("packet"))
+                    .expect("depacketize")
+                    .or(completed);
+            }
+        }
+
+        let frame = completed.expect("large fragmented frame completes");
+        assert_eq!(frame.nal_units.len(), 1);
+        assert_eq!(frame.nal_units[0].len(), 72);
+        assert_eq!(&frame.nal_units[0][2..], &(0..70u8).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn reassembles_h264_fu_a() {
         let nal = [0x65, 0x88, 0x84, 0x21, 0x22, 0x33, 0x44];
         // FU-A: type 28, start of first part.
@@ -1100,5 +1148,39 @@ mod tests {
             vec![sps.to_vec(), pps.to_vec(), idr.to_vec()]
         );
         assert!(frame.is_idr());
+    }
+
+    #[test]
+    fn standalone_apple_avc1_entry_extracts_parameter_sets_before_idr() {
+        let sps = [0x67, 0x64, 0x00, 0x34];
+        let pps = [0x68, 0xee, 0x3c, 0xb0];
+        let mut sample_entry = vec![0x92, 0xe6, 0xc0, 0xa3];
+        let avcc_size = 8 + 6 + 2 + sps.len() + 1 + 2 + pps.len();
+        sample_entry.extend_from_slice(&(avcc_size as u32).to_be_bytes());
+        sample_entry.extend_from_slice(b"avcC");
+        sample_entry.extend_from_slice(&[1, 100, 0, 52, 0xff, 0xe1]);
+        sample_entry.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        sample_entry.extend_from_slice(&sps);
+        sample_entry.push(1);
+        sample_entry.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        sample_entry.extend_from_slice(&pps);
+
+        let first = rtp(10, 700, false, &sample_entry);
+        let idr = rtp(11, 700, true, &[0x65, 0xaa, 0xbb]);
+        let mut depacketizer = H264Depacketizer::new();
+        assert!(
+            depacketizer
+                .push(&RtpPacket::parse(&first).expect("sample entry"))
+                .unwrap()
+                .is_none()
+        );
+        let unit = depacketizer
+            .push(&RtpPacket::parse(&idr).expect("IDR"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unit.nal_units,
+            vec![sps.to_vec(), pps.to_vec(), vec![0x65, 0xaa, 0xbb]]
+        );
     }
 }

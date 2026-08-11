@@ -11,7 +11,7 @@ pub mod vt;
 pub mod pipeline;
 
 #[cfg(target_os = "macos")]
-pub use pipeline::{spawn_avc_video_pipeline, spawn_avc_video_pipeline_with_config};
+pub use pipeline::spawn_avc_video_pipeline;
 
 /// A decoded frame ready for the viewer's RGBA display path.
 #[derive(Debug, Clone)]

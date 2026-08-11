@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::i18n::Language;
 use ard_rs::{
-    ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdKey, ArdNamedKey,
-    ArdScrollWheelEvent, ArdVideoQuality, Framebuffer, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate,
-    keysym_for_key,
+    ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdDisplayConfiguration, ArdKey,
+    ArdNamedKey, ArdScrollWheelEvent, ArdVideoQuality, Framebuffer, MvsGpuFrame, MvsGpuTile,
+    MvsGpuTileUpdate, keysym_for_key,
 };
 use iced::futures::StreamExt;
 use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -36,6 +36,7 @@ pub struct SessionConfig {
     pub username: String,
     pub password: Vec<u8>,
     pub quality: ArdVideoQuality,
+    pub display_configuration: Option<ArdDisplayConfiguration>,
     pub frame_interval: Duration,
     pub should_interpolate: bool,
     pub sharp_sampling: bool,
@@ -397,12 +398,9 @@ impl SessionRuntime {
     #[allow(dead_code)]
     pub fn start_avc_media_stream(
         &mut self,
-        endpoints: ard_rs::media_stream::MediaUdpEndpoints,
-        key_blob: Vec<u8>,
-        codec: ard_rs::media_stream::MediaStreamCodec,
-        payload_type: u8,
-        remote_ssrc: u32,
+        media: ard_rs::ArdMediaStream,
         quality: ArdVideoQuality,
+        target_dimensions: (u32, u32),
     ) {
         use crate::media::spawn_avc_video_pipeline;
 
@@ -418,25 +416,17 @@ impl SessionRuntime {
         if let Some(previous) = self.avc_worker.take() {
             let _ = previous.join();
         }
-        let handle = spawn_avc_video_pipeline(
-            endpoints,
-            key_blob,
-            codec,
-            payload_type,
-            remote_ssrc,
-            stop,
-            move |frame| {
-                if let Ok(mut mailbox) = mailbox.lock() {
-                    mailbox.replace_latest(FramePacket::from_rgba(
-                        u16::try_from(frame.width).unwrap_or(u16::MAX),
-                        u16::try_from(frame.height).unwrap_or(u16::MAX),
-                        frame.rgba,
-                        quality,
-                    ));
-                    frame_wake.notify();
-                }
-            },
-        );
+        let handle = spawn_avc_video_pipeline(media, target_dimensions, stop, move |frame| {
+            if let Ok(mut mailbox) = mailbox.lock() {
+                mailbox.replace_latest(FramePacket::from_rgba(
+                    u16::try_from(frame.width).unwrap_or(u16::MAX),
+                    u16::try_from(frame.height).unwrap_or(u16::MAX),
+                    frame.rgba,
+                    quality,
+                ));
+                frame_wake.notify();
+            }
+        });
         self.avc_worker = Some(handle);
     }
 }
@@ -483,6 +473,7 @@ fn run_receiver(
             config.password.clone(),
         );
         client_config.video_quality = requested_quality;
+        client_config.display_configuration = config.display_configuration.clone();
         client_config.timeout = Duration::from_secs(2);
         client_config.frame_interval = config.frame_interval;
         let mut client = match ArdClient::connect(client_config) {
@@ -560,8 +551,6 @@ fn run_receiver(
                 Ok(ArdClientEvent::MediaStream(media)) => {
                     #[cfg(target_os = "macos")]
                     {
-                        let (endpoints, key_blob, codec_config, remote_ssrc) =
-                            media.into_video_pipeline_parts_with_config();
                         if let Some(stop) = avc_stop.take() {
                             stop.store(true, Ordering::Release);
                         }
@@ -572,12 +561,14 @@ fn run_receiver(
                         let pipeline_stop = Arc::clone(&stop);
                         let pipeline_mailbox = Arc::clone(&mailbox);
                         let pipeline_wake = Arc::clone(&frame_wake);
+                        let target_dimensions = (
+                            u32::from(client.framebuffer().width()),
+                            u32::from(client.framebuffer().height()),
+                        );
                         let mut media_meter = RateMeter::new();
-                        let handle = crate::media::spawn_avc_video_pipeline_with_config(
-                            endpoints,
-                            key_blob,
-                            codec_config,
-                            remote_ssrc,
+                        let handle = crate::media::spawn_avc_video_pipeline(
+                            media,
+                            target_dimensions,
                             pipeline_stop,
                             move |frame| {
                                 if let Ok(mut mailbox) = pipeline_mailbox.lock() {

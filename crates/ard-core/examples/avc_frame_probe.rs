@@ -6,7 +6,7 @@ use std::io::{self, BufRead};
 use std::time::{Duration, Instant};
 
 use ard_rs::media_stream::UdpStreamKind;
-use ard_rs::media_stream::udp::AvcVideoStreamReceiver;
+use ard_rs::media_stream::udp::{AvcStreamCrypto, AvcVideoStreamReceiver};
 use ard_rs::{ArdClient, ArdClientConfig, ArdClientEvent, ArdVideoQuality};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -48,21 +48,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         match client.next_event()? {
             ArdClientEvent::MediaStream(media) => {
                 println!("negotiated: {media:?}");
-                let (endpoints, mut key_blob, codec, payload_type, remote_ssrc) =
-                    media.into_video_pipeline_parts();
-                let mut receiver = AvcVideoStreamReceiver::new(
-                    &endpoints,
-                    UdpStreamKind::Video1,
-                    &key_blob,
+                let (
+                    endpoints,
+                    mut key_blob,
+                    mut feedback_key_blob,
                     codec,
                     payload_type,
                     remote_ssrc,
+                    local_ssrc,
+                ) = media.into_video_pipeline_parts();
+                let mut receiver = AvcVideoStreamReceiver::new(
+                    &endpoints,
+                    UdpStreamKind::Video1,
+                    AvcStreamCrypto {
+                        server_to_viewer_key_blob: &key_blob,
+                        viewer_to_server_key_blob: &feedback_key_blob,
+                        remote_ssrc,
+                        local_ssrc,
+                    },
+                    codec,
+                    payload_type,
                 )?;
                 key_blob.fill(0);
+                feedback_key_blob.fill(0);
                 let mut receive_errors = 0_usize;
                 while Instant::now() < deadline {
                     match receiver.receive() {
-                        Ok(Some(unit)) => {
+                        Ok(Some((slice_index, unit))) => {
                             let nal_types: Vec<_> = unit
                                 .nal_units
                                 .iter()
@@ -76,7 +88,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 })
                                 .collect();
                             println!(
-                                "frame: codec={codec:?} nal_units={} types={nal_types:?} bytes={} packets={} decrypted={} heartbeats={} receive_errors={receive_errors}",
+                                "frame: codec={codec:?} slice={slice_index} nal_units={} types={nal_types:?} bytes={} packets={} decrypted={} heartbeats={} receive_errors={receive_errors}",
                                 unit.nal_units.len(),
                                 unit.avcc_len(),
                                 receiver.packets_received(),

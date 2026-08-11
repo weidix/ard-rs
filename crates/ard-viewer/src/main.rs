@@ -17,7 +17,10 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use ard_input_hook::{HookConfig, HookEvent};
-use ard_rs::{ArdVideoQuality, XK_CONTROL_LEFT, XK_F1, XK_META_LEFT, XK_SHIFT_LEFT, XK_TAB, XK_UP};
+use ard_rs::{
+    ArdDisplayConfiguration, ArdVideoQuality, ArdVirtualDisplay, XK_CONTROL_LEFT, XK_F1,
+    XK_META_LEFT, XK_SHIFT_LEFT, XK_TAB, XK_UP,
+};
 use iced::widget::{column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, Subscription, Task, Theme, window};
 
@@ -58,6 +61,7 @@ struct ArdViewer {
     remember_password: bool,
     remember_device: bool,
     quality: ArdVideoQuality,
+    resolution: String,
     open_dropdown: Option<DropdownMenu>,
     frame_rate: String,
     should_interpolate: bool,
@@ -153,6 +157,7 @@ enum Message {
     ToggleDropdown(DropdownMenu),
     CloseDropdown,
     QualityChanged(ArdVideoQuality),
+    ResolutionChanged(String),
     FrameRateChanged(String),
     ShouldInterpolateChanged(bool),
     SharpSamplingChanged(bool),
@@ -237,6 +242,7 @@ impl ArdViewer {
             remember_password: cached.remember_password,
             remember_device: cached.remember_device,
             quality: config::quality_from_cache(&cached.quality),
+            resolution: cached.resolution.clone(),
             open_dropdown: None,
             frame_rate: if cached.frame_rate.is_empty() {
                 frame_rate_from_interval(&cached.frame_interval_ms)
@@ -554,6 +560,16 @@ impl ArdViewer {
                 self.open_dropdown = None;
                 self.persist_config();
             }
+            Message::ResolutionChanged(value) => {
+                self.resolution = value
+                    .chars()
+                    .filter(|character| {
+                        character.is_ascii_digit() || matches!(character, 'x' | 'X' | ',' | ' ')
+                    })
+                    .take(48)
+                    .collect();
+                self.persist_config();
+            }
             Message::FrameRateChanged(value) => {
                 let value: String = value.chars().filter(char::is_ascii_digit).take(3).collect();
                 self.frame_rate = value.parse::<u16>().map_or(value.clone(), |rate| {
@@ -662,6 +678,11 @@ impl ArdViewer {
                     self.status = self.language.tr("请输入设备地址和用户名").into();
                 } else if self.remote_endpoint().is_err() {
                     self.status = self.language.tr("请输入有效端口（1–65535）").into();
+                } else if parse_display_configuration(&self.resolution).is_err() {
+                    self.status = self
+                        .language
+                        .tr("请输入有效分辨率，例如 2560x1440 或 2560x1440,1920x1080")
+                        .into();
                 } else if self.password.is_empty() && !self.has_saved_password {
                     self.status = self.language.tr("请输入密码").into();
                 } else {
@@ -1100,6 +1121,7 @@ impl ArdViewer {
             remember_password: self.remember_password,
             remember_device: self.remember_device,
             quality: config::quality_to_cache(self.quality).into(),
+            resolution: self.resolution.clone(),
             frame_rate: self.frame_rate.clone(),
             frame_interval_ms: frame_interval_from_rate(&self.frame_rate).to_string(),
             should_interpolate: self.should_interpolate,
@@ -1214,6 +1236,8 @@ impl ArdViewer {
             username: self.username.trim().to_owned(),
             password: password.into_bytes(),
             quality: self.quality,
+            display_configuration: parse_display_configuration(&self.resolution)
+                .expect("resolution validated before starting a session"),
             frame_interval: frame_duration_from_rate(&self.frame_rate),
             should_interpolate: self.should_interpolate,
             sharp_sampling: self.sharp_sampling,
@@ -1560,6 +1584,35 @@ fn frame_interval_from_rate(value: &str) -> u64 {
         0 => 0,
         frames_per_second => (1000 / frames_per_second).max(1),
     }
+}
+
+fn parse_display_configuration(value: &str) -> Result<Option<ArdDisplayConfiguration>, ()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let displays: Result<Vec<_>, ()> = value
+        .split(',')
+        .enumerate()
+        .map(|(index, dimensions)| {
+            let (width, height) = dimensions.trim().split_once(['x', 'X']).ok_or(())?;
+            let width = width.trim().parse::<u32>().map_err(|_| ())?;
+            let height = height.trim().parse::<u32>().map_err(|_| ())?;
+            if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+                return Err(());
+            }
+            Ok(ArdVirtualDisplay::named(
+                width,
+                height,
+                format!("ARD Display {}", index + 1),
+            ))
+        })
+        .collect();
+    let displays = displays?;
+    if displays.is_empty() || displays.len() > ArdDisplayConfiguration::MAX_DISPLAYS {
+        return Err(());
+    }
+    Ok(Some(ArdDisplayConfiguration { displays }))
 }
 
 fn frame_duration_from_rate(value: &str) -> Duration {
@@ -1975,6 +2028,21 @@ mod tests {
         );
         assert_eq!(frame_rate_from_interval("0"), "");
         assert_eq!(frame_rate_from_interval("16"), "63");
+    }
+
+    #[test]
+    fn resolution_configuration_is_explicit_and_supports_two_displays() {
+        assert_eq!(parse_display_configuration(""), Ok(None));
+        let configuration = parse_display_configuration("2560x1440, 1920X1080")
+            .expect("valid resolution syntax")
+            .expect("configured displays");
+        assert_eq!(configuration.displays.len(), 2);
+        assert_eq!(configuration.displays[0].width, 2560);
+        assert_eq!(configuration.displays[0].height, 1440);
+        assert_eq!(configuration.displays[1].width, 1920);
+        assert_eq!(configuration.displays[1].height, 1080);
+        assert!(parse_display_configuration("dynamic").is_err());
+        assert!(parse_display_configuration("1920x1080,1280x720,800x600").is_err());
     }
 
     #[test]

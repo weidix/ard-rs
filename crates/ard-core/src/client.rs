@@ -15,10 +15,11 @@ use crate::media_stream::{
     build_media_stream_offer_with_ssrc_and_codec, build_remote_endpoint_info,
 };
 use crate::{
-    ArdEncryptionControl, ArdMessageDispatcher, ArdScrollWheelEvent, ArdServerMessage,
-    ArdVerifiedRecordStream, ArdViewerInformation, Decoder, Framebuffer, FramebufferFormat,
-    PixelFormat, ProtocolVersion, SecurityType, build_ard_auto_frame_update,
-    build_ard_encryption_activation, build_ard_scroll_wheel_event, build_ard_set_encryption_level,
+    ArdDisplayConfiguration, ArdEncryptionControl, ArdMessageDispatcher, ArdScrollWheelEvent,
+    ArdServerMessage, ArdVerifiedRecordStream, ArdViewerInformation, Decoder, Framebuffer,
+    FramebufferFormat, PixelFormat, ProtocolVersion, SecurityType, build_ard_auto_frame_update,
+    build_ard_encryption_activation, build_ard_scroll_wheel_event,
+    build_ard_set_display_configuration, build_ard_set_encryption_level,
     build_ard_type30_client_exchange, build_client_cut_text, build_framebuffer_update_request,
     build_key_event, build_pointer_event, build_set_encodings, build_set_pixel_format,
     parse_ard_auth_challenge, parse_framebuffer_update, parse_security_types, parse_server_init,
@@ -168,6 +169,9 @@ pub struct ArdClientConfig {
     pub password: Vec<u8>,
     pub timeout: Duration,
     pub video_quality: ArdVideoQuality,
+    /// Optional fixed virtual-display layout requested from the server.
+    /// `None` keeps the server's existing physical display layout.
+    pub display_configuration: Option<ArdDisplayConfiguration>,
     /// RFB pixel layout requested from the server and retained by the core.
     pub output_format: ArdFrameOutput,
     /// Use Apple's server-driven update stream instead of serial
@@ -188,6 +192,7 @@ impl fmt::Debug for ArdClientConfig {
             .field("password", &"<redacted>")
             .field("timeout", &self.timeout)
             .field("video_quality", &self.video_quality)
+            .field("display_configuration", &self.display_configuration)
             .field("output_format", &self.output_format)
             .field("automatic_updates", &self.automatic_updates)
             .field("frame_interval", &self.frame_interval)
@@ -208,6 +213,7 @@ impl ArdClientConfig {
             password: password.into(),
             timeout: Duration::from_secs(20),
             video_quality: ArdVideoQuality::Adaptive,
+            display_configuration: None,
             output_format: ArdFrameOutput::ServerNative,
             automatic_updates: true,
             frame_interval: Duration::ZERO,
@@ -289,13 +295,18 @@ pub enum ArdClientEvent {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ArdMediaStream {
     pub endpoints: MediaUdpEndpoints,
+    /// Server-to-viewer SRTP master key and salt.
     pub key_blob: Vec<u8>,
+    /// Viewer-to-server SRTCP master key and salt used for feedback.
+    pub feedback_key_blob: Vec<u8>,
     pub codec: MediaStreamCodec,
     pub payload_type: u8,
     pub codec_config: VideoCodecConfig,
     /// The server's negotiated video SSRC from the answer. Cipher suite 5
     /// uses it when constructing the SRTP counter block.
     pub derived_ssrc: u32,
+    /// The viewer SSRC advertised in the offer and used by outbound SRTCP.
+    pub local_ssrc: u32,
 }
 
 impl ArdMediaStream {
@@ -304,14 +315,25 @@ impl ArdMediaStream {
     /// event does not leave a second live copy while the worker is starting.
     pub fn into_video_pipeline_parts(
         mut self,
-    ) -> (MediaUdpEndpoints, Vec<u8>, MediaStreamCodec, u8, u32) {
+    ) -> (
+        MediaUdpEndpoints,
+        Vec<u8>,
+        Vec<u8>,
+        MediaStreamCodec,
+        u8,
+        u32,
+        u32,
+    ) {
         let key_blob = core::mem::take(&mut self.key_blob);
+        let feedback_key_blob = core::mem::take(&mut self.feedback_key_blob);
         (
             self.endpoints,
             key_blob,
+            feedback_key_blob,
             self.codec,
             self.payload_type,
             self.derived_ssrc,
+            self.local_ssrc,
         )
     }
 
@@ -321,16 +343,32 @@ impl ArdMediaStream {
     /// packet bytes.
     pub fn into_video_pipeline_parts_with_config(
         mut self,
-    ) -> (MediaUdpEndpoints, Vec<u8>, VideoCodecConfig, u32) {
+    ) -> (
+        MediaUdpEndpoints,
+        Vec<u8>,
+        Vec<u8>,
+        VideoCodecConfig,
+        u32,
+        u32,
+    ) {
         let key_blob = core::mem::take(&mut self.key_blob);
+        let feedback_key_blob = core::mem::take(&mut self.feedback_key_blob);
         let codec_config = core::mem::take(&mut self.codec_config);
-        (self.endpoints, key_blob, codec_config, self.derived_ssrc)
+        (
+            self.endpoints,
+            key_blob,
+            feedback_key_blob,
+            codec_config,
+            self.derived_ssrc,
+            self.local_ssrc,
+        )
     }
 }
 
 impl Drop for ArdMediaStream {
     fn drop(&mut self) {
         self.key_blob.fill(0);
+        self.feedback_key_blob.fill(0);
     }
 }
 
@@ -340,10 +378,12 @@ impl fmt::Debug for ArdMediaStream {
             .debug_struct("ArdMediaStream")
             .field("endpoints", &self.endpoints)
             .field("key_blob_len", &self.key_blob.len())
+            .field("feedback_key_blob_len", &self.feedback_key_blob.len())
             .field("codec", &self.codec)
             .field("payload_type", &self.payload_type)
             .field("codec_config", &self.codec_config)
             .field("derived_ssrc", &self.derived_ssrc)
+            .field("local_ssrc", &self.local_ssrc)
             .finish()
     }
 }
@@ -530,11 +570,14 @@ pub struct ArdClient {
 struct PendingMediaStream {
     endpoints: MediaUdpEndpoints,
     video1_server_to_viewer: Vec<u8>,
+    video1_viewer_to_server: Vec<u8>,
+    video1_local_ssrc: u32,
 }
 
 impl Drop for PendingMediaStream {
     fn drop(&mut self) {
         self.video1_server_to_viewer.fill(0);
+        self.video1_viewer_to_server.fill(0);
     }
 }
 
@@ -673,6 +716,16 @@ impl ArdClient {
             .extension
             .as_ref()
             .is_some_and(|extension| extension.supports_command(0x17));
+        let supports_display_configuration = server_init
+            .extension
+            .as_ref()
+            .is_some_and(|extension| extension.supports_command(0x1d));
+        if config.display_configuration.is_some() && !supports_display_configuration {
+            authentication_value.fill(0);
+            return Err(ArdClientError::Message(
+                "server does not advertise display configuration support".to_owned(),
+            ));
+        }
         let requested_pixel_format = config.output_format.pixel_format(server_init.pixel_format);
         let (mut decoder, mut framebuffer) = if config.video_quality == ArdVideoQuality::Adaptive
             || config.video_quality.is_high_performance()
@@ -734,6 +787,11 @@ impl ArdClient {
         } else {
             0
         };
+        if let Some(configuration) = &config.display_configuration {
+            let request = build_ard_set_display_configuration(configuration)?;
+            stream.write_all(&encoder.encode_wire(&request)?)?;
+            stream.flush()?;
+        }
         // Apple's view startup always requests one non-incremental frame.
         // That frame establishes MVS copy/cache state before type 9 enables
         // the server-driven incremental stream.
@@ -901,6 +959,7 @@ impl ArdClient {
                     keys,
                 };
                 let video1_key_blob = video1_server_to_viewer.to_vec();
+                let video1_feedback_key_blob = video1_viewer_to_server.to_vec();
                 let offer = configuration.encode()?;
                 debug_assert_eq!(offer[0], CLIENT_MEDIA_STREAM_MESSAGE_TYPE);
                 self.input.send_payload(offer)?;
@@ -915,6 +974,8 @@ impl ArdClient {
                 self.pending_media_stream = Some(PendingMediaStream {
                     endpoints: MediaUdpEndpoints::from_message1(self.media_host, &message),
                     video1_server_to_viewer: video1_key_blob,
+                    video1_viewer_to_server: video1_feedback_key_blob,
+                    video1_local_ssrc: video1_derived_ssrc,
                 });
                 if self.automatic_updates && !self.automatic_updates_started {
                     let request = build_ard_auto_frame_update(
@@ -994,13 +1055,16 @@ impl ArdClient {
                     )
                 })?;
                 let key_blob = core::mem::take(&mut pending.video1_server_to_viewer);
+                let feedback_key_blob = core::mem::take(&mut pending.video1_viewer_to_server);
                 Ok(Some(ArdClientEvent::MediaStream(ArdMediaStream {
                     endpoints: pending.endpoints,
                     key_blob,
+                    feedback_key_blob,
                     codec,
                     payload_type,
                     codec_config,
                     derived_ssrc,
+                    local_ssrc: pending.video1_local_ssrc,
                 })))
             }
             MediaStreamServerReply::Error(error) => Err(ArdClientError::Message(format!(

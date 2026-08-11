@@ -67,6 +67,11 @@ impl Language {
             "添加到历史连接" => "Add to connection history",
             "连接参数" => "Connection options",
             "视频质量" => "Video quality",
+            "远程分辨率" => "Remote resolution",
+            "不更改（例如 2560x1440）" => "Keep current (for example 2560x1440)",
+            "请输入有效分辨率，例如 2560x1440 或 2560x1440,1920x1080" => {
+                "Enter a valid resolution, such as 2560x1440 or 2560x1440,1920x1080"
+            }
             "高性能编码" => "High-performance codecs",
             "帧率 (FPS)" => "Frame rate (FPS)",
             "画面插值" => "Display interpolation",

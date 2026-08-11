@@ -28,9 +28,12 @@ pub(crate) const AUTH_TAG_LEN: usize = 10;
 // `_SRTPUseEncryptionInternal` selects the standard SRTP labels 0/2 for RTP
 // and 3/5 for SRTCP. The selector is RTP-vs-RTCP, not send-vs-receive; both
 // media directions therefore use the RTP pair 0/2.
-const ENCRYPTION_LABEL: u8 = 0;
-const AUTHENTICATION_LABEL: u8 = 1;
-const SALT_LABEL: u8 = 2;
+const RTP_ENCRYPTION_LABEL: u8 = 0;
+const RTP_AUTHENTICATION_LABEL: u8 = 1;
+const RTP_SALT_LABEL: u8 = 2;
+const SRTCP_ENCRYPTION_LABEL: u8 = 3;
+const SRTCP_AUTHENTICATION_LABEL: u8 = 4;
+const SRTCP_SALT_LABEL: u8 = 5;
 
 #[derive(Clone)]
 struct SessionMaterial {
@@ -52,6 +55,110 @@ pub struct SrtpContext {
     /// Highest packet index and the 64-packet replay window.
     highest_index: Option<u64>,
     replay_window: u64,
+}
+
+/// SRTCP sender context for the receiver reports expected by Apple's AVC
+/// server. Unlike RTP, the 31-bit SRTCP packet index is carried on the wire.
+pub struct SrtcpContext {
+    material: SessionMaterial,
+    sender_ssrc: u32,
+    index: u32,
+}
+
+impl fmt::Debug for SrtcpContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SrtcpContext")
+            .field("sender_ssrc", &self.sender_ssrc)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
+impl SrtcpContext {
+    /// Build the outbound feedback context from the viewer-to-server key.
+    pub fn from_key_blob_with_sender_ssrc(blob: &[u8], sender_ssrc: u32) -> Result<Self> {
+        if blob.len() != MEDIA_STREAM_KEY_LEN {
+            return Err(Error::Invalid("SRTCP key blob must be 46 bytes"));
+        }
+        let mut master_key = [0u8; MASTER_KEY_LEN];
+        let mut master_salt = [0u8; MASTER_SALT_LEN];
+        master_key.copy_from_slice(&blob[..MASTER_KEY_LEN]);
+        master_salt.copy_from_slice(&blob[MASTER_KEY_LEN..]);
+        let material = derive_session_material_with_labels(
+            &master_key,
+            &master_salt,
+            SRTCP_ENCRYPTION_LABEL,
+            SRTCP_AUTHENTICATION_LABEL,
+            SRTCP_SALT_LABEL,
+        );
+        master_key.fill(0);
+        master_salt.fill(0);
+        Ok(Self {
+            material,
+            sender_ssrc,
+            index: 0,
+        })
+    }
+
+    /// Create the encrypted/authenticated 22-byte AVC receiver keep-alive.
+    /// Packet type 192 and the empty RTCP payload match the native client;
+    /// the index and authentication tag are unique to this negotiated session.
+    pub fn protect_heartbeat(&mut self) -> Result<Vec<u8>> {
+        let mut packet = Vec::with_capacity(8);
+        packet.extend_from_slice(&[0x80, 0xc0, 0x00, 0x01]);
+        packet.extend_from_slice(&self.sender_ssrc.to_be_bytes());
+        self.protect_rtcp(packet)
+    }
+
+    /// Create the native 26-byte receiver report for one simulcast SSRC.
+    /// The remote SSRC is the four-byte encrypted RTCP payload.
+    pub fn protect_receiver_report(&mut self, remote_ssrc: u32) -> Result<Vec<u8>> {
+        let mut packet = Vec::with_capacity(12);
+        packet.extend_from_slice(&[0x80, 0xc0, 0x00, 0x02]);
+        packet.extend_from_slice(&self.sender_ssrc.to_be_bytes());
+        packet.extend_from_slice(&remote_ssrc.to_be_bytes());
+        self.protect_rtcp(packet)
+    }
+
+    fn protect_rtcp(&mut self, mut packet: Vec<u8>) -> Result<Vec<u8>> {
+        let index = self
+            .index
+            .checked_add(1)
+            .filter(|index| *index <= 0x7fff_fffe)
+            .ok_or(Error::LimitExceeded("SRTCP packet index"))?;
+        if packet.len() < 8 {
+            return Err(Error::Invalid("SRTCP packet is too short"));
+        }
+        let keystream = self.keystream(index, packet.len() - 8);
+        for (byte, key) in packet[8..].iter_mut().zip(keystream) {
+            *byte ^= key;
+        }
+        packet.extend_from_slice(&(index | 0x8000_0000).to_be_bytes());
+        let digest = hmac_sha1(&self.material.authentication_key, &packet);
+        packet.extend_from_slice(&digest[..AUTH_TAG_LEN]);
+        self.index = index;
+        Ok(packet)
+    }
+
+    fn keystream(&self, index: u32, len: usize) -> Vec<u8> {
+        let mut block = [0u8; 16];
+        block[..SESSION_SALT_LEN].copy_from_slice(&self.material.salt);
+        xor_bytes(&mut block[4..8], &self.sender_ssrc.to_be_bytes());
+        xor_bytes(&mut block[8..12], &(index >> 16).to_be_bytes());
+        xor_bytes(&mut block[12..14], &(index as u16).to_be_bytes());
+
+        let mut stream = Vec::with_capacity(len);
+        let mut counter = block;
+        while stream.len() < len {
+            let mut output = GenericArray::clone_from_slice(&counter);
+            self.material.cipher.encrypt_block(&mut output);
+            stream.extend_from_slice(&output);
+            increment_counter(&mut counter);
+        }
+        stream.truncate(len);
+        stream
+    }
 }
 
 impl fmt::Debug for SrtpContext {
@@ -287,21 +394,40 @@ fn derive_session_material(
     master_key: &[u8; MASTER_KEY_LEN],
     master_salt: &[u8; MASTER_SALT_LEN],
 ) -> SessionMaterial {
-    let encryption_key = aes_ecb_expand(master_key, master_salt, ENCRYPTION_LABEL, SESSION_KEY_LEN);
+    derive_session_material_with_labels(
+        master_key,
+        master_salt,
+        RTP_ENCRYPTION_LABEL,
+        RTP_AUTHENTICATION_LABEL,
+        RTP_SALT_LABEL,
+    )
+}
+
+fn derive_session_material_with_labels(
+    master_key: &[u8; MASTER_KEY_LEN],
+    master_salt: &[u8; MASTER_SALT_LEN],
+    encryption_label: u8,
+    authentication_label: u8,
+    salt_label: u8,
+) -> SessionMaterial {
+    let mut encryption_key =
+        aes_ecb_expand(master_key, master_salt, encryption_label, SESSION_KEY_LEN);
     let authentication_key = aes_ecb_expand(
         master_key,
         master_salt,
-        AUTHENTICATION_LABEL,
+        authentication_label,
         SESSION_AUTH_KEY_LEN,
     );
-    let salt = aes_ecb_expand(master_key, master_salt, SALT_LABEL, SESSION_SALT_LEN);
-    SessionMaterial {
+    let salt = aes_ecb_expand(master_key, master_salt, salt_label, SESSION_SALT_LEN);
+    let material = SessionMaterial {
         cipher: Aes256::new(GenericArray::from_slice(&encryption_key)),
         authentication_key: authentication_key
             .try_into()
             .expect("session authentication key length"),
         salt: salt.try_into().expect("session salt length"),
-    }
+    };
+    encryption_key.fill(0);
+    material
 }
 
 fn hmac_sha1(key: &[u8], input: &[u8]) -> [u8; 20] {
@@ -379,7 +505,12 @@ mod tests {
             *byte = (index + MASTER_KEY_LEN) as u8;
         }
         assert_eq!(
-            aes_ecb_expand(&master_key, &master_salt, ENCRYPTION_LABEL, SESSION_KEY_LEN),
+            aes_ecb_expand(
+                &master_key,
+                &master_salt,
+                RTP_ENCRYPTION_LABEL,
+                SESSION_KEY_LEN
+            ),
             [
                 0x0e, 0x67, 0x4e, 0x2d, 0xb9, 0x0f, 0xd0, 0x74, 0xb7, 0xd1, 0x17, 0xff, 0x27, 0x48,
                 0x25, 0x69, 0xaa, 0x77, 0x04, 0xa1, 0x2a, 0x1a, 0x9b, 0xda, 0x69, 0xd3, 0x3f, 0xcc,
@@ -592,5 +723,53 @@ mod tests {
                 .is_err()
         );
         assert_eq!(receiver.highest_index, None);
+    }
+
+    #[test]
+    fn creates_session_specific_srtcp_heartbeats() {
+        let mut blob = [0u8; MEDIA_STREAM_KEY_LEN];
+        for (index, byte) in blob.iter_mut().enumerate() {
+            *byte = (index * 5 + 11) as u8;
+        }
+        let sender_ssrc = 0xb5ff_003e;
+        let mut context =
+            SrtcpContext::from_key_blob_with_sender_ssrc(&blob, sender_ssrc).expect("context");
+
+        let first = context.protect_heartbeat().expect("first heartbeat");
+        let second = context.protect_heartbeat().expect("second heartbeat");
+        assert_eq!(first.len(), 22);
+        assert_eq!(&first[..8], &[0x80, 0xc0, 0, 1, 0xb5, 0xff, 0, 0x3e]);
+        assert_eq!(&first[8..12], &0x8000_0001u32.to_be_bytes());
+        assert_eq!(&second[8..12], &0x8000_0002u32.to_be_bytes());
+        assert_ne!(&first[12..], &second[12..]);
+
+        let expected = hmac_sha1(&context.material.authentication_key, &first[..12]);
+        assert_eq!(&first[12..], &expected[..AUTH_TAG_LEN]);
+    }
+
+    #[test]
+    fn encrypts_native_srtcp_receiver_report_payload() {
+        let blob = [0x5au8; MEDIA_STREAM_KEY_LEN];
+        let local_ssrc = 0xb5ff_003e;
+        let remote_ssrc = 0x6405_c090;
+        let mut context =
+            SrtcpContext::from_key_blob_with_sender_ssrc(&blob, local_ssrc).expect("context");
+        let packet = context
+            .protect_receiver_report(remote_ssrc)
+            .expect("receiver report");
+
+        assert_eq!(packet.len(), 26);
+        assert_eq!(&packet[..8], &[0x80, 0xc0, 0, 2, 0xb5, 0xff, 0, 0x3e]);
+        assert_ne!(&packet[8..12], &remote_ssrc.to_be_bytes());
+        let keystream = context.keystream(1, 4);
+        let decrypted: Vec<_> = packet[8..12]
+            .iter()
+            .zip(keystream)
+            .map(|(byte, key)| byte ^ key)
+            .collect();
+        assert_eq!(decrypted, remote_ssrc.to_be_bytes());
+        assert_eq!(&packet[12..16], &0x8000_0001u32.to_be_bytes());
+        let expected = hmac_sha1(&context.material.authentication_key, &packet[..16]);
+        assert_eq!(&packet[16..], &expected[..AUTH_TAG_LEN]);
     }
 }

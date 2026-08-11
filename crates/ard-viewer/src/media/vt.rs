@@ -18,6 +18,7 @@ use super::DecodedFrame;
 type OSStatus = i32;
 type CFIndex = isize;
 type CFAllocatorRef = *const c_void;
+type CFArrayRef = *const c_void;
 type CFDictionaryRef = *const c_void;
 type CFNumberRef = *const c_void;
 type CFStringRef = *const c_void;
@@ -53,8 +54,10 @@ struct CMSampleTimingInfo {
 #[link(name = "CoreVideo", kind = "framework")]
 #[link(name = "VideoToolbox", kind = "framework")]
 unsafe extern "C" {
+    static kCFBooleanTrue: CFBooleanRef;
     fn CFRelease(cf: *const c_void);
     fn CFRetain(cf: *const c_void) -> *const c_void;
+    fn CFArrayGetValueAtIndex(the_array: CFArrayRef, index: CFIndex) -> *const c_void;
     fn CFDictionaryCreateMutable(
         allocator: CFAllocatorRef,
         capacity: CFIndex,
@@ -121,6 +124,12 @@ unsafe extern "C" {
         sample_size_array: *const usize,
         sample_buffer_out: *mut CMSampleBufferRef,
     ) -> OSStatus;
+    fn CMSampleBufferGetSampleAttachmentsArray(
+        sample_buffer: CMSampleBufferRef,
+        create_if_necessary: bool,
+    ) -> CFArrayRef;
+    static kCMSampleAttachmentKey_DisplayImmediately: CFStringRef;
+    static kCMSampleAttachmentKey_NotSync: CFStringRef;
 
     fn VTDecompressionSessionCreate(
         allocator: CFAllocatorRef,
@@ -178,6 +187,12 @@ pub unsafe extern "C" fn decompression_output_callback(
     _presentation_duration: CMTime,
 ) {
     if status != 0 || image_buffer.is_null() {
+        if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+            eprintln!(
+                "VideoToolbox callback without image: status={status} info_flags={_info_flags:#x} null_image={}",
+                image_buffer.is_null(),
+            );
+        }
         return;
     }
     let slot = &*(decompression_output_ref_con as *const Mutex<Option<CVPixelBufferRef>>);
@@ -209,6 +224,7 @@ struct NativeDecoder {
     format_description: CMVideoFormatDescriptionRef,
     session: VTDecompressionSessionRef,
     output_slot: Box<Mutex<Option<CVPixelBufferRef>>>,
+    dimensions: (u32, u32),
 }
 
 impl Drop for NativeDecoder {
@@ -248,6 +264,13 @@ impl VideoToolboxDecoder {
         self.frames_decoded
     }
 
+    /// Resolution configured on the active VideoToolbox session. When the
+    /// server applies an explicitly requested display mode and sends updated
+    /// parameter sets, the decoder recreates the immutable native session.
+    pub fn configured_dimensions(&self) -> Option<(u32, u32)> {
+        self.native.as_ref().map(|native| native.dimensions)
+    }
+
     /// Decode one access unit; returns the displayable frame when the decoder
     /// produced output.
     pub fn decode(&mut self, unit: &AccessUnit) -> Option<DecodedFrame> {
@@ -271,7 +294,8 @@ impl VideoToolboxDecoder {
             return None;
         };
         let avcc = unit.to_avcc();
-        let result = unsafe { decode_access_unit(native, &avcc) };
+        let result =
+            unsafe { decode_access_unit(native, &avcc, unit.timestamp, self.is_sync_unit(unit)) };
         let frame = result.ok().flatten();
         if frame.is_some() {
             self.frames_decoded += 1;
@@ -294,6 +318,16 @@ impl VideoToolboxDecoder {
                 .cloned()
                 .collect(),
         }
+    }
+
+    fn is_sync_unit(&self, unit: &AccessUnit) -> bool {
+        unit.nal_units.iter().any(|nal| match self.codec {
+            MediaStreamCodec::H264 => matches!(nal.first().map(|byte| byte & 0x1f), Some(5 | 7)),
+            MediaStreamCodec::Hevc => matches!(
+                nal.first().map(|byte| (byte >> 1) & 0x3f),
+                Some(16..=23 | 32..=34)
+            ),
+        })
     }
 
     fn merge_parameter_sets(&mut self, sets: Vec<Vec<u8>>) -> bool {
@@ -356,12 +390,23 @@ impl VideoToolboxDecoder {
         if status != 0 || format_description.is_null() {
             return Err(());
         }
+        let dimensions = unsafe { CMVideoFormatDescriptionGetDimensions(format_description) };
+        if dimensions.width <= 0
+            || dimensions.height <= 0
+            || dimensions.width > 16_384
+            || dimensions.height > 16_384
+        {
+            unsafe { CFRelease(format_description as *const c_void) };
+            return Err(());
+        }
 
         let output_slot = Box::new(Mutex::new(None));
         let refcon = &*output_slot as *const Mutex<Option<CVPixelBufferRef>> as *mut c_void;
         let callback: VTDecompressionOutputCallback = decompression_output_callback;
         let record = VTDecompressionOutputCallbackRecord { callback, refcon };
-        let Some(destination_attributes) = DestinationAttributes::new() else {
+        let Some(destination_attributes) =
+            DestinationAttributes::new(dimensions.width, dimensions.height)
+        else {
             unsafe { CFRelease(format_description as *const c_void) };
             return Err(());
         };
@@ -385,59 +430,76 @@ impl VideoToolboxDecoder {
             format_description,
             session,
             output_slot,
+            dimensions: (dimensions.width as u32, dimensions.height as u32),
         })
     }
 }
 
 struct DestinationAttributes {
     dictionary: CFDictionaryRef,
-    key: CFStringRef,
-    value: CFNumberRef,
+    keys: Vec<CFStringRef>,
+    values: Vec<CFNumberRef>,
 }
 
 impl DestinationAttributes {
-    fn new() -> Option<Self> {
-        let key = unsafe {
-            CFStringCreateWithCString(
-                std::ptr::null(),
-                c"PixelFormatType".as_ptr() as *const u8,
-                kCFStringEncodingUTF8,
-            )
+    fn new(width: c_int, height: c_int) -> Option<Self> {
+        let dictionary = unsafe {
+            CFDictionaryCreateMutable(std::ptr::null(), 3, std::ptr::null(), std::ptr::null())
         };
-        if key.is_null() {
+        if dictionary.is_null() {
             return None;
         }
-        let value = {
-            let raw = kCVPixelFormatType_32BGRA;
-            unsafe {
+        let attributes = [
+            (
+                c"PixelFormatType".as_ptr(),
+                kCVPixelFormatType_32BGRA as c_int,
+            ),
+            (c"Width".as_ptr(), width),
+            (c"Height".as_ptr(), height),
+        ];
+        let mut keys = Vec::with_capacity(attributes.len());
+        let mut values = Vec::with_capacity(attributes.len());
+        for (name, raw) in attributes {
+            let key = unsafe {
+                CFStringCreateWithCString(
+                    std::ptr::null(),
+                    name as *const u8,
+                    kCFStringEncodingUTF8,
+                )
+            };
+            let value = unsafe {
                 CFNumberCreate(
                     std::ptr::null(),
                     kCFNumberSInt32Type,
-                    &raw as *const u32 as *const c_void,
+                    &raw as *const c_int as *const c_void,
                 )
+            };
+            if key.is_null() || value.is_null() {
+                if !key.is_null() {
+                    unsafe { CFRelease(key) };
+                }
+                if !value.is_null() {
+                    unsafe { CFRelease(value) };
+                }
+                for key in keys {
+                    unsafe { CFRelease(key) };
+                }
+                for value in values {
+                    unsafe { CFRelease(value) };
+                }
+                unsafe { CFRelease(dictionary) };
+                return None;
             }
-        };
-        if value.is_null() {
-            unsafe { CFRelease(key) };
-            return None;
-        }
-        let dictionary = unsafe {
-            CFDictionaryCreateMutable(std::ptr::null(), 1, std::ptr::null(), std::ptr::null())
-        };
-        if dictionary.is_null() {
             unsafe {
-                CFRelease(key);
-                CFRelease(value);
+                CFDictionarySetValue(dictionary, key as *const c_void, value as *const c_void);
             }
-            return None;
-        }
-        unsafe {
-            CFDictionarySetValue(dictionary, key as *const c_void, value as *const c_void);
+            keys.push(key);
+            values.push(value);
         }
         Some(Self {
             dictionary,
-            key,
-            value,
+            keys,
+            values,
         })
     }
 }
@@ -446,8 +508,12 @@ impl Drop for DestinationAttributes {
     fn drop(&mut self) {
         unsafe {
             CFRelease(self.dictionary);
-            CFRelease(self.key);
-            CFRelease(self.value);
+            for key in &self.keys {
+                CFRelease(*key);
+            }
+            for value in &self.values {
+                CFRelease(*value);
+            }
         }
     }
 }
@@ -455,6 +521,8 @@ impl Drop for DestinationAttributes {
 unsafe fn decode_access_unit(
     native: &NativeDecoder,
     avcc: &[u8],
+    rtp_timestamp: u32,
+    is_sync: bool,
 ) -> Result<Option<DecodedFrame>, ()> {
     let mut block_buffer: CMBlockBufferRef = std::ptr::null();
     let status = CMBlockBufferCreateWithMemoryBlock(
@@ -479,13 +547,33 @@ unsafe fn decode_access_unit(
     }
     let mut sample_buffer: CMSampleBufferRef = std::ptr::null();
     let sample_size = avcc.len();
+    let timing = CMSampleTimingInfo {
+        duration: CMTime {
+            value: 1,
+            timescale: 90_000,
+            flags: 1,
+            epoch: 0,
+        },
+        presentation_time_stamp: CMTime {
+            value: i64::from(rtp_timestamp),
+            timescale: 90_000,
+            flags: 1, // kCMTimeFlags_Valid
+            epoch: 0,
+        },
+        decode_time_stamp: CMTime {
+            value: i64::from(rtp_timestamp),
+            timescale: 90_000,
+            flags: 1,
+            epoch: 0,
+        },
+    };
     let status = CMSampleBufferCreateReady(
         std::ptr::null(),
         block_buffer,
         native.format_description,
         1,
-        0,
-        std::ptr::null(),
+        1,
+        &timing,
         1,
         &sample_size,
         &mut sample_buffer,
@@ -494,11 +582,29 @@ unsafe fn decode_access_unit(
         CFRelease(block_buffer);
         return Err(());
     }
+    let attachments = CMSampleBufferGetSampleAttachmentsArray(sample_buffer, true);
+    if !attachments.is_null() {
+        let attachment = CFArrayGetValueAtIndex(attachments, 0) as CFDictionaryRef;
+        if !attachment.is_null() {
+            CFDictionarySetValue(
+                attachment,
+                kCMSampleAttachmentKey_DisplayImmediately as *const c_void,
+                kCFBooleanTrue as *const c_void,
+            );
+            if !is_sync {
+                CFDictionarySetValue(
+                    attachment,
+                    kCMSampleAttachmentKey_NotSync as *const c_void,
+                    kCFBooleanTrue as *const c_void,
+                );
+            }
+        }
+    }
     let mut info_flags: VTDecodeInfoFlags = 0;
     let status = VTDecompressionSessionDecodeFrame(
         native.session,
         sample_buffer,
-        0, // synchronous decode: the callback runs before DecodeFrame returns
+        1, // kVTDecodeFrame_EnableAsynchronousDecompression
         std::ptr::null_mut(),
         &mut info_flags,
     );
@@ -508,6 +614,9 @@ unsafe fn decode_access_unit(
     CFRelease(sample_buffer);
     CFRelease(block_buffer);
     if status != 0 {
+        if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+            eprintln!("VideoToolbox decode failed: status={status} info_flags={info_flags:#x}");
+        }
         return Err(());
     }
     let buffer = native
@@ -516,6 +625,9 @@ unsafe fn decode_access_unit(
         .ok()
         .and_then(|mut slot| slot.take());
     let Some(buffer) = buffer else {
+        if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+            eprintln!("VideoToolbox produced no image: info_flags={info_flags:#x}");
+        }
         return Ok(None);
     };
     let frame = pixel_buffer_to_rgba(buffer);
@@ -645,6 +757,7 @@ mod tests {
         let first = first.expect("first frame");
         assert_eq!(first.width, 320);
         assert_eq!(first.height, 240);
+        assert_eq!(decoder.configured_dimensions(), Some((320, 240)));
         assert_eq!(first.rgba.len(), 320 * 240 * 4);
     }
 }

@@ -957,6 +957,127 @@ pub fn build_ard_auto_frame_update(
     out
 }
 
+/// One fixed-resolution virtual display requested from the ARD server.
+///
+/// Apple's display-configuration command accepts at most two display records.
+/// The server arranges multiple virtual displays and reports the resulting
+/// desktop layout through DisplayInfo2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArdVirtualDisplay {
+    pub width: u32,
+    pub height: u32,
+    pub name: String,
+}
+
+impl ArdVirtualDisplay {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            name: "ARD Display".to_owned(),
+        }
+    }
+
+    pub fn named(width: u32, height: u32, name: impl Into<String>) -> Self {
+        Self {
+            width,
+            height,
+            name: name.into(),
+        }
+    }
+}
+
+/// Fixed virtual-display layout for Apple's `RFBSetDisplayConfiguration`
+/// client message (`0x1d`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArdDisplayConfiguration {
+    pub displays: Vec<ArdVirtualDisplay>,
+}
+
+impl ArdDisplayConfiguration {
+    pub const MAX_DISPLAYS: usize = 2;
+
+    pub fn single(width: u32, height: u32) -> Self {
+        Self {
+            displays: vec![ArdVirtualDisplay::new(width, height)],
+        }
+    }
+}
+
+/// Builds the fixed-resolution display request used by current Screen Sharing.
+///
+/// Each display contains one non-dynamic mode. Width and height are repeated
+/// in the physical and logical mode fields, with a 60 Hz refresh rate. The
+/// message supports one or two displays, matching the native framework.
+pub fn build_ard_set_display_configuration(
+    configuration: &ArdDisplayConfiguration,
+) -> Result<Vec<u8>> {
+    const HEADER_LEN: usize = 12;
+    const DISPLAY_FIXED_LEN: usize = 156;
+    const MODE_LEN: usize = 28;
+    const NAME_LEN: usize = 120;
+    const DISPLAY_RECORD_LEN: usize = DISPLAY_FIXED_LEN + MODE_LEN;
+
+    if configuration.displays.is_empty() {
+        return Err(Error::Invalid("display configuration is empty"));
+    }
+    if configuration.displays.len() > ArdDisplayConfiguration::MAX_DISPLAYS {
+        return Err(Error::LimitExceeded("virtual display count"));
+    }
+    let display_count = u16::try_from(configuration.displays.len())
+        .map_err(|_| Error::LimitExceeded("virtual display count"))?;
+    let total_len = HEADER_LEN
+        .checked_add(
+            DISPLAY_RECORD_LEN
+                .checked_mul(configuration.displays.len())
+                .ok_or(Error::LimitExceeded("display configuration size"))?,
+        )
+        .ok_or(Error::LimitExceeded("display configuration size"))?;
+    let wire_payload_len = u16::try_from(total_len - 4)
+        .map_err(|_| Error::LimitExceeded("display configuration size"))?;
+    let record_len =
+        u16::try_from(DISPLAY_RECORD_LEN).expect("display configuration record has fixed width");
+
+    let mut out = vec![0_u8; total_len];
+    out[0] = 0x1d;
+    out[2..4].copy_from_slice(&wire_payload_len.to_be_bytes());
+    out[4..6].copy_from_slice(&1_u16.to_be_bytes());
+    out[6..8].copy_from_slice(&display_count.to_be_bytes());
+
+    for (index, display) in configuration.displays.iter().enumerate() {
+        if display.width == 0 || display.height == 0 {
+            return Err(Error::Invalid(
+                "virtual display dimensions must be non-zero",
+            ));
+        }
+        if display.width > 16_384 || display.height > 16_384 {
+            return Err(Error::LimitExceeded("virtual display dimensions"));
+        }
+        let name = display.name.as_bytes();
+        if name.len() >= NAME_LEN {
+            return Err(Error::LimitExceeded("virtual display name"));
+        }
+
+        let base = HEADER_LEN + index * DISPLAY_RECORD_LEN;
+        out[base..base + 2].copy_from_slice(&record_len.to_be_bytes());
+        out[base + 2..base + 2 + name.len()].copy_from_slice(name);
+        // Keep flags zero: bit 0 enables dynamic resolution in the native
+        // client, while this API deliberately requests a fixed mode.
+        out[base + 138..base + 142].copy_from_slice(&display.width.to_be_bytes());
+        out[base + 142..base + 146].copy_from_slice(&display.height.to_be_bytes());
+        out[base + 150..base + 154].copy_from_slice(&7_u32.to_be_bytes());
+        out[base + 154..base + 156].copy_from_slice(&1_u16.to_be_bytes());
+
+        let mode = base + DISPLAY_FIXED_LEN;
+        out[mode..mode + 4].copy_from_slice(&display.width.to_be_bytes());
+        out[mode + 4..mode + 8].copy_from_slice(&display.height.to_be_bytes());
+        out[mode + 8..mode + 12].copy_from_slice(&display.width.to_be_bytes());
+        out[mode + 12..mode + 16].copy_from_slice(&display.height.to_be_bytes());
+        out[mode + 16..mode + 24].copy_from_slice(&60.0_f64.to_bits().to_be_bytes());
+    }
+    Ok(out)
+}
+
 pub fn parse_framebuffer_update(
     bytes: &[u8],
     decoder: &mut Decoder,

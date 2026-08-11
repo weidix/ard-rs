@@ -2,9 +2,38 @@ use std::net::TcpListener;
 use std::thread;
 
 use ard_rs::{
-    ArdClient, ArdClientConfig, ArdClientEvent, ArdFrameOutput, ArdReconnectPolicy,
-    ArdVideoQuality, EncryptedTransportOracle, MvsGpuTile, PixelFormat,
+    ArdClient, ArdClientConfig, ArdClientEvent, ArdDisplayConfiguration, ArdFrameOutput,
+    ArdReconnectPolicy, ArdVideoQuality, EncryptedTransportOracle, MvsGpuTile, PixelFormat,
 };
+
+#[test]
+fn client_sends_fixed_display_configuration_inside_encrypted_transport() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, peer) = listener.accept().unwrap();
+        let mut command_support = EncryptedTransportOracle::default().command_support;
+        command_support[3] |= 0x04;
+        EncryptedTransportOracle {
+            allowed_peer: Some(peer.ip()),
+            expect_security_selection: false,
+            command_support,
+            ..EncryptedTransportOracle::default()
+        }
+        .run(stream, peer)
+        .unwrap()
+    });
+
+    let mut config =
+        ArdClientConfig::new(address.to_string(), b"viewer".to_vec(), b"oracle".to_vec());
+    config.display_configuration = Some(ArdDisplayConfiguration::single(2560, 1440));
+    let mut client = ArdClient::connect(config).unwrap();
+    client.next_frame().unwrap();
+    drop(client);
+
+    let report = server.join().unwrap();
+    assert_eq!(report.client_message_types[..2], [0x1d, 3]);
+}
 
 #[test]
 fn receive_only_client_delivers_gpu_mvs_tiles_without_cpu_frame_expansion() {

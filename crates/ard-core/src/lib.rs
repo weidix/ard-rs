@@ -53,11 +53,12 @@ pub use media_stream::{
 pub use mvs::{MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate};
 pub use oracle::{EncryptedTransportOracle, OracleReport};
 pub use protocol::{
-    ArdAuthChallenge, ArdAuthResponse, ArdClientInit, ArdEncryptionControl, ArdScrollWheelEvent,
-    ArdServerInitExtension, ArdSessionOptions, ArdSetEncryptionLevel, ArdViewerInformation,
-    Encoding, PixelFormat, ProtocolVersion, Rectangle, SecurityType, ServerInit,
-    build_ard_auto_frame_update, build_ard_encryption_activation, build_ard_scroll_wheel_event,
-    build_ard_server_init, build_ard_set_encryption_level, build_client_cut_text,
+    ArdAuthChallenge, ArdAuthResponse, ArdClientInit, ArdDisplayConfiguration,
+    ArdEncryptionControl, ArdScrollWheelEvent, ArdServerInitExtension, ArdSessionOptions,
+    ArdSetEncryptionLevel, ArdViewerInformation, ArdVirtualDisplay, Encoding, PixelFormat,
+    ProtocolVersion, Rectangle, SecurityType, ServerInit, build_ard_auto_frame_update,
+    build_ard_encryption_activation, build_ard_scroll_wheel_event, build_ard_server_init,
+    build_ard_set_display_configuration, build_ard_set_encryption_level, build_client_cut_text,
     build_clipboard_text, build_framebuffer_update_request, build_key_event, build_pointer_event,
     build_set_encodings, build_set_pixel_format, parse_ard_auth_challenge, parse_ard_auth_response,
     parse_ard_client_init, parse_ard_encryption_control, parse_ard_session_options,

@@ -421,6 +421,13 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .spacing(18);
 
     let quality = quality_selector(app);
+    let resolution =
+        iced::widget::text_input(app.language.tr("不更改（例如 2560x1440）"), &app.resolution)
+            .on_input(Message::ResolutionChanged)
+            .width(PARAMETER_CONTROL_WIDTH)
+            .padding([10.0, CONTROL_PADDING_X])
+            .size(PARAMETER_TEXT_SIZE)
+            .style(theme::connection_parameter_input);
     let frame_rate = iced::widget::text_input(app.language.tr("自动"), &app.frame_rate)
         .on_input(Message::FrameRateChanged)
         .width(PARAMETER_CONTROL_WIDTH)
@@ -449,6 +456,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .center_y(CONTROL_HEIGHT);
     let parameter_rows = column![
         connection_parameter_row(app.language.tr("视频质量"), quality),
+        connection_parameter_row(app.language.tr("远程分辨率"), resolution),
         connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate),
         connection_parameter_row(app.language.tr("画面插值"), interpolation),
         connection_parameter_row(app.language.tr("三次锐化采样"), sharp_sampling),
