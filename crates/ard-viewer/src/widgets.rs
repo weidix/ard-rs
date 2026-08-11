@@ -266,13 +266,16 @@ impl DropdownOption {
 }
 
 pub struct DropdownSection {
-    pub label: Option<&'static str>,
+    pub label: Option<String>,
     pub options: Vec<DropdownOption>,
 }
 
 impl DropdownSection {
-    pub fn new(label: Option<&'static str>, options: Vec<DropdownOption>) -> Self {
-        Self { label, options }
+    pub fn new(label: Option<&str>, options: Vec<DropdownOption>) -> Self {
+        Self {
+            label: label.map(str::to_owned),
+            options,
+        }
     }
 }
 
@@ -304,11 +307,11 @@ pub fn quality_dropdown_sections(
             vec![option(ArdVideoQuality::Adaptive, "quality-option-adaptive")],
         ),
         DropdownSection::new(
-            Some("AVC"),
-            vec![option(
-                ArdVideoQuality::HighPerformance,
-                "quality-option-high-performance",
-            )],
+            Some(language.tr("高性能编码")),
+            vec![
+                option(ArdVideoQuality::HighPerformanceHevc, "quality-option-hevc"),
+                option(ArdVideoQuality::HighPerformanceAvc, "quality-option-avc"),
+            ],
         ),
     ]
 }

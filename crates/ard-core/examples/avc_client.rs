@@ -10,8 +10,8 @@
 //!    carrying the session UUID, audio/video1 offers and six 46-byte SRTP keys;
 //! 2. waits for the server's `RFBMediaStreamMessage1` (encoding 1010) with the
 //!    UDP ports and the negotiator answer (Message2);
-//! 3. prints the negotiated ports, keys and codec so the viewer pipeline can
-//!    bind the sockets and start decoding.
+//! 3. reports only the negotiated structure so the viewer pipeline can bind
+//!    the sockets and start decoding without exposing media key material.
 //!
 //! Usage: `avc_client ADDRESS USERNAME [MAX_SECONDS]`
 //!
@@ -24,9 +24,9 @@ use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use ard_rs::avc::{
+use ard_rs::media_stream::{
     ENCODING_AVC_MEDIA_STREAM, MediaStreamConfiguration, MediaStreamFlags, MediaStreamKeyMaterial,
-    MediaStreamMessage1, MediaStreamServerReply, build_media_stream_offer,
+    MediaStreamMessage1, MediaStreamServerReply, build_media_stream_offer_with_ssrc,
     build_remote_endpoint_info,
 };
 use ard_rs::{
@@ -191,26 +191,16 @@ fn run(
     let keys =
         MediaStreamKeyMaterial::new(&audio_v2s, &audio_s2v, &video1_v2s, &video1_s2v, None, None)?;
 
-    let call_id = format!(
-        "{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
-        u32::from_be_bytes(session_id[0..4].try_into().expect("uuid")),
-        u16::from_be_bytes(session_id[4..6].try_into().expect("uuid")),
-        u16::from_be_bytes(session_id[6..8].try_into().expect("uuid")),
-        u16::from_be_bytes(session_id[8..10].try_into().expect("uuid")),
-        u64::from_be_bytes([
-            0,
-            0,
-            session_id[10],
-            session_id[11],
-            session_id[12],
-            session_id[13],
-            session_id[14],
-            session_id[15],
-        ])
-    );
+    let call_id = format_uuid(session_id);
+    let mut video_call_id_bytes = [0_u8; 16];
+    fill_random(&mut video_call_id_bytes)?;
+    let video_call_id = format_uuid(video_call_id_bytes);
     let endpoint = build_remote_endpoint_info("Mac16,10", "25G72");
-    let audio_offer = build_media_stream_offer(&call_id, &endpoint, 7, 1)?;
-    let video1_offer = build_media_stream_offer(&call_id, &endpoint, 7, 2)?;
+    let audio_ssrc = random_media_ssrc()?;
+    let video1_ssrc = random_media_ssrc()?;
+    let audio_offer = build_media_stream_offer_with_ssrc(&call_id, &endpoint, 8, 1, audio_ssrc)?;
+    let video1_offer =
+        build_media_stream_offer_with_ssrc(&video_call_id, &endpoint, 7, 2, video1_ssrc)?;
     let configuration = MediaStreamConfiguration {
         message_version: 0x0300,
         flags: MediaStreamFlags::new(
@@ -229,6 +219,14 @@ fn run(
     );
     stream.write_all(&client_encoder.encode_wire(&offer_bytes)?)?;
     stream.flush()?;
+    drop(offer_bytes);
+    drop(configuration);
+    session_id.fill(0);
+    audio_v2s.fill(0);
+    audio_s2v.fill(0);
+    video1_v2s.fill(0);
+    video1_s2v.fill(0);
+    video_call_id_bytes.fill(0);
 
     // ---- Wait for Message1 (1010) and the negotiator answer
     let deadline = Instant::now() + Duration::from_secs(max_seconds);
@@ -262,7 +260,6 @@ fn run(
                             message1.video2_hdr,
                             message1.stream_count
                         );
-                        println!("video1 SRTP key (server→viewer): {}", hex(&video1_s2v));
                     }
                 }
                 MediaStreamServerReply::Answer(answer) => {
@@ -304,9 +301,8 @@ fn run(
         }
     }
     Err(io::Error::other(format!(
-        "timed out waiting for the AVC media stream reply (received_message1={received_message1}, window={} bytes: {})",
-        avc_window.len(),
-        hex(&avc_window)
+        "timed out waiting for the AVC media stream reply (received_message1={received_message1}, window={} bytes)",
+        avc_window.len()
     ))
     .into())
 }
@@ -343,10 +339,6 @@ fn scan_avc_reply(plaintext: &[u8]) -> Option<MediaStreamServerReply> {
     None
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn viewer_information() -> [u8; ArdViewerInformation::WIRE_LEN] {
     let mut info = [0_u8; ArdViewerInformation::WIRE_LEN];
     info[0] = 0x21;
@@ -357,6 +349,19 @@ fn viewer_information() -> [u8; ArdViewerInformation::WIRE_LEN] {
     info[10..14].copy_from_slice(&6_u32.to_be_bytes());
     info[14..18].copy_from_slice(&1_u32.to_be_bytes());
     info
+}
+
+fn format_uuid(bytes: [u8; 16]) -> String {
+    format!(
+        "{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
+        u32::from_be_bytes(bytes[0..4].try_into().expect("uuid")),
+        u16::from_be_bytes(bytes[4..6].try_into().expect("uuid")),
+        u16::from_be_bytes(bytes[6..8].try_into().expect("uuid")),
+        u16::from_be_bytes(bytes[8..10].try_into().expect("uuid")),
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ])
+    )
 }
 
 fn read_encryption_control(
@@ -392,6 +397,17 @@ fn read_password_from_stdin() -> io::Result<Vec<u8>> {
 
 fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
     getrandom(bytes).map_err(io::Error::other)
+}
+
+fn random_media_ssrc() -> io::Result<u32> {
+    loop {
+        let mut bytes = [0_u8; 4];
+        fill_random(&mut bytes)?;
+        let value = u32::from_be_bytes(bytes);
+        if value != 0 {
+            return Ok(value);
+        }
+    }
 }
 
 fn getrandom(bytes: &mut [u8]) -> Result<(), String> {

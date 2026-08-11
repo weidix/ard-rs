@@ -1,4 +1,4 @@
-use ard_rs::avc::{MediaStreamMessage1, MediaStreamServerReply};
+use ard_rs::media_stream::{MediaStreamMessage1, MediaStreamServerReply};
 use ard_rs::{
     ArdMessageDispatcher, ArdServerMessage, Decoder, Encoding, Error, Framebuffer, PixelFormat,
     Rectangle,

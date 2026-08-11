@@ -802,7 +802,7 @@ RFB connection.
 
 ### Rust implementation
 
-`crates/ard-core/src/avc/` implements the negotiation wire format, the
+`crates/ard-core/src/media_stream/` implements the negotiation wire format, the
 binary-plist negotiation payload parser, RTP de-packetization, SRTP
 AES-128-CM and the UDP receive path in pure Rust (no unsafe, bounded parsing).
 `crates/ard-viewer/src/media/vt.rs` provides the macOS VideoToolbox decode

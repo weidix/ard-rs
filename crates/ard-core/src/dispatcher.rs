@@ -1,7 +1,7 @@
 use crate::protocol::{complete_framebuffer_update_len, parse_complete_framebuffer_update};
 use crate::wire::Cursor;
 use crate::{
-    ArdEncryptionControl, Decoder, Error, Framebuffer, Result, avc::MediaStreamServerReply,
+    ArdEncryptionControl, Decoder, Error, Framebuffer, Result, media_stream::MediaStreamServerReply,
 };
 
 /// One complete server message recovered from the decrypted record payload

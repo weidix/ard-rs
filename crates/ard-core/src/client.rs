@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::avc::{
+use crate::media_stream::{
     CLIENT_MEDIA_STREAM_MESSAGE_TYPE, ENCODING_AVC_MEDIA_STREAM, MEDIA_STREAM_MESSAGE_VERSION,
     MediaStreamAnswer, MediaStreamCodec, MediaStreamConfiguration, MediaStreamFlags,
-    MediaStreamKeyMaterial, MediaStreamServerReply, MediaUdpEndpoints, build_media_stream_offer,
-    build_remote_endpoint_info, parse_negotiation_payload,
+    MediaStreamKeyMaterial, MediaStreamOffer, MediaStreamServerReply, MediaUdpEndpoints,
+    VideoCodecConfig, build_media_stream_offer_with_ssrc,
+    build_media_stream_offer_with_ssrc_and_codec, build_remote_endpoint_info,
 };
 use crate::{
     ArdEncryptionControl, ArdMessageDispatcher, ArdScrollWheelEvent, ArdServerMessage,
@@ -32,6 +33,19 @@ const MAX_SERVER_NAME_BYTES: usize = 1024 * 1024;
 const MAX_INPUT_QUEUE: usize = 512;
 const MAX_OUTBOUND_PAYLOAD_BYTES: usize = 65_498;
 
+fn generate_media_ssrc() -> Result<u32, ArdClientError> {
+    loop {
+        let mut bytes = [0_u8; 4];
+        getrandom::fill(&mut bytes).map_err(|error| {
+            ArdClientError::Message(format!("AVC SSRC random source failed: {error}"))
+        })?;
+        let ssrc = u32::from_be_bytes(bytes);
+        if ssrc != 0 {
+            return Ok(ssrc);
+        }
+    }
+}
+
 /// ARD image-quality profiles, matching the encoding families exposed by
 /// Apple Screen Sharing and Remote Desktop Manager.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -39,9 +53,10 @@ pub enum ArdVideoQuality {
     Low,
     Medium,
     High,
-    /// Apple AVC/H.264 or HEVC media stream over UDP/SRTP. The first RFB
-    /// encoding is 1010 so Screen Sharing selects its real-time path.
-    HighPerformance,
+    /// Apple AVC media stream constrained to HEVC over UDP/SRTP.
+    HighPerformanceHevc,
+    /// Apple AVC media stream constrained to H.264/AVC over UDP/SRTP.
+    HighPerformanceAvc,
     #[default]
     Adaptive,
     Full,
@@ -113,7 +128,9 @@ impl ArdVideoQuality {
             Self::Low => &[1000, 6, 16, -223],
             Self::Medium => &[1001, 6, 16, -223],
             Self::High => &[1002, 6, 16, -223],
-            Self::HighPerformance => &[ENCODING_AVC_MEDIA_STREAM, 1011, 1002, 6, 16, -223],
+            Self::HighPerformanceHevc | Self::HighPerformanceAvc => {
+                &[ENCODING_AVC_MEDIA_STREAM, 1011, 1002, 6, 16, -223]
+            }
             Self::Adaptive => &[1011, 1002, 6, 16, -223],
             Self::Full => &[6, 16, -223],
         }
@@ -124,9 +141,22 @@ impl ArdVideoQuality {
             Self::Low => "黑白",
             Self::Medium => "灰度",
             Self::High => "16位颜色",
-            Self::HighPerformance => "高性能 AVC",
+            Self::HighPerformanceHevc => "HEVC (H.265)",
+            Self::HighPerformanceAvc => "AVC (H.264)",
             Self::Adaptive => "自适应 MVS",
             Self::Full => "全色",
+        }
+    }
+
+    pub const fn is_high_performance(self) -> bool {
+        matches!(self, Self::HighPerformanceHevc | Self::HighPerformanceAvc)
+    }
+
+    const fn preferred_media_codec(self) -> Option<MediaStreamCodec> {
+        match self {
+            Self::HighPerformanceHevc => Some(MediaStreamCodec::Hevc),
+            Self::HighPerformanceAvc => Some(MediaStreamCodec::H264),
+            _ => None,
         }
     }
 }
@@ -256,16 +286,65 @@ pub enum ArdClientEvent {
 }
 
 /// Negotiated server-to-viewer AVC video stream parameters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ArdMediaStream {
     pub endpoints: MediaUdpEndpoints,
     pub key_blob: Vec<u8>,
     pub codec: MediaStreamCodec,
+    pub payload_type: u8,
+    pub codec_config: VideoCodecConfig,
+    /// The server's negotiated video SSRC from the answer. Cipher suite 5
+    /// uses it when constructing the SRTP counter block.
+    pub derived_ssrc: u32,
+}
+
+impl ArdMediaStream {
+    /// Move only the values needed by the video worker. The negotiated key is
+    /// removed from `self` before its `Drop` implementation runs so the
+    /// event does not leave a second live copy while the worker is starting.
+    pub fn into_video_pipeline_parts(
+        mut self,
+    ) -> (MediaUdpEndpoints, Vec<u8>, MediaStreamCodec, u8, u32) {
+        let key_blob = core::mem::take(&mut self.key_blob);
+        (
+            self.endpoints,
+            key_blob,
+            self.codec,
+            self.payload_type,
+            self.derived_ssrc,
+        )
+    }
+
+    /// Move the complete negotiated video configuration into the formal
+    /// receive pipeline. The codec and RTP payload are deliberately taken
+    /// from the answer object instead of being reconstructed from decrypted
+    /// packet bytes.
+    pub fn into_video_pipeline_parts_with_config(
+        mut self,
+    ) -> (MediaUdpEndpoints, Vec<u8>, VideoCodecConfig, u32) {
+        let key_blob = core::mem::take(&mut self.key_blob);
+        let codec_config = core::mem::take(&mut self.codec_config);
+        (self.endpoints, key_blob, codec_config, self.derived_ssrc)
+    }
 }
 
 impl Drop for ArdMediaStream {
     fn drop(&mut self) {
         self.key_blob.fill(0);
+    }
+}
+
+impl fmt::Debug for ArdMediaStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArdMediaStream")
+            .field("endpoints", &self.endpoints)
+            .field("key_blob_len", &self.key_blob.len())
+            .field("codec", &self.codec)
+            .field("payload_type", &self.payload_type)
+            .field("codec_config", &self.codec_config)
+            .field("derived_ssrc", &self.derived_ssrc)
+            .finish()
     }
 }
 
@@ -448,7 +527,6 @@ pub struct ArdClient {
     pending_media_stream: Option<PendingMediaStream>,
 }
 
-#[derive(Debug)]
 struct PendingMediaStream {
     endpoints: MediaUdpEndpoints,
     video1_server_to_viewer: Vec<u8>,
@@ -596,10 +674,9 @@ impl ArdClient {
             .as_ref()
             .is_some_and(|extension| extension.supports_command(0x17));
         let requested_pixel_format = config.output_format.pixel_format(server_init.pixel_format);
-        let (mut decoder, mut framebuffer) = if matches!(
-            config.video_quality,
-            ArdVideoQuality::Adaptive | ArdVideoQuality::HighPerformance
-        ) {
+        let (mut decoder, mut framebuffer) = if config.video_quality == ArdVideoQuality::Adaptive
+            || config.video_quality.is_high_performance()
+        {
             (
                 Decoder::new_gpu_mvs(requested_pixel_format)?,
                 Framebuffer::new_metadata_with_format(
@@ -750,6 +827,11 @@ impl ArdClient {
                         "AVC media stream did not provide a video1 UDP port".to_owned(),
                     ));
                 }
+                let Some(preferred_codec) =
+                    self.reconnect_config.video_quality.preferred_media_codec()
+                else {
+                    return Ok(None);
+                };
                 if self.media_offer_sent {
                     return Ok(None);
                 }
@@ -758,10 +840,10 @@ impl ArdClient {
                 getrandom::fill(&mut session_id).map_err(|error| {
                     ArdClientError::Message(format!("AVC session random source failed: {error}"))
                 })?;
-                let mut audio_viewer_to_server = [0_u8; crate::avc::MEDIA_STREAM_KEY_LEN];
-                let mut audio_server_to_viewer = [0_u8; crate::avc::MEDIA_STREAM_KEY_LEN];
-                let mut video1_viewer_to_server = [0_u8; crate::avc::MEDIA_STREAM_KEY_LEN];
-                let mut video1_server_to_viewer = [0_u8; crate::avc::MEDIA_STREAM_KEY_LEN];
+                let mut audio_viewer_to_server = [0_u8; crate::media_stream::MEDIA_STREAM_KEY_LEN];
+                let mut audio_server_to_viewer = [0_u8; crate::media_stream::MEDIA_STREAM_KEY_LEN];
+                let mut video1_viewer_to_server = [0_u8; crate::media_stream::MEDIA_STREAM_KEY_LEN];
+                let mut video1_server_to_viewer = [0_u8; crate::media_stream::MEDIA_STREAM_KEY_LEN];
                 for key in [
                     &mut audio_viewer_to_server,
                     &mut audio_server_to_viewer,
@@ -781,6 +863,13 @@ impl ArdClient {
                     None,
                 )?;
                 let call_id = format_uuid(session_id);
+                let mut video_call_id_bytes = [0_u8; 16];
+                getrandom::fill(&mut video_call_id_bytes).map_err(|error| {
+                    ArdClientError::Message(format!("AVC call ID random source failed: {error}"))
+                })?;
+                let video_call_id = format_uuid(video_call_id_bytes);
+                let audio_ssrc = generate_media_ssrc()?;
+                let video1_derived_ssrc = generate_media_ssrc()?;
                 // ScreenSharing's negotiator expects a VCCallInfoBlob with a
                 // recognizable Apple build string. Keep the protocol profile
                 // stable even when the Rust client is running on another OS.
@@ -793,8 +882,21 @@ impl ArdClient {
                             | MediaStreamFlags::VIEWER_APP,
                     ),
                     session_id,
-                    audio_offer: build_media_stream_offer(&call_id, &endpoint_info, 7, 1)?,
-                    video1_offer: build_media_stream_offer(&call_id, &endpoint_info, 7, 2)?,
+                    audio_offer: build_media_stream_offer_with_ssrc(
+                        &call_id,
+                        &endpoint_info,
+                        8,
+                        1,
+                        audio_ssrc,
+                    )?,
+                    video1_offer: build_media_stream_offer_with_ssrc_and_codec(
+                        &video_call_id,
+                        &endpoint_info,
+                        7,
+                        2,
+                        video1_derived_ssrc,
+                        preferred_codec,
+                    )?,
                     video2_offer: None,
                     keys,
                 };
@@ -808,10 +910,11 @@ impl ArdClient {
                 audio_server_to_viewer.fill(0);
                 video1_viewer_to_server.fill(0);
                 video1_server_to_viewer.fill(0);
+                video_call_id_bytes.fill(0);
                 self.media_offer_sent = true;
                 self.pending_media_stream = Some(PendingMediaStream {
                     endpoints: MediaUdpEndpoints::from_message1(self.media_host, &message),
-                    video1_server_to_viewer: video1_key_blob.clone(),
+                    video1_server_to_viewer: video1_key_blob,
                 });
                 if self.automatic_updates && !self.automatic_updates_started {
                     let request = build_ard_auto_frame_update(
@@ -833,28 +936,71 @@ impl ArdClient {
                     );
                     self.input.send_payload(request.to_vec())?;
                 }
-                // Message1 already gives us the video UDP endpoint and key.
-                // Start H.264 immediately; a later negotiator answer can
-                // replace the codec with HEVC by emitting a second event.
-                Ok(Some(ArdClientEvent::MediaStream(ArdMediaStream {
-                    endpoints: MediaUdpEndpoints::from_message1(self.media_host, &message),
-                    key_blob: video1_key_blob,
-                    codec: MediaStreamCodec::H264,
-                })))
+                // Message1 only supplies the endpoint and key. Wait for the
+                // negotiator answer before starting SRTP: its media blob
+                // carries the server stream SSRC.
+                Ok(None)
             }
             MediaStreamServerReply::Answer(MediaStreamAnswer { answer_body, .. }) => {
+                let parsed = MediaStreamOffer::parse(&answer_body).map_err(|error| {
+                    ArdClientError::Message(format!("AVC negotiator answer parse failed: {error}"))
+                })?;
                 let Some(mut pending) = self.pending_media_stream.take() else {
                     return Ok(None);
                 };
-                let codec = parse_negotiation_payload(&answer_body)
-                    .ok()
-                    .and_then(|config| config.codec)
-                    .unwrap_or(MediaStreamCodec::H264);
+                let derived_ssrc = parsed.remote_ssrc.ok_or_else(|| {
+                    ArdClientError::Message(
+                        "AVC negotiator answer did not provide the remote video SSRC".to_owned(),
+                    )
+                })?;
+                let mut codec_config = parsed.codec;
+                // Native Message2 can omit separate codec/payload selection
+                // fields. Resolve the payload mapping for the single codec
+                // requested by this quality profile.
+                let preferred_codec = self
+                    .reconnect_config
+                    .video_quality
+                    .preferred_media_codec()
+                    .ok_or_else(|| {
+                        ArdClientError::Message(
+                            "received AVC answer outside high-performance mode".to_owned(),
+                        )
+                    })?;
+                if let Some(mapping) = codec_config
+                    .payload_mappings
+                    .iter()
+                    .find(|mapping| mapping.codec == Some(preferred_codec))
+                {
+                    codec_config.payload_type = Some(mapping.payload_type);
+                    codec_config.codec = mapping.codec;
+                    if !mapping.encoding_name.is_empty() {
+                        codec_config.encoding_name = Some(mapping.encoding_name.clone());
+                    }
+                } else if codec_config.codec != Some(preferred_codec) {
+                    return Err(ArdClientError::Message(format!(
+                        "AVC negotiator did not accept requested codec {}",
+                        preferred_codec.name()
+                    )));
+                }
+                let codec = codec_config.codec.ok_or_else(|| {
+                    ArdClientError::Message(format!(
+                        "AVC negotiator selected unsupported codec: {codec_config:?}"
+                    ))
+                })?;
+                let payload_type = codec_config.payload_type.ok_or_else(|| {
+                    ArdClientError::Message(
+                        "AVC negotiator answer did not provide a selected RTP payload type"
+                            .to_owned(),
+                    )
+                })?;
                 let key_blob = core::mem::take(&mut pending.video1_server_to_viewer);
                 Ok(Some(ArdClientEvent::MediaStream(ArdMediaStream {
                     endpoints: pending.endpoints,
                     key_blob,
                     codec,
+                    payload_type,
+                    codec_config,
+                    derived_ssrc,
                 })))
             }
             MediaStreamServerReply::Error(error) => Err(ArdClientError::Message(format!(

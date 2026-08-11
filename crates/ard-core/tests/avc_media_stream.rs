@@ -1,6 +1,6 @@
 //! End-to-end tests for the AVC media stream negotiation wire format.
 
-use ard_rs::avc::{
+use ard_rs::media_stream::{
     CLIENT_MEDIA_STREAM_MESSAGE_TYPE, ENCODING_AVC_MEDIA_STREAM, MediaStreamAnswer,
     MediaStreamConfiguration, MediaStreamFlags, MediaStreamKeyMaterial, MediaStreamMessage1,
     MediaStreamOffer, MediaStreamServerReply, SERVER_MEDIA_STREAM_MESSAGE_TYPE,
@@ -147,8 +147,29 @@ fn server_answer_is_not_misclassified_as_message1() {
 }
 
 #[test]
+fn native_compact_server_answer_is_supported() {
+    let compact = vec![
+        0x00, 0x12, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x01, 0x3a, 0x01, 0xc2, 0x00,
+        0x00, b't', b'e', b's', b't',
+    ];
+    let (reply, consumed) = MediaStreamServerReply::parse_rectangle_payload_with_len(&compact)
+        .expect("parses compact answer");
+    assert_eq!(consumed, compact.len());
+    assert_eq!(
+        reply,
+        MediaStreamServerReply::Answer(MediaStreamAnswer {
+            flags: 1,
+            field_a: 0x013a,
+            field_b: 0x01c2,
+            field_c: 0,
+            answer_body: b"test".to_vec(),
+        })
+    );
+}
+
+#[test]
 fn server_error_round_trips_and_frames() {
-    let error = ard_rs::avc::MediaStreamError {
+    let error = ard_rs::media_stream::MediaStreamError {
         error_type: 3,
         error_sub_code: 7,
     };
@@ -185,13 +206,64 @@ fn compact_server_message1_envelope_is_supported() {
 }
 
 #[test]
+fn native_framebuffer_message1_tail_is_supported() {
+    let mut tail = vec![0_u8; 0x26];
+    tail[0..4].copy_from_slice(&[0x00, 0x24, 0x00, 0x01]);
+    tail[0x0a..0x0c].copy_from_slice(&5900_u16.to_be_bytes());
+    tail[0x0c..0x10].copy_from_slice(&1_u32.to_be_bytes());
+    tail[0x10..0x12].copy_from_slice(&5901_u16.to_be_bytes());
+    tail[0x12..0x16].copy_from_slice(&1_u32.to_be_bytes());
+
+    // The native dispatcher may append state-change notifications to the
+    // same encrypted record after the zero-sized AVC rectangle.
+    tail.extend_from_slice(&[0x14, 0, 0, 4, 0, 1, 0, 4]);
+    let (parsed, consumed) = MediaStreamMessage1::parse_with_len(&tail).expect("parses tail");
+    assert_eq!(consumed, 0x26);
+    assert_eq!(parsed.audio_port, Some(5900));
+    assert_eq!(parsed.video1_port, 5901);
+    assert_eq!(parsed.video2_port, None);
+}
+
+#[test]
+fn native_compact_server_error_is_supported() {
+    let mut payload = vec![
+        0x00, 0x10, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+        0x00, 0x00, 0x00,
+    ];
+    payload.extend_from_slice(&[0x14, 0, 0, 4, 0, 1, 0, 4]);
+    let (reply, consumed) = MediaStreamServerReply::parse_rectangle_payload_with_len(&payload)
+        .expect("parses compact error");
+    assert_eq!(consumed, 0x12);
+    assert_eq!(
+        reply,
+        MediaStreamServerReply::Error(ard_rs::media_stream::MediaStreamError {
+            error_type: 2,
+            error_sub_code: 0,
+        })
+    );
+
+    let mut framed = vec![SERVER_MEDIA_STREAM_MESSAGE_TYPE, 0, 0, 0x12];
+    framed.extend_from_slice(&payload[..0x12]);
+    let (reply, consumed) = MediaStreamServerReply::parse_framed(&framed).expect("frames error");
+    assert_eq!(consumed, framed.len());
+    assert_eq!(
+        reply,
+        MediaStreamServerReply::Error(ard_rs::media_stream::MediaStreamError {
+            error_type: 2,
+            error_sub_code: 0,
+        })
+    );
+}
+
+#[test]
 fn offer_plist_builder_round_trips() {
     let endpoint = build_remote_endpoint_info("Mac16,12", "25G72");
     assert_eq!(
         endpoint,
         vec![
             0x08, 0x00, 0x10, 0x01, 0x1a, 0x08, b'M', b'a', b'c', b'1', b'6', b',', b'1', b'2',
-            0x2a, 0x05, b'2', b'5', b'G', b'7', b'2',
+            0x22, 0x08, b'2', b'2', b'1', b'5', b'.', b'5', b'.', b'1', 0x2a, 0x05, b'2', b'5',
+            b'G', b'7', b'2',
         ]
     );
     let offer = build_media_stream_offer("0FE233A5-990F-4B52-B2B2-4FD1BCEB53CC", &endpoint, 7, 2)
@@ -207,7 +279,13 @@ fn offer_plist_builder_round_trips() {
         Some(endpoint.as_slice())
     );
     assert_eq!(parsed.mode, Some(7));
-    assert_eq!(parsed.direction, Some(2));
+    assert_eq!(parsed.direction, None);
+    assert!(
+        parsed
+            .media_blob
+            .as_ref()
+            .is_some_and(|blob| blob.starts_with(&[0x78, 0xda]))
+    );
 }
 
 #[cfg(target_os = "macos")]

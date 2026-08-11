@@ -21,7 +21,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 
-use ard_rs::avc::{
+use ard_rs::media_stream::{
     ENCODING_AVC_MEDIA_STREAM, MediaStreamMessage1, SERVER_MEDIA_STREAM_MESSAGE_TYPE,
 };
 

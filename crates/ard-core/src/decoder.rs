@@ -4,7 +4,7 @@ use crate::mvs::MvsState;
 use crate::wire::Cursor;
 use crate::{
     ArdEncryptionControl, Encoding, Error, Framebuffer, PixelFormat, Rectangle, Result,
-    avc::MediaStreamServerReply, parse_ard_encryption_control,
+    media_stream::MediaStreamServerReply, parse_ard_encryption_control,
 };
 
 const MAX_REUSABLE_ZRLE_SCRATCH: usize = 8 * 1024 * 1024;
@@ -142,9 +142,9 @@ impl Decoder {
                     "ARD AVC media-stream rectangle is not at the origin",
                 ));
             }
-            let (message, consumed) = crate::avc::MediaStreamMessage1::parse_with_len(payload)?;
-            self.pending_media_stream_replies
-                .push(MediaStreamServerReply::Message1(message));
+            let (message, consumed) =
+                MediaStreamServerReply::parse_rectangle_payload_with_len(payload)?;
+            self.pending_media_stream_replies.push(message);
             return Ok(consumed);
         }
         if encoding == Encoding::CursorPosition {
@@ -208,7 +208,8 @@ impl Decoder {
                 }
             }
             Encoding::ArdAvcMediaStream => {
-                let (_, consumed) = crate::avc::MediaStreamMessage1::parse_with_len(payload)?;
+                let (_, consumed) =
+                    MediaStreamServerReply::parse_rectangle_payload_with_len(payload)?;
                 Ok(consumed)
             }
             Encoding::CopyRect => fixed_payload_len(payload, 4),

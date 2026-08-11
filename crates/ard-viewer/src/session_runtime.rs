@@ -391,15 +391,17 @@ impl SessionRuntime {
     /// Start the AVC media stream video path (encoding 1010) on top of an
     /// already established RFB session. The negotiated UDP endpoints, the
     /// video1 server-to-viewer SRTP key and the negotiated codec come from
-    /// `ard_rs::avc`. Frames are decoded with VideoToolbox and pushed into
+    /// `ard_rs::media_stream`. Frames are decoded with VideoToolbox and pushed into
     /// the same mailbox as the rectangle/MVS paths.
     #[cfg(target_os = "macos")]
     #[allow(dead_code)]
     pub fn start_avc_media_stream(
         &mut self,
-        endpoints: ard_rs::avc::MediaUdpEndpoints,
+        endpoints: ard_rs::media_stream::MediaUdpEndpoints,
         key_blob: Vec<u8>,
-        codec: ard_rs::avc::MediaStreamCodec,
+        codec: ard_rs::media_stream::MediaStreamCodec,
+        payload_type: u8,
+        remote_ssrc: u32,
         quality: ArdVideoQuality,
     ) {
         use crate::media::spawn_avc_video_pipeline;
@@ -416,17 +418,25 @@ impl SessionRuntime {
         if let Some(previous) = self.avc_worker.take() {
             let _ = previous.join();
         }
-        let handle = spawn_avc_video_pipeline(endpoints, key_blob, codec, stop, move |frame| {
-            if let Ok(mut mailbox) = mailbox.lock() {
-                mailbox.replace_latest(FramePacket::from_rgba(
-                    u16::try_from(frame.width).unwrap_or(u16::MAX),
-                    u16::try_from(frame.height).unwrap_or(u16::MAX),
-                    frame.rgba,
-                    quality,
-                ));
-                frame_wake.notify();
-            }
-        });
+        let handle = spawn_avc_video_pipeline(
+            endpoints,
+            key_blob,
+            codec,
+            payload_type,
+            remote_ssrc,
+            stop,
+            move |frame| {
+                if let Ok(mut mailbox) = mailbox.lock() {
+                    mailbox.replace_latest(FramePacket::from_rgba(
+                        u16::try_from(frame.width).unwrap_or(u16::MAX),
+                        u16::try_from(frame.height).unwrap_or(u16::MAX),
+                        frame.rgba,
+                        quality,
+                    ));
+                    frame_wake.notify();
+                }
+            },
+        );
         self.avc_worker = Some(handle);
     }
 }
@@ -446,12 +456,11 @@ fn run_receiver(
 ) {
     let mut reconnecting = false;
     let mut attempts = 0;
-    let requested_quality =
-        if !cfg!(target_os = "macos") && config.quality == ArdVideoQuality::HighPerformance {
-            ArdVideoQuality::Adaptive
-        } else {
-            config.quality
-        };
+    let requested_quality = if !cfg!(target_os = "macos") && config.quality.is_high_performance() {
+        ArdVideoQuality::Adaptive
+    } else {
+        config.quality
+    };
     #[cfg(target_os = "macos")]
     let mut avc_stop: Option<Arc<AtomicBool>> = None;
     #[cfg(target_os = "macos")]
@@ -551,6 +560,8 @@ fn run_receiver(
                 Ok(ArdClientEvent::MediaStream(media)) => {
                     #[cfg(target_os = "macos")]
                     {
+                        let (endpoints, key_blob, codec_config, remote_ssrc) =
+                            media.into_video_pipeline_parts_with_config();
                         if let Some(stop) = avc_stop.take() {
                             stop.store(true, Ordering::Release);
                         }
@@ -562,10 +573,11 @@ fn run_receiver(
                         let pipeline_mailbox = Arc::clone(&mailbox);
                         let pipeline_wake = Arc::clone(&frame_wake);
                         let mut media_meter = RateMeter::new();
-                        let handle = crate::media::spawn_avc_video_pipeline(
-                            media.endpoints,
-                            media.key_blob.clone(),
-                            media.codec,
+                        let handle = crate::media::spawn_avc_video_pipeline_with_config(
+                            endpoints,
+                            key_blob,
+                            codec_config,
+                            remote_ssrc,
                             pipeline_stop,
                             move |frame| {
                                 if let Ok(mut mailbox) = pipeline_mailbox.lock() {
@@ -582,7 +594,7 @@ fn run_receiver(
                                         width,
                                         height,
                                         frame.rgba,
-                                        ArdVideoQuality::HighPerformance,
+                                        requested_quality,
                                     ));
                                     if let Some(metrics) = metrics {
                                         mailbox.metrics = metrics;

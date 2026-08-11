@@ -7,13 +7,13 @@
 //! version, security methods and framebuffer encodings.
 
 mod auth;
-pub mod avc;
 mod client;
 mod decoder;
 mod dispatcher;
 mod error;
 mod framebuffer;
 mod input;
+pub mod media_stream;
 mod mvs;
 mod oracle;
 mod protocol;
@@ -21,15 +21,6 @@ mod transport;
 mod wire;
 
 pub use auth::{ArdType30ClientExchange, build_ard_type30_client_exchange};
-pub use avc::udp::AvcVideoStreamReceiver;
-pub use avc::{
-    AccessUnit, CLIENT_MEDIA_STREAM_MESSAGE_TYPE, ENCODING_AVC_MEDIA_STREAM, H264Depacketizer,
-    HevcDepacketizer, MEDIA_STREAM_KEY_LEN, MEDIA_STREAM_MESSAGE_VERSION, MediaStreamAnswer,
-    MediaStreamCodec, MediaStreamConfiguration, MediaStreamError, MediaStreamFlags,
-    MediaStreamKeyMaterial, MediaStreamMessage1, MediaStreamOffer, MediaStreamServerReply,
-    MediaUdpEndpoints, MediaUdpSession, RtpHeader, RtpPacket, SERVER_MEDIA_STREAM_MESSAGE_TYPE,
-    UdpStreamKind, parse_negotiation_payload,
-};
 pub use client::{
     ArdClient, ArdClientConfig, ArdClientError, ArdClientEvent, ArdClientInput, ArdFrameInfo,
     ArdFrameOutput, ArdMediaStream, ArdReconnectPolicy, ArdVideoQuality,
@@ -48,6 +39,16 @@ pub use input::{
     XK_PRINT_SCREEN, XK_RETURN, XK_RIGHT, XK_SCROLL_LOCK, XK_SHIFT_LEFT, XK_SHIFT_RIGHT, XK_SPACE,
     XK_SUPER_LEFT, XK_SUPER_RIGHT, XK_TAB, XK_UP, keysym_for_key, keysym_for_named_key,
     unicode_keysym,
+};
+pub use media_stream::udp::AvcVideoStreamReceiver;
+pub use media_stream::{
+    AccessUnit, CLIENT_MEDIA_STREAM_MESSAGE_TYPE, ENCODING_AVC_MEDIA_STREAM, H264Depacketizer,
+    HevcDepacketizer, MEDIA_STREAM_KEY_LEN, MEDIA_STREAM_MESSAGE_VERSION, MediaStreamAnswer,
+    MediaStreamCodec, MediaStreamConfiguration, MediaStreamError, MediaStreamFlags,
+    MediaStreamKeyMaterial, MediaStreamMessage1, MediaStreamOffer, MediaStreamServerReply,
+    MediaUdpEndpoints, MediaUdpSession, RtpHeader, RtpPacket, SERVER_MEDIA_STREAM_MESSAGE_TYPE,
+    UdpStreamKind, VideoCodecConfig, VideoFormatParameters, VideoPayloadConfig,
+    parse_negotiation_payload,
 };
 pub use mvs::{MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate};
 pub use oracle::{EncryptedTransportOracle, OracleReport};

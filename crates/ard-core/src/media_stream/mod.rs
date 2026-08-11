@@ -1,4 +1,4 @@
-//! Apple AVC media stream mode (encoding 1010, `kSSVideoEncoding_AVCMediaStream`).
+//! Apple real-time media stream mode (encoding 1010, `kSSVideoEncoding_AVCMediaStream`).
 //!
 //! This is the third Screen Sharing video path, distinct from the VNC/RFB
 //! rectangle encodings and from MVS (`1011`). It negotiates a real-time
@@ -28,7 +28,9 @@ pub mod udp;
 pub mod wire;
 
 pub use negotiation::{
-    MediaStreamCodec, MediaStreamOffer, build_media_stream_offer, build_remote_endpoint_info,
+    MediaStreamCodec, MediaStreamOffer, VideoCodecConfig, VideoFormatParameters,
+    VideoPayloadConfig, build_media_stream_offer, build_media_stream_offer_with_ssrc,
+    build_media_stream_offer_with_ssrc_and_codec, build_remote_endpoint_info, media_stream_ssrc,
     parse_negotiation_payload,
 };
 pub use rtp::{AccessUnit, H264Depacketizer, HevcDepacketizer, RtpHeader, RtpPacket};

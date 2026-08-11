@@ -1,4 +1,4 @@
-//! Wire parsing and serialization for the AVC media stream negotiation.
+//! Wire parsing and serialization for Apple media stream negotiation.
 //!
 //! The layout below was recovered from macOS 26.6 (build 25G72) binaries:
 //!
@@ -6,13 +6,16 @@
 //!   (confirmed against `_RFBMediaStreamServerConfiguration` in
 //!   ScreenSharing.framework).
 //! * Server to viewer Message1: RFB server message `0x23` carrying the
-//!   encoding marker `1010` and consecutive UDP ports (confirmed against
+//!   encoding marker `1010` and consecutive UDP ports (audio at the base
+//!   port, video 1 at base+1, and video 2 at base+2; confirmed against
 //!   `EncodeRFBMediaStreamMessage1` in screensharingd).
 //! * Server to viewer Message2 (answer) and error message builders were
 //!   confirmed the same way.
 //!
 //! All parsers are bounded and reject messages whose length fields disagree
 //! with the available bytes.
+
+use std::fmt;
 
 use crate::{Error, Result};
 
@@ -63,9 +66,10 @@ impl MediaStreamFlags {
 /// Six SRTP key blobs exchanged during negotiation.
 ///
 /// Every key is 46 random bytes (confirmed: `AuthGetRandomBytes(0x2e)`);
-/// the first 16 bytes are the SRTP master key and bytes 16..30 the master
-/// salt, per RFC 3711 AES-128-CM.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the first 32 bytes are the native master key and the final 14 bytes are
+/// the native master salt. The native AVC path derives the suite-5 session
+/// material from this whole blob before applying AES-CTR.
+#[derive(Clone, PartialEq, Eq)]
 pub struct MediaStreamKeyMaterial {
     pub audio_viewer_to_server: [u8; MEDIA_STREAM_KEY_LEN],
     pub audio_server_to_viewer: [u8; MEDIA_STREAM_KEY_LEN],
@@ -73,6 +77,38 @@ pub struct MediaStreamKeyMaterial {
     pub video1_server_to_viewer: [u8; MEDIA_STREAM_KEY_LEN],
     pub video2_viewer_to_server: Option<[u8; MEDIA_STREAM_KEY_LEN]>,
     pub video2_server_to_viewer: Option<[u8; MEDIA_STREAM_KEY_LEN]>,
+}
+
+impl fmt::Debug for MediaStreamKeyMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MediaStreamKeyMaterial")
+            .field(
+                "audio_viewer_to_server_len",
+                &self.audio_viewer_to_server.len(),
+            )
+            .field(
+                "audio_server_to_viewer_len",
+                &self.audio_server_to_viewer.len(),
+            )
+            .field(
+                "video1_viewer_to_server_len",
+                &self.video1_viewer_to_server.len(),
+            )
+            .field(
+                "video1_server_to_viewer_len",
+                &self.video1_server_to_viewer.len(),
+            )
+            .field(
+                "video2_viewer_to_server_present",
+                &self.video2_viewer_to_server.is_some(),
+            )
+            .field(
+                "video2_server_to_viewer_present",
+                &self.video2_server_to_viewer.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl MediaStreamKeyMaterial {
@@ -354,6 +390,11 @@ pub struct MediaStreamMessage1 {
 }
 
 const MESSAGE1_STRUCT_LEN: usize = 0x44;
+/// The server's framebuffer-update path sends only the tail of the native
+/// 0x44-byte message1 allocation. The preceding 0x1e bytes are the RFB
+/// rectangle/message envelope, so the payload seen by the decoder is 0x26
+/// bytes and starts with `00 24 00 01`.
+const MESSAGE1_COMPACT_TAIL_LEN: usize = 0x26;
 const MESSAGE1_ENCODING_OFFSET: usize = 0x1a;
 const MESSAGE1_PORT1_OFFSET: usize = 0x28;
 const MESSAGE1_PORT2_OFFSET: usize = 0x2e;
@@ -377,6 +418,9 @@ impl MediaStreamMessage1 {
     /// The compact form used by older Screen Sharing builds is shorter than
     /// the fixed native structure, so stream framers must use this method.
     pub fn parse_with_len(body: &[u8]) -> Result<(Self, usize)> {
+        if is_compact_message1_tail(body) {
+            return Ok((Self::parse_compact_tail(body)?, MESSAGE1_COMPACT_TAIL_LEN));
+        }
         let (base, base_offset) = if body.len() >= MESSAGE1_STRUCT_LEN
             && u32::from_be_bytes(
                 body[MESSAGE1_ENCODING_OFFSET..MESSAGE1_ENCODING_OFFSET + 4]
@@ -422,17 +466,17 @@ impl MediaStreamMessage1 {
         if encoding != super::ENCODING_AVC_MEDIA_STREAM {
             return Err(Error::Invalid("not an AVC media stream message"));
         }
-        let video1_port = u16::from_be_bytes(
+        let audio_port = u16::from_be_bytes(
             base[MESSAGE1_PORT1_OFFSET..MESSAGE1_PORT1_OFFSET + 2]
                 .try_into()
                 .expect("slice"),
         );
-        let video2_port = u16::from_be_bytes(
+        let video1_port = u16::from_be_bytes(
             base[MESSAGE1_PORT2_OFFSET..MESSAGE1_PORT2_OFFSET + 2]
                 .try_into()
                 .expect("slice"),
         );
-        let audio_port = u16::from_be_bytes(
+        let video2_port = u16::from_be_bytes(
             base[MESSAGE1_PORT3_OFFSET..MESSAGE1_PORT3_OFFSET + 2]
                 .try_into()
                 .expect("slice"),
@@ -462,9 +506,9 @@ impl MediaStreamMessage1 {
             });
         }
         let encoding = u32::from_be_bytes(body[0x0c..0x10].try_into().expect("slice")) as i32;
-        let video1_port = u16::from_be_bytes(body[0x1a..0x1c].try_into().expect("slice"));
-        let video2_port = u16::from_be_bytes(body[0x20..0x22].try_into().expect("slice"));
-        let audio_port = u16::from_be_bytes(body[0x26..0x28].try_into().expect("slice"));
+        let audio_port = u16::from_be_bytes(body[0x1a..0x1c].try_into().expect("slice"));
+        let video1_port = u16::from_be_bytes(body[0x20..0x22].try_into().expect("slice"));
+        let video2_port = u16::from_be_bytes(body[0x26..0x28].try_into().expect("slice"));
         let port2_flags = u32::from_be_bytes(body[0x22..0x26].try_into().expect("slice"));
         let port3_flags = u32::from_be_bytes(body[0x28..0x2c].try_into().expect("slice"));
         Ok(Self {
@@ -478,6 +522,23 @@ impl MediaStreamMessage1 {
         })
     }
 
+    fn parse_compact_tail(body: &[u8]) -> Result<Self> {
+        let audio_port = u16::from_be_bytes(body[0x0a..0x0c].try_into().expect("tail checked"));
+        let video1_port = u16::from_be_bytes(body[0x10..0x12].try_into().expect("tail checked"));
+        let video2_port = u16::from_be_bytes(body[0x16..0x18].try_into().expect("tail checked"));
+        let video1_flags = u32::from_be_bytes(body[0x0c..0x10].try_into().expect("tail checked"));
+        let video2_flags = u32::from_be_bytes(body[0x12..0x16].try_into().expect("tail checked"));
+        Ok(Self {
+            encoding: super::ENCODING_AVC_MEDIA_STREAM,
+            video1_port,
+            video2_port: (video2_port != 0).then_some(video2_port),
+            audio_port: (audio_port != 0).then_some(audio_port),
+            video1_hdr: video1_flags & 0x0200_0000 != 0,
+            video2_hdr: video2_flags & 0x0200_0000 != 0,
+            stream_count: u16::from_be_bytes(body[0x02..0x04].try_into().expect("tail checked")),
+        })
+    }
+
     /// Serialize the 68-byte struct (tests and server oracle).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![0u8; MESSAGE1_STRUCT_LEN];
@@ -486,19 +547,17 @@ impl MediaStreamMessage1 {
         out[0x1a..0x1e].copy_from_slice(&(super::ENCODING_AVC_MEDIA_STREAM as u32).to_be_bytes());
         out[0x1e..0x22].copy_from_slice(&0x0100_2400u32.to_be_bytes());
         out[0x22..0x24].copy_from_slice(&0x0100u16.to_be_bytes());
-        out[0x28..0x2a].copy_from_slice(&self.video1_port.to_be_bytes());
-        out[0x2a..0x2e].copy_from_slice(&0x0100_0000u32.to_be_bytes());
-        out[0x2e..0x30].copy_from_slice(&self.video2_port.unwrap_or(0).to_be_bytes());
-        let p2flags = if self.video2_port.is_some() {
-            0x0100_0000u32 | if self.video1_hdr { 0x0200_0000 } else { 0 }
-        } else {
-            0
-        };
-        out[0x30..0x34].copy_from_slice(&p2flags.to_be_bytes());
         if let Some(audio) = self.audio_port {
-            out[0x34..0x36].copy_from_slice(&audio.to_be_bytes());
+            out[0x28..0x2a].copy_from_slice(&audio.to_be_bytes());
         }
-        let p3flags = if self.audio_port.is_some() {
+        out[0x2a..0x2e].copy_from_slice(&0x0100_0000u32.to_be_bytes());
+        out[0x2e..0x30].copy_from_slice(&self.video1_port.to_be_bytes());
+        let p2flags = 0x0100_0000u32 | if self.video1_hdr { 0x0200_0000 } else { 0 };
+        out[0x30..0x34].copy_from_slice(&p2flags.to_be_bytes());
+        if let Some(video2) = self.video2_port {
+            out[0x34..0x36].copy_from_slice(&video2.to_be_bytes());
+        }
+        let p3flags = if self.video2_port.is_some() {
             0x0100_0000u32 | if self.video2_hdr { 0x0200_0000 } else { 0 }
         } else {
             0
@@ -506,6 +565,13 @@ impl MediaStreamMessage1 {
         out[0x36..0x3a].copy_from_slice(&p3flags.to_be_bytes());
         out
     }
+}
+
+fn is_compact_message1_tail(body: &[u8]) -> bool {
+    body.len() >= MESSAGE1_COMPACT_TAIL_LEN
+        && body[0..2] == [0x00, 0x24]
+        && body[2..4] == [0x00, 0x01]
+        && u16::from_be_bytes(body[0x0a..0x0c].try_into().expect("tail checked")) != 0
 }
 
 /// Server reply "RFBMediaStreamMessage2" (answer). The negotiator answer body
@@ -558,6 +624,43 @@ impl MediaStreamAnswer {
         })
     }
 
+    fn parse_compact_with_len(bytes: &[u8]) -> Result<(Self, usize)> {
+        if bytes.len() < 0x12 {
+            return Err(Error::NeedMore {
+                needed: 0x12,
+                available: bytes.len(),
+            });
+        }
+        let body_len = usize::from(u16::from_be_bytes(
+            bytes[0..2].try_into().expect("slice checked"),
+        ));
+        let total = body_len
+            .checked_add(2)
+            .ok_or(Error::LimitExceeded("compact media stream answer"))?;
+        if body_len < 0x10 {
+            return Err(Error::Invalid("compact media stream answer is too short"));
+        }
+        if bytes.len() < total {
+            return Err(Error::NeedMore {
+                needed: total,
+                available: bytes.len(),
+            });
+        }
+        if bytes[2..6] != [0x00, 0x02, 0x00, 0x02] {
+            return Err(Error::Invalid("compact media stream answer discriminator"));
+        }
+        Ok((
+            Self {
+                flags: u32::from_be_bytes(bytes[0x06..0x0a].try_into().expect("slice")),
+                field_a: u16::from_be_bytes(bytes[0x0a..0x0c].try_into().expect("slice")),
+                field_b: u16::from_be_bytes(bytes[0x0c..0x0e].try_into().expect("slice")),
+                field_c: u16::from_be_bytes(bytes[0x0e..0x10].try_into().expect("slice")),
+                answer_body: bytes[0x10..total].to_vec(),
+            },
+            total,
+        ))
+    }
+
     /// Serialize the answer struct (tests and server oracle).
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body_len = u16::try_from(self.answer_body.len())
@@ -585,6 +688,8 @@ pub struct MediaStreamError {
     pub error_sub_code: u8,
 }
 
+const MEDIA_STREAM_ERROR_COMPACT_LEN: usize = 0x12;
+
 impl MediaStreamError {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 0x30 {
@@ -603,6 +708,32 @@ impl MediaStreamError {
             error_type: (flags >> 16) as u8,
             error_sub_code: (flags >> 8) as u8,
         })
+    }
+
+    fn parse_compact(bytes: &[u8]) -> Result<(Self, usize)> {
+        if bytes.len() < MEDIA_STREAM_ERROR_COMPACT_LEN {
+            return Err(Error::NeedMore {
+                needed: MEDIA_STREAM_ERROR_COMPACT_LEN,
+                available: bytes.len(),
+            });
+        }
+        if bytes[0..2] != [0x00, 0x10] || bytes[2..4] != [0x00, 0x03] || bytes[4..6] != [0x00, 0x01]
+        {
+            return Err(Error::Invalid("invalid compact AVC media stream error"));
+        }
+        let error_type = u32::from_be_bytes(bytes[0x0a..0x0e].try_into().expect("slice"));
+        let error_sub_code = u32::from_be_bytes(bytes[0x0e..0x12].try_into().expect("slice"));
+        let error_type = u8::try_from(error_type)
+            .map_err(|_| Error::Invalid("compact AVC media stream error type is too large"))?;
+        let error_sub_code = u8::try_from(error_sub_code)
+            .map_err(|_| Error::Invalid("compact AVC media stream error subcode is too large"))?;
+        Ok((
+            Self {
+                error_type,
+                error_sub_code,
+            },
+            MEDIA_STREAM_ERROR_COMPACT_LEN,
+        ))
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -625,6 +756,22 @@ pub enum MediaStreamServerReply {
 }
 
 impl MediaStreamServerReply {
+    /// Parse the payload of a zero-sized framebuffer rectangle carrying an
+    /// AVC server reply. Native Screen Sharing uses a compact 18-byte error
+    /// record when it rejects the media configuration.
+    pub fn parse_rectangle_payload_with_len(payload: &[u8]) -> Result<(Self, usize)> {
+        if is_compact_media_stream_error(payload) {
+            return MediaStreamError::parse_compact(payload)
+                .map(|(error, consumed)| (Self::Error(error), consumed));
+        }
+        if is_compact_media_stream_answer(payload) {
+            return MediaStreamAnswer::parse_compact_with_len(payload)
+                .map(|(answer, consumed)| (Self::Answer(answer), consumed));
+        }
+        MediaStreamMessage1::parse_with_len(payload)
+            .map(|(message, consumed)| (Self::Message1(message), consumed))
+    }
+
     /// Classify a body by looking for the AVC marker and confirmed fields.
     pub fn parse(message_type: u8, body: &[u8]) -> Result<Self> {
         if message_type != SERVER_MEDIA_STREAM_MESSAGE_TYPE {
@@ -638,6 +785,16 @@ impl MediaStreamServerReply {
         } else {
             body
         };
+        if is_compact_media_stream_error(body) {
+            return MediaStreamError::parse_compact(body).map(|(error, _)| Self::Error(error));
+        }
+        if is_compact_media_stream_answer(body) {
+            return MediaStreamAnswer::parse_compact_with_len(body)
+                .map(|(answer, _)| Self::Answer(answer));
+        }
+        if is_compact_message1_tail(body) {
+            return MediaStreamMessage1::parse(body).map(Self::Message1);
+        }
         if body.len() >= 0x10
             && u32::from_be_bytes(body[0x0c..0x10].try_into().expect("slice"))
                 == super::ENCODING_AVC_MEDIA_STREAM as u32
@@ -690,12 +847,21 @@ impl MediaStreamServerReply {
             available: bytes.len(),
         })?;
 
+        if is_compact_media_stream_error(body) {
+            let (error, consumed) = MediaStreamError::parse_compact(body)?;
+            return Ok((Self::Error(error), 1 + consumed));
+        }
+        if is_compact_media_stream_answer(body) {
+            let (answer, consumed) = MediaStreamAnswer::parse_compact_with_len(body)?;
+            return Ok((Self::Answer(answer), 1 + consumed));
+        }
+
         // Compact envelope: [pad][u16 payload length][payload]. A fixed
         // Message1 also starts with zero bytes, so require a plausible
         // compact payload length before taking this branch.
         if body.len() >= 3
             && body[0] == 0
-            && usize::from(u16::from_be_bytes([body[1], body[2]])) >= 0x2c
+            && usize::from(u16::from_be_bytes([body[1], body[2]])) >= 0x12
         {
             let payload_len = usize::from(u16::from_be_bytes([body[1], body[2]]));
             let total = 1usize
@@ -766,6 +932,19 @@ impl MediaStreamServerReply {
             available: bytes.len(),
         })
     }
+}
+
+fn is_compact_media_stream_error(bytes: &[u8]) -> bool {
+    bytes.len() >= MEDIA_STREAM_ERROR_COMPACT_LEN
+        && bytes[0..2] == [0x00, 0x10]
+        && bytes[2..4] == [0x00, 0x03]
+        && bytes[4..6] == [0x00, 0x01]
+}
+
+fn is_compact_media_stream_answer(bytes: &[u8]) -> bool {
+    bytes.len() >= 0x12
+        && usize::from(u16::from_be_bytes([bytes[0], bytes[1]])) >= 0x10
+        && bytes[2..6] == [0x00, 0x02, 0x00, 0x02]
 }
 
 fn write_key(out: &mut [u8], pos: usize, key: &[u8; MEDIA_STREAM_KEY_LEN]) -> Result<usize> {

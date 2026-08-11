@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use ard_rs::avc::udp::AvcVideoStreamReceiver;
-use ard_rs::avc::{MediaStreamCodec, MediaUdpEndpoints, UdpStreamKind};
+use ard_rs::media_stream::udp::AvcVideoStreamReceiver;
+use ard_rs::media_stream::{MediaStreamCodec, MediaUdpEndpoints, UdpStreamKind, VideoCodecConfig};
 
 use super::DecodedFrame;
 use super::vt::VideoToolboxDecoder;
@@ -24,30 +24,76 @@ pub fn spawn_avc_video_pipeline(
     endpoints: MediaUdpEndpoints,
     key_blob: Vec<u8>,
     codec: MediaStreamCodec,
+    payload_type: u8,
+    remote_ssrc: u32,
+    stop: Arc<AtomicBool>,
+    on_frame: impl FnMut(DecodedFrame) + Send + 'static,
+) -> JoinHandle<()> {
+    let codec_config = VideoCodecConfig {
+        codec: Some(codec),
+        payload_type: Some(payload_type),
+        ..VideoCodecConfig::default()
+    };
+    spawn_avc_video_pipeline_with_config(
+        endpoints,
+        key_blob,
+        codec_config,
+        remote_ssrc,
+        stop,
+        on_frame,
+    )
+}
+
+/// Spawn the AVC pipeline using the complete codec configuration extracted
+/// from the negotiator answer. In particular, the worker never infers a
+/// codec or payload type from RTP payload bytes.
+pub fn spawn_avc_video_pipeline_with_config(
+    endpoints: MediaUdpEndpoints,
+    key_blob: Vec<u8>,
+    codec_config: VideoCodecConfig,
+    remote_ssrc: u32,
     stop: Arc<AtomicBool>,
     mut on_frame: impl FnMut(DecodedFrame) + Send + 'static,
 ) -> JoinHandle<()> {
     thread::Builder::new()
-        .name("ard-avc-media".into())
+        .name("ard-media-stream".into())
         .spawn(move || {
+            let mut key_blob = key_blob;
+            let Some(codec) = codec_config.codec else {
+                key_blob.fill(0);
+                return;
+            };
+            let Some(payload_type) = codec_config.payload_type else {
+                key_blob.fill(0);
+                return;
+            };
             let mut receiver = match AvcVideoStreamReceiver::new(
                 &endpoints,
                 UdpStreamKind::Video1,
                 &key_blob,
                 codec,
+                payload_type,
+                remote_ssrc,
             ) {
                 Ok(receiver) => receiver,
-                Err(_) => return,
+                Err(_) => {
+                    key_blob.fill(0);
+                    return;
+                }
             };
+            // SrtpContext keeps only the derived session material. Do not
+            // retain the negotiated master blob for the lifetime of the
+            // receive/decode thread.
+            key_blob.fill(0);
             let mut decoder = VideoToolboxDecoder::new(codec);
             let mut last_frame = Instant::now();
             const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
             while !stop.load(Ordering::Relaxed) {
                 match receiver.receive() {
                     Ok(Some(unit)) => {
-                        last_frame = Instant::now();
                         let encoded_bytes = unit.avcc_len();
                         if let Some(mut frame) = decoder.decode(&unit) {
+                            last_frame = Instant::now();
                             frame.encoded_bytes = encoded_bytes;
                             on_frame(frame);
                         }

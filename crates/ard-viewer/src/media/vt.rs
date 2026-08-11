@@ -1,6 +1,6 @@
 //! macOS VideoToolbox decoder for the AVC media stream.
 //!
-//! Consumes access units (H.264 or HEVC NAL units) from `ard_rs::avc`, builds
+//! Consumes access units (H.264 or HEVC NAL units) from `ard_rs::media_stream`, builds
 //! a `CMVideoFormatDescription` from the parameter sets, decodes with a
 //! `VTDecompressionSession`, and returns RGBA8 pixels for the viewer's
 //! existing framebuffer path.
@@ -11,7 +11,7 @@
 use std::os::raw::{c_int, c_void};
 use std::sync::Mutex;
 
-use ard_rs::avc::{AccessUnit, MediaStreamCodec};
+use ard_rs::media_stream::{AccessUnit, MediaStreamCodec};
 
 use super::DecodedFrame;
 
@@ -87,6 +87,7 @@ unsafe extern "C" {
         parameter_set_pointers: *const *const u8,
         parameter_set_sizes: *const usize,
         nal_unit_header_length: c_int,
+        extensions: CFDictionaryRef,
         format_description_out: *mut CMVideoFormatDescriptionRef,
     ) -> OSStatus;
     fn CMVideoFormatDescriptionGetDimensions(
@@ -347,6 +348,7 @@ impl VideoToolboxDecoder {
                     pointers.as_ptr(),
                     sizes.as_ptr(),
                     4,
+                    std::ptr::null(),
                     &mut format_description,
                 ),
             }
@@ -360,7 +362,6 @@ impl VideoToolboxDecoder {
         let callback: VTDecompressionOutputCallback = decompression_output_callback;
         let record = VTDecompressionOutputCallbackRecord { callback, refcon };
         let Some(destination_attributes) = DestinationAttributes::new() else {
-            eprintln!("destination attributes creation failed");
             unsafe { CFRelease(format_description as *const c_void) };
             return Err(());
         };
@@ -561,7 +562,7 @@ unsafe fn pixel_buffer_to_rgba(buffer: CVPixelBufferRef) -> Option<DecodedFrame>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ard_rs::avc::AccessUnit;
+    use ard_rs::media_stream::AccessUnit;
 
     /// Split an Annex-B byte stream into access units, keeping parameter sets
     /// with the following VCL NAL units.
@@ -625,7 +626,6 @@ mod tests {
     fn decodes_real_h264_sample_with_videotoolbox() {
         let path = "/tmp/ardre/avc_test/sample.h264";
         let Ok(bytes) = std::fs::read(path) else {
-            eprintln!("skipping: {path} not available");
             return;
         };
         let units = annex_b_to_access_units(&bytes);
@@ -646,8 +646,5 @@ mod tests {
         assert_eq!(first.width, 320);
         assert_eq!(first.height, 240);
         assert_eq!(first.rgba.len(), 320 * 240 * 4);
-        let out = "/tmp/ardre/avc_test/out.rgba";
-        std::fs::write(out, &first.rgba).expect("write rgba");
-        eprintln!("decoded {decoded} frames; first frame dumped to {out}");
     }
 }

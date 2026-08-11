@@ -67,6 +67,7 @@ impl Language {
             "添加到历史连接" => "Add to connection history",
             "连接参数" => "Connection options",
             "视频质量" => "Video quality",
+            "高性能编码" => "High-performance codecs",
             "帧率 (FPS)" => "Frame rate (FPS)",
             "画面插值" => "Display interpolation",
             "三次锐化采样" => "Bicubic sharp sampling",

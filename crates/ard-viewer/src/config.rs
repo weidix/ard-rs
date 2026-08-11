@@ -277,7 +277,9 @@ pub fn quality_from_cache(value: &str) -> ArdVideoQuality {
         "low" => ArdVideoQuality::Low,
         "medium" => ArdVideoQuality::Medium,
         "high" => ArdVideoQuality::High,
-        "high-performance" => ArdVideoQuality::HighPerformance,
+        // Older versions exposed one AVC mode whose live path selected HEVC.
+        "high-performance" | "hevc" => ArdVideoQuality::HighPerformanceHevc,
+        "avc" => ArdVideoQuality::HighPerformanceAvc,
         "full" => ArdVideoQuality::Full,
         _ => ArdVideoQuality::Adaptive,
     }
@@ -288,7 +290,8 @@ pub fn quality_to_cache(value: ArdVideoQuality) -> &'static str {
         ArdVideoQuality::Low => "low",
         ArdVideoQuality::Medium => "medium",
         ArdVideoQuality::High => "high",
-        ArdVideoQuality::HighPerformance => "high-performance",
+        ArdVideoQuality::HighPerformanceHevc => "hevc",
+        ArdVideoQuality::HighPerformanceAvc => "avc",
         ArdVideoQuality::Adaptive => "adaptive",
         ArdVideoQuality::Full => "full",
     }
@@ -364,7 +367,12 @@ fn toolbar_button_to_cache(button: ToolbarButton) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, toolbar_buttons_from_cache, toolbar_buttons_to_cache};
+    use ard_rs::ArdVideoQuality;
+
+    use super::{
+        AppConfig, quality_from_cache, quality_to_cache, toolbar_buttons_from_cache,
+        toolbar_buttons_to_cache,
+    };
     use crate::state::ToolbarButton;
 
     #[test]
@@ -434,6 +442,20 @@ mod tests {
                 "zoom-in".to_owned(),
                 "desktop".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn avc_codec_quality_choices_round_trip() {
+        for quality in [
+            ArdVideoQuality::HighPerformanceHevc,
+            ArdVideoQuality::HighPerformanceAvc,
+        ] {
+            assert_eq!(quality_from_cache(quality_to_cache(quality)), quality);
+        }
+        assert_eq!(
+            quality_from_cache("high-performance"),
+            ArdVideoQuality::HighPerformanceHevc
         );
     }
 }
