@@ -68,7 +68,7 @@ impl Language {
             "连接参数" => "Connection options",
             "视频质量" => "Video quality",
             "远程分辨率" => "Remote resolution",
-            "不更改（例如 2560x1440）" => "Keep current (for example 2560x1440)",
+            "仅高性能模式下生效" => "Only applies in high-performance mode",
             "请输入有效分辨率，例如 2560x1440 或 2560x1440,1920x1080" => {
                 "Enter a valid resolution, such as 2560x1440 or 2560x1440,1920x1080"
             }

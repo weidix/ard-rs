@@ -62,6 +62,8 @@ struct ArdViewer {
     remember_device: bool,
     quality: ArdVideoQuality,
     resolution: String,
+    resolution_width: String,
+    resolution_height: String,
     open_dropdown: Option<DropdownMenu>,
     frame_rate: String,
     should_interpolate: bool,
@@ -157,7 +159,8 @@ enum Message {
     ToggleDropdown(DropdownMenu),
     CloseDropdown,
     QualityChanged(ArdVideoQuality),
-    ResolutionChanged(String),
+    ResolutionWidthChanged(String),
+    ResolutionHeightChanged(String),
     FrameRateChanged(String),
     ShouldInterpolateChanged(bool),
     SharpSamplingChanged(bool),
@@ -221,6 +224,7 @@ impl ArdViewer {
             && cached.remember_password
             && config::load_password(&endpoint, &username).is_some();
         let mappings = profile_mappings(&cached.key_profile);
+        let (resolution_width, resolution_height) = split_resolution(&cached.resolution);
         let app = Self {
             windows: BTreeMap::new(),
             maximized_windows: BTreeSet::new(),
@@ -243,6 +247,8 @@ impl ArdViewer {
             remember_device: cached.remember_device,
             quality: config::quality_from_cache(&cached.quality),
             resolution: cached.resolution.clone(),
+            resolution_width,
+            resolution_height,
             open_dropdown: None,
             frame_rate: if cached.frame_rate.is_empty() {
                 frame_rate_from_interval(&cached.frame_interval_ms)
@@ -560,14 +566,22 @@ impl ArdViewer {
                 self.open_dropdown = None;
                 self.persist_config();
             }
-            Message::ResolutionChanged(value) => {
-                self.resolution = value
+            Message::ResolutionWidthChanged(value) => {
+                self.resolution_width = value
                     .chars()
-                    .filter(|character| {
-                        character.is_ascii_digit() || matches!(character, 'x' | 'X' | ',' | ' ')
-                    })
-                    .take(48)
+                    .filter(char::is_ascii_digit)
+                    .take(5)
                     .collect();
+                self.join_resolution();
+                self.persist_config();
+            }
+            Message::ResolutionHeightChanged(value) => {
+                self.resolution_height = value
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .take(5)
+                    .collect();
+                self.join_resolution();
                 self.persist_config();
             }
             Message::FrameRateChanged(value) => {
@@ -1095,6 +1109,15 @@ impl ArdViewer {
         }
     }
 
+    fn join_resolution(&mut self) {
+        self.resolution =
+            if self.resolution_width.is_empty() && self.resolution_height.is_empty() {
+                String::new()
+            } else {
+                format!("{}x{}", self.resolution_width, self.resolution_height)
+            };
+    }
+
     fn persist_config(&mut self) {
         let has_history = !self.devices.is_empty();
         let cached = config::AppConfig {
@@ -1584,6 +1607,17 @@ fn frame_interval_from_rate(value: &str) -> u64 {
         0 => 0,
         frames_per_second => (1000 / frames_per_second).max(1),
     }
+}
+
+fn split_resolution(value: &str) -> (String, String) {
+    let Some((width, height)) = value
+        .split(',')
+        .next()
+        .and_then(|dimensions| dimensions.trim().split_once(['x', 'X']))
+    else {
+        return (String::new(), String::new());
+    };
+    (width.trim().to_owned(), height.trim().to_owned())
 }
 
 fn parse_display_configuration(value: &str) -> Result<Option<ArdDisplayConfiguration>, ()> {

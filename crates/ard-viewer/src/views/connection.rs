@@ -176,7 +176,9 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             .width(Fill)
             .center(Fill)
         } else {
-            container(scrollable(devices)).height(Fill).width(Fill)
+            container(scrollable(devices).style(theme::connection_scrollable))
+                .height(Fill)
+                .width(Fill)
         },
     ]
     .spacing(8)
@@ -421,13 +423,33 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .spacing(18);
 
     let quality = quality_selector(app);
-    let resolution =
-        iced::widget::text_input(app.language.tr("不更改（例如 2560x1440）"), &app.resolution)
-            .on_input(Message::ResolutionChanged)
-            .width(PARAMETER_CONTROL_WIDTH)
-            .padding([10.0, CONTROL_PADDING_X])
-            .size(PARAMETER_TEXT_SIZE)
-            .style(theme::connection_parameter_input);
+    let resolution = column![
+        row![
+            iced::widget::text_input("2560", &app.resolution_width)
+                .on_input(Message::ResolutionWidthChanged)
+                .width(Fill)
+                .padding([10.0, CONTROL_PADDING_X])
+                .size(PARAMETER_TEXT_SIZE)
+                .style(theme::connection_parameter_input),
+            text("×")
+                .size(PARAMETER_TEXT_SIZE)
+                .color(theme::palette().text_muted),
+            iced::widget::text_input("1440", &app.resolution_height)
+                .on_input(Message::ResolutionHeightChanged)
+                .width(Fill)
+                .padding([10.0, CONTROL_PADDING_X])
+                .size(PARAMETER_TEXT_SIZE)
+                .style(theme::connection_parameter_input),
+        ]
+        .spacing(6)
+        .width(Fill)
+        .align_y(Alignment::Center),
+        text(app.language.tr("仅高性能模式下生效"))
+            .size(PARAMETER_CAPTION_SIZE)
+            .color(theme::palette().text_warm),
+    ]
+    .spacing(4)
+    .width(PARAMETER_CONTROL_WIDTH);
     let frame_rate = iced::widget::text_input(app.language.tr("自动"), &app.frame_rate)
         .on_input(Message::FrameRateChanged)
         .width(PARAMETER_CONTROL_WIDTH)
@@ -455,13 +477,23 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .width(PARAMETER_CONTROL_WIDTH)
     .center_y(CONTROL_HEIGHT);
     let parameter_rows = column![
-        connection_parameter_row(app.language.tr("视频质量"), quality),
-        connection_parameter_row(app.language.tr("远程分辨率"), resolution),
-        connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate),
-        connection_parameter_row(app.language.tr("画面插值"), interpolation),
-        connection_parameter_row(app.language.tr("三次锐化采样"), sharp_sampling),
+        connection_parameter_row(app.language.tr("视频质量"), quality, CONTROL_HEIGHT),
+        connection_parameter_row(app.language.tr("远程分辨率"), resolution, 52.0),
+        connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate, CONTROL_HEIGHT),
+        connection_parameter_row(app.language.tr("画面插值"), interpolation, CONTROL_HEIGHT),
+        connection_parameter_row(
+            app.language.tr("三次锐化采样"),
+            sharp_sampling,
+            CONTROL_HEIGHT
+        ),
     ]
-    .spacing(8);
+    .spacing(8)
+    .padding(iced::Padding {
+        top: 0.0,
+        right: 12.0,
+        bottom: 0.0,
+        left: 0.0,
+    });
     let advanced = container(
         column![
             row![
@@ -575,6 +607,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
 fn connection_parameter_row<'a>(
     label: &'a str,
     control: impl Into<Element<'a, Message>>,
+    height: f32,
 ) -> Element<'a, Message> {
     row![
         text(label)
@@ -583,7 +616,7 @@ fn connection_parameter_row<'a>(
             .width(Fill),
         control.into(),
     ]
-    .height(CONTROL_HEIGHT)
+    .height(height)
     .align_y(Alignment::Center)
     .into()
 }
