@@ -23,7 +23,6 @@ const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// slice uses an adjacent SSRC with independent SRTP/RTP state, while all four
 /// share one interleaved video decoder reference chain.
 pub const AVC_VIDEO_SLICE_COUNT: usize = 4;
-const MAX_PENDING_ACCESS_UNIT_GROUPS: usize = 64;
 /// Which media stream a UDP socket carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpStreamKind {
@@ -133,7 +132,6 @@ pub struct AvcVideoStreamReceiver {
     buffer: Vec<u8>,
     decrypted_buffer: Vec<u8>,
     ready_frames: VecDeque<(usize, AccessUnit)>,
-    pending_frames: AccessUnitGroupQueue,
     packets_received: usize,
     decrypted_packets: usize,
     heartbeats_sent: usize,
@@ -166,6 +164,7 @@ struct InboundVideoStream {
     srtp: SrtpContext,
     reorder: RtpReorderBuffer,
     depacketizer: VideoDepacketizer,
+    completed: VecDeque<AccessUnit>,
 }
 
 impl InboundVideoStream {
@@ -174,19 +173,19 @@ impl InboundVideoStream {
             srtp: SrtpContext::from_key_blob_with_derived_ssrc(key_blob, ssrc)?,
             reorder: RtpReorderBuffer::with_codec(codec),
             depacketizer: VideoDepacketizer::new(codec),
+            completed: VecDeque::new(),
         })
     }
 
-    fn push_decrypted_packet(&mut self, packet: &[u8]) -> Result<Vec<AccessUnit>> {
+    fn push_decrypted_packet(&mut self, packet: &[u8]) -> Result<()> {
         let ready_packets = self.reorder.push(packet)?;
-        let mut completed = Vec::new();
         for packet in ready_packets {
             let packet = RtpPacket::parse(&packet)?;
             if let Some(unit) = self.depacketizer.push(&packet)? {
-                completed.push(unit);
+                self.completed.push_back(unit);
             }
         }
-        Ok(completed)
+        Ok(())
     }
 }
 
@@ -195,92 +194,36 @@ struct FeedbackStream {
     srtcp: SrtcpContext,
 }
 
-struct PendingAccessUnitGroup {
-    timestamp: u32,
-    slices: [Option<AccessUnit>; AVC_VIDEO_SLICE_COUNT],
-}
-
-struct AccessUnitGroupQueue {
-    groups: VecDeque<PendingAccessUnitGroup>,
-    last_released_timestamp: Option<u32>,
-}
-
-impl AccessUnitGroupQueue {
-    fn new() -> Self {
-        Self {
-            groups: VecDeque::new(),
-            last_released_timestamp: None,
+/// Scan interleaved streams in index order, collect every completed AU, then
+/// sort the scheduled items before decode. This is the native receiver's
+/// process/schedule/insert sequence and intentionally has no four-slice
+/// timestamp barrier: unchanged desktop bands may be absent.
+fn process_completed_frames(streams: &mut [InboundVideoStream]) -> VecDeque<(usize, AccessUnit)> {
+    let mut scheduled = Vec::new();
+    for (stream_index, stream) in streams.iter_mut().enumerate() {
+        while let Some(unit) = stream.completed.pop_front() {
+            insert_scheduled_item(&mut scheduled, stream_index, unit);
         }
     }
-
-    fn push(&mut self, slice_index: usize, unit: AccessUnit) -> Vec<(usize, AccessUnit)> {
-        if slice_index >= AVC_VIDEO_SLICE_COUNT
-            || self.last_released_timestamp.is_some_and(|last| {
-                unit.timestamp == last || !timestamp_is_newer(unit.timestamp, last)
-            })
-        {
-            return Vec::new();
-        }
-        let position = if let Some(position) = self
-            .groups
-            .iter()
-            .position(|group| group.timestamp == unit.timestamp)
-        {
-            position
-        } else {
-            let position = self
-                .groups
-                .iter()
-                .position(|group| timestamp_is_newer(group.timestamp, unit.timestamp))
-                .unwrap_or(self.groups.len());
-            self.groups.insert(
-                position,
-                PendingAccessUnitGroup {
-                    timestamp: unit.timestamp,
-                    slices: std::array::from_fn(|_| None),
-                },
-            );
-            position
-        };
-        let slot = &mut self.groups[position].slices[slice_index];
-        if slot.is_some() {
-            return Vec::new();
-        }
-        *slot = Some(unit);
-
-        let mut ready = Vec::new();
-        // AVConference schedules completed frames from every interleaved RTP
-        // stream by RTP timestamp, retaining stream-index order for ties. It
-        // does not require all streams to contribute to every timestamp: an
-        // unchanged desktop band is legitimately absent. Keep the newest
-        // timestamp as a small jitter window, but release a complete group
-        // immediately and never discard a sparse group at the queue bound.
-        while self.groups.len() > 1
-            || self
-                .groups
-                .front()
-                .is_some_and(|group| group.slices.iter().all(Option::is_some))
-            || self.groups.len() > MAX_PENDING_ACCESS_UNIT_GROUPS
-        {
-            let group = self
-                .groups
-                .pop_front()
-                .expect("release condition requires a group");
-            self.last_released_timestamp = Some(group.timestamp);
-            ready.extend(
-                group
-                    .slices
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, unit)| unit.map(|unit| (index, unit))),
-            );
-        }
-        ready
-    }
+    scheduled.into()
 }
 
-fn timestamp_is_newer(candidate: u32, reference: u32) -> bool {
-    candidate != reference && candidate.wrapping_sub(reference) < 0x8000_0000
+fn insert_scheduled_item(
+    scheduled: &mut Vec<(usize, AccessUnit)>,
+    stream_index: usize,
+    unit: AccessUnit,
+) {
+    let position = scheduled
+        .iter()
+        .position(|(_, current)| timestamp_precedes(unit.timestamp, current.timestamp))
+        .unwrap_or(scheduled.len());
+    // Equal timestamps insert after existing items, preserving the stream
+    // scan order above.
+    scheduled.insert(position, (stream_index, unit));
+}
+
+fn timestamp_precedes(candidate: u32, reference: u32) -> bool {
+    (candidate.wrapping_sub(reference) as i32).is_negative()
 }
 
 /// Borrowed session credentials for one bidirectional AVC media stream.
@@ -327,7 +270,6 @@ impl AvcVideoStreamReceiver {
             buffer: vec![0u8; MAX_RTP_PACKET],
             decrypted_buffer: Vec::with_capacity(MAX_RTP_PACKET),
             ready_frames: VecDeque::new(),
-            pending_frames: AccessUnitGroupQueue::new(),
             packets_received: 0,
             decrypted_packets: 0,
             heartbeats_sent: 0,
@@ -414,12 +356,10 @@ impl AvcVideoStreamReceiver {
             payload_offset,
         )?;
         self.decrypted_packets += 1;
-        let completed = stream.push_decrypted_packet(&self.decrypted_buffer)?;
-        for completed in completed {
-            self.frames += 1;
-            self.ready_frames
-                .extend(self.pending_frames.push(stream_index, completed));
-        }
+        stream.push_decrypted_packet(&self.decrypted_buffer)?;
+        let completed = process_completed_frames(&mut self.streams);
+        self.frames += completed.len();
+        self.ready_frames.extend(completed);
         Ok(self.ready_frames.pop_front())
     }
 
@@ -467,7 +407,7 @@ fn io_error(error: std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{AVC_VIDEO_SLICE_COUNT, AccessUnitGroupQueue, is_rtcp};
+    use super::{AVC_VIDEO_SLICE_COUNT, insert_scheduled_item, is_rtcp};
     use crate::media_stream::AccessUnit;
 
     #[test]
@@ -491,12 +431,11 @@ mod tests {
     }
 
     #[test]
-    fn completed_slices_are_released_in_reference_chain_order() {
-        let mut queue = AccessUnitGroupQueue::new();
-        assert!(queue.push(3, unit(100, 3)).is_empty());
-        assert!(queue.push(0, unit(100, 0)).is_empty());
-        assert!(queue.push(2, unit(100, 2)).is_empty());
-        let ready = queue.push(1, unit(100, 1));
+    fn completed_slices_are_stably_sorted_in_stream_scan_order() {
+        let mut ready = Vec::new();
+        for index in 0..AVC_VIDEO_SLICE_COUNT {
+            insert_scheduled_item(&mut ready, index, unit(100, index as u8));
+        }
         assert_eq!(
             ready
                 .iter()
@@ -507,28 +446,32 @@ mod tests {
     }
 
     #[test]
-    fn newer_timestamp_releases_sparse_older_group_in_stream_order() {
-        let mut queue = AccessUnitGroupQueue::new();
-        assert!(queue.push(0, unit(100, 0)).is_empty());
-        assert!(queue.push(2, unit(100, 2)).is_empty());
-        let ready = queue.push(1, unit(200, 1));
+    fn sparse_updates_are_sorted_without_waiting_for_four_slices() {
+        let mut ready = Vec::new();
+        insert_scheduled_item(&mut ready, 1, unit(200, 1));
+        insert_scheduled_item(&mut ready, 0, unit(100, 0));
+        insert_scheduled_item(&mut ready, 2, unit(100, 2));
         assert_eq!(
             ready
                 .iter()
                 .map(|(index, unit)| (*index, unit.timestamp))
                 .collect::<Vec<_>>(),
-            vec![(0, 100), (2, 100)]
+            vec![(0, 100), (2, 100), (1, 200)]
         );
     }
 
     #[test]
-    fn complete_newest_group_is_released_without_waiting_for_next_timestamp() {
-        let mut queue = AccessUnitGroupQueue::new();
-        for index in 0..AVC_VIDEO_SLICE_COUNT - 1 {
-            assert!(queue.push(index, unit(100, index as u8)).is_empty());
-        }
-        let ready = queue.push(AVC_VIDEO_SLICE_COUNT - 1, unit(100, 3));
-        assert_eq!(ready.len(), AVC_VIDEO_SLICE_COUNT);
-        assert!(ready.iter().all(|(_, unit)| unit.timestamp == 100));
+    fn timestamp_sort_is_wrap_aware() {
+        let mut ready = Vec::new();
+        insert_scheduled_item(&mut ready, 2, unit(1, 2));
+        insert_scheduled_item(&mut ready, 0, unit(u32::MAX - 1, 0));
+        insert_scheduled_item(&mut ready, 1, unit(u32::MAX, 1));
+        assert_eq!(
+            ready
+                .iter()
+                .map(|(index, unit)| (*index, unit.timestamp))
+                .collect::<Vec<_>>(),
+            vec![(0, u32::MAX - 1), (1, u32::MAX), (2, 1)]
+        );
     }
 }

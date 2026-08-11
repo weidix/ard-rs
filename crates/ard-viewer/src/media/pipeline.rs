@@ -78,20 +78,46 @@ pub fn spawn_avc_video_pipeline(
             while !stop.load(Ordering::Relaxed) {
                 match receiver.receive() {
                     Ok(Some((slice_index, unit))) => {
-                        let encoded_bytes = unit.avcc_len();
-                        if let Some(frame) = decoder.decode(&unit)
-                            && let Some(frame) = compositor.push(slice_index, encoded_bytes, frame)
-                        {
-                            last_frame = Instant::now();
-                            on_frame(frame);
+                        for output in decoder.decode(slice_index, &unit) {
+                            if let Some(decoded) = output.frame
+                                && let Some(frame) = compositor.push(
+                                    output.stream_index,
+                                    output.encoded_bytes,
+                                    decoded,
+                                )
+                            {
+                                last_frame = Instant::now();
+                                on_frame(frame);
+                            }
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        for output in decoder.take_outputs() {
+                            if let Some(decoded) = output.frame
+                                && let Some(frame) = compositor.push(
+                                    output.stream_index,
+                                    output.encoded_bytes,
+                                    decoded,
+                                )
+                            {
+                                last_frame = Instant::now();
+                                on_frame(frame);
+                            }
+                        }
+                    }
                     Err(_) => {
                         if last_frame.elapsed() > IDLE_TIMEOUT {
                             break;
                         }
                     }
+                }
+            }
+            for output in decoder.flush() {
+                if let Some(decoded) = output.frame
+                    && let Some(frame) =
+                        compositor.push(output.stream_index, output.encoded_bytes, decoded)
+                {
+                    on_frame(frame);
                 }
             }
         })
@@ -132,9 +158,6 @@ impl SliceCompositor {
         let mut rgba = Vec::with_capacity(rgba_len);
         let row_bytes = usize::try_from(width).ok()?.checked_mul(4)?;
         let mut remaining_rows = usize::try_from(height).ok()?;
-        let encoded_height = self.slices.iter().try_fold(0u32, |height, slice| {
-            height.checked_add(slice.as_ref()?.height)
-        })?;
         for slice in &self.slices {
             let slice = slice.as_ref()?;
             if slice.width != width {
@@ -143,15 +166,6 @@ impl SliceCompositor {
             let rows = usize::try_from(slice.height).ok()?.min(remaining_rows);
             rgba.extend_from_slice(slice.rgba.get(..rows.checked_mul(row_bytes)?)?);
             remaining_rows -= rows;
-        }
-        // The encoder rounds the bottom AVC band up to a macroblock boundary.
-        // On Apple hosts the first retained chroma row next to that padding is
-        // green as well. Preserve the advertised RFB height by extending the
-        // preceding valid row over that one boundary row.
-        if encoded_height > height && height > 1 && rgba.len() >= row_bytes * 2 {
-            let bottom_start = rgba.len() - row_bytes;
-            let (preceding, bottom) = rgba.split_at_mut(bottom_start);
-            bottom.copy_from_slice(&preceding[preceding.len() - row_bytes..]);
         }
         (remaining_rows == 0 && rgba.len() == rgba_len).then_some(DecodedFrame {
             width,
@@ -240,7 +254,7 @@ mod tests {
             );
         }
         let frame = compositor
-            .push(3, 1, two_row_slice([0, 255, 0, 255], [0, 255, 0, 255]))
+            .push(3, 1, two_row_slice([3, 0, 0, 255], [0, 255, 0, 255]))
             .expect("the padded bottom slice completes the frame");
         assert_eq!((frame.width, frame.height), (2, 7));
         assert_eq!(
@@ -249,7 +263,7 @@ mod tests {
                 .chunks_exact(8)
                 .map(|row| row[0])
                 .collect::<Vec<_>>(),
-            vec![0, 0, 1, 1, 2, 2, 2]
+            vec![0, 0, 1, 1, 2, 2, 3]
         );
     }
 }

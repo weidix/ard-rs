@@ -1,15 +1,16 @@
-//! macOS VideoToolbox decoder for the AVC media stream.
+//! macOS VideoProcessing decoder for the AVC media stream.
 //!
 //! Consumes access units (H.264 or HEVC NAL units) from `ard_rs::media_stream`, builds
-//! a `CMVideoFormatDescription` from the parameter sets, decodes with a
-//! `VTDecompressionSession`, and returns RGBA8 pixels for the viewer's
+//! a `CMVideoFormatDescription` from the parameter sets, decodes with the
+//! private VCP session used by AVConference, and returns RGBA8 pixels for the viewer's
 //! existing framebuffer path.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::os::raw::{c_int, c_void};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ard_rs::media_stream::{AccessUnit, MediaStreamCodec};
 
@@ -30,6 +31,7 @@ type CVPixelBufferRef = *const c_void;
 type VTDecompressionSessionRef = *const c_void;
 type VTDecodeFrameFlags = u32;
 type VTDecodeInfoFlags = u32;
+type CFTypeID = usize;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -55,8 +57,8 @@ struct CMSampleTimingInfo {
 #[link(name = "VideoToolbox", kind = "framework")]
 unsafe extern "C" {
     static kCFBooleanTrue: CFBooleanRef;
+    fn CFGetTypeID(cf: *const c_void) -> CFTypeID;
     fn CFRelease(cf: *const c_void);
-    fn CFRetain(cf: *const c_void) -> *const c_void;
     fn CFArrayGetValueAtIndex(the_array: CFArrayRef, index: CFIndex) -> *const c_void;
     fn CFDictionaryCreateMutable(
         allocator: CFAllocatorRef,
@@ -131,26 +133,8 @@ unsafe extern "C" {
     static kCMSampleAttachmentKey_DisplayImmediately: CFStringRef;
     static kCMSampleAttachmentKey_NotSync: CFStringRef;
 
-    fn VTDecompressionSessionCreate(
-        allocator: CFAllocatorRef,
-        video_format_description: CMVideoFormatDescriptionRef,
-        video_decoder_specification: CFDictionaryRef,
-        destination_image_buffer_attributes: CFDictionaryRef,
-        output_callback: *const VTDecompressionOutputCallbackRecord,
-        decompression_session_out: *mut VTDecompressionSessionRef,
-    ) -> OSStatus;
-    fn VTDecompressionSessionDecodeFrame(
-        session: VTDecompressionSessionRef,
-        sample_buffer: CMSampleBufferRef,
-        decode_flags: VTDecodeFrameFlags,
-        source_frame_ref_con: *mut c_void,
-        info_flags_out: *mut VTDecodeInfoFlags,
-    ) -> OSStatus;
-    fn VTDecompressionSessionWaitForAsynchronousFrames(
-        session: VTDecompressionSessionRef,
-    ) -> OSStatus;
-    fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
-
+    fn CVPixelBufferGetTypeID() -> CFTypeID;
+    fn CVPixelBufferGetPixelFormatType(pixel_buffer: CVPixelBufferRef) -> u32;
     fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferGetBytesPerRow(pixel_buffer: CVPixelBufferRef) -> usize;
@@ -160,6 +144,9 @@ unsafe extern "C" {
         pixel_buffer: CVPixelBufferRef,
         unlock_flags: u32,
     ) -> OSStatus;
+
+    fn dlopen(path: *const u8, mode: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const u8) -> *mut c_void;
 }
 
 #[repr(C)]
@@ -175,32 +162,142 @@ const kCFNumberSInt32Type: i32 = 3;
 const kCFStringEncodingUTF8: u32 = 0x08000100;
 #[allow(non_upper_case_globals)]
 const kCVPixelFormatType_32BGRA: u32 = 0x42475241; // 'BGRA'
+#[allow(non_upper_case_globals)]
+const kCVPixelFormatType_32RGBA: u32 = 0x52474241; // 'RGBA'
+const VCP_FRAMEWORK: &[u8] =
+    b"/System/Library/PrivateFrameworks/VideoProcessing.framework/Versions/A/VideoProcessing\0";
+const RTLD_LAZY: c_int = 0x1;
+const RTLD_LOCAL: c_int = 0x4;
+
+type VcpCreate = unsafe extern "C" fn(
+    CFAllocatorRef,
+    CMVideoFormatDescriptionRef,
+    CFDictionaryRef,
+    CFDictionaryRef,
+    *const VTDecompressionOutputCallbackRecord,
+    *mut VTDecompressionSessionRef,
+) -> OSStatus;
+type VcpDecode = unsafe extern "C" fn(
+    VTDecompressionSessionRef,
+    CMSampleBufferRef,
+    VTDecodeFrameFlags,
+    *mut c_void,
+    *mut VTDecodeInfoFlags,
+) -> OSStatus;
+type VcpCheckLast =
+    unsafe extern "C" fn(VTDecompressionSessionRef, CMSampleBufferRef, *mut bool) -> OSStatus;
+type VcpWait = unsafe extern "C" fn(VTDecompressionSessionRef) -> OSStatus;
+type VcpInvalidate = unsafe extern "C" fn(VTDecompressionSessionRef);
+
+struct VcpApi {
+    _handle: usize,
+    create: VcpCreate,
+    decode: VcpDecode,
+    check_last_subframe: VcpCheckLast,
+    wait: VcpWait,
+    invalidate: VcpInvalidate,
+}
+
+fn vcp_api() -> Option<&'static VcpApi> {
+    static API: OnceLock<Option<VcpApi>> = OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let handle = dlopen(VCP_FRAMEWORK.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+        if handle.is_null() {
+            return None;
+        }
+        unsafe fn load<T: Copy>(handle: *mut c_void, name: &[u8]) -> Option<T> {
+            let pointer = dlsym(handle, name.as_ptr());
+            (!pointer.is_null()).then(|| std::mem::transmute_copy(&pointer))
+        }
+        Some(VcpApi {
+            _handle: handle as usize,
+            create: load(handle, b"VCPDecompressionSessionCreate\0")?,
+            decode: load(handle, b"VCPDecompressionSessionDecodeFrame\0")?,
+            check_last_subframe: load(handle, b"VCPDecompressionSessionCheckIfLastSubFrame\0")?,
+            wait: load(
+                handle,
+                b"VCPDecompressionSessionWaitForAsynchronousFrames\0",
+            )?,
+            invalidate: load(handle, b"VCPDecompressionSessionInvalidate\0")?,
+        })
+    })
+    .as_ref()
+}
+
+#[derive(Debug)]
+pub(crate) struct DecodedOutput {
+    pub(crate) stream_index: usize,
+    pub(crate) timestamp: u32,
+    pub(crate) submission: u64,
+    pub(crate) encoded_bytes: usize,
+    pub(crate) is_last_subframe: bool,
+    pub(crate) status: OSStatus,
+    pub(crate) info_flags: VTDecodeInfoFlags,
+    pub(crate) frame: Option<DecodedFrame>,
+}
+
+#[derive(Default)]
+struct CallbackState {
+    outputs: Mutex<VecDeque<DecodedOutput>>,
+}
+
+struct SourceFrameContext {
+    stream_index: usize,
+    timestamp: u32,
+    submission: u64,
+    encoded_bytes: usize,
+    is_last_subframe: bool,
+    output_state: Arc<CallbackState>,
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[allow(private_interfaces)]
 pub unsafe extern "C" fn decompression_output_callback(
-    decompression_output_ref_con: *mut c_void,
-    _source_frame_ref_con: *mut c_void,
+    _decompression_output_ref_con: *mut c_void,
+    source_frame_ref_con: *mut c_void,
     status: OSStatus,
-    _info_flags: VTDecodeInfoFlags,
+    info_flags: VTDecodeInfoFlags,
     image_buffer: CVPixelBufferRef,
     _presentation_time_stamp: CMTime,
     _presentation_duration: CMTime,
 ) {
-    if status != 0 || image_buffer.is_null() {
+    if source_frame_ref_con.is_null() {
         if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
-            eprintln!(
-                "VideoToolbox callback without image: status={status} info_flags={_info_flags:#x} null_image={}",
-                image_buffer.is_null(),
-            );
+            eprintln!("VCP callback without source-frame context");
         }
         return;
     }
-    let slot = &*(decompression_output_ref_con as *const Mutex<Option<CVPixelBufferRef>>);
-    if let Ok(mut guard) = slot.lock() {
-        if let Some(previous) = guard.replace(image_buffer) {
-            unsafe { CFRelease(previous) };
-        }
-        unsafe { CFRetain(image_buffer) };
+    // Every accepted decode owns one unique Box. The callback consumes it
+    // even when decoding fails or intentionally produces no image.
+    let context = Box::from_raw(source_frame_ref_con as *mut SourceFrameContext);
+    let frame = if status == 0
+        && !image_buffer.is_null()
+        && CFGetTypeID(image_buffer) == CVPixelBufferGetTypeID()
+    {
+        pixel_buffer_to_rgba(image_buffer)
+    } else {
+        None
+    };
+    if std::env::var_os("ARD_MEDIA_TRACE").is_some() && frame.is_none() {
+        eprintln!(
+            "VCP callback without conventional image: stream={} timestamp={} submission={} status={status} info_flags={info_flags:#x} null_image={}",
+            context.stream_index,
+            context.timestamp,
+            context.submission,
+            image_buffer.is_null(),
+        );
+    }
+    if let Ok(mut outputs) = context.output_state.outputs.lock() {
+        outputs.push_back(DecodedOutput {
+            stream_index: context.stream_index,
+            timestamp: context.timestamp,
+            submission: context.submission,
+            encoded_bytes: context.encoded_bytes,
+            is_last_subframe: context.is_last_subframe,
+            status,
+            info_flags,
+            frame,
+        });
     }
 }
 
@@ -223,31 +320,45 @@ struct VTDecompressionOutputCallbackRecord {
 struct NativeDecoder {
     format_description: CMVideoFormatDescriptionRef,
     session: VTDecompressionSessionRef,
-    output_slot: Box<Mutex<Option<CVPixelBufferRef>>>,
+    api: &'static VcpApi,
+    output_state: Arc<CallbackState>,
     dimensions: (u32, u32),
+}
+
+impl NativeDecoder {
+    fn wait(&self) {
+        unsafe {
+            let _ = (self.api.wait)(self.session);
+        }
+    }
+
+    fn take_outputs(&self) -> Vec<DecodedOutput> {
+        self.output_state
+            .outputs
+            .lock()
+            .map(|mut outputs| outputs.drain(..).collect())
+            .unwrap_or_default()
+    }
 }
 
 impl Drop for NativeDecoder {
     fn drop(&mut self) {
         unsafe {
-            VTDecompressionSessionInvalidate(self.session);
+            let _ = (self.api.wait)(self.session);
+            (self.api.invalidate)(self.session);
             CFRelease(self.session as *const c_void);
             CFRelease(self.format_description as *const c_void);
-            if let Ok(mut slot) = self.output_slot.lock()
-                && let Some(buffer) = slot.take()
-            {
-                CFRelease(buffer);
-            }
         }
     }
 }
 
-/// Safe wrapper around a VideoToolbox decompression session.
+/// Safe wrapper around an AVConference-style VCP decompression session.
 pub struct VideoToolboxDecoder {
     codec: MediaStreamCodec,
     native: Option<NativeDecoder>,
     parameter_sets: Vec<Vec<u8>>,
     frames_decoded: u64,
+    next_submission: u64,
 }
 
 impl VideoToolboxDecoder {
@@ -257,6 +368,7 @@ impl VideoToolboxDecoder {
             native: None,
             parameter_sets: Vec::new(),
             frames_decoded: 0,
+            next_submission: 0,
         }
     }
 
@@ -271,36 +383,101 @@ impl VideoToolboxDecoder {
         self.native.as_ref().map(|native| native.dimensions)
     }
 
-    /// Decode one access unit; returns the displayable frame when the decoder
-    /// produced output.
-    pub fn decode(&mut self, unit: &AccessUnit) -> Option<DecodedFrame> {
+    /// Submit one AU to the shared interleaved VCP session and return every
+    /// callback outcome that has arrived so far. An outcome may belong to an
+    /// earlier submission and may contain no pixel buffer.
+    pub(crate) fn decode(&mut self, stream_index: usize, unit: &AccessUnit) -> Vec<DecodedOutput> {
+        let mut outputs = self.take_outputs();
         let parameter_sets = self.parameter_sets_for(unit);
         if !parameter_sets.is_empty() {
             let changed = self.merge_parameter_sets(parameter_sets);
             if changed {
-                // VideoToolbox format descriptions are immutable. A server
-                // keyframe can refresh SPS/PPS/VPS, so recreate the session
-                // before decoding the first frame using the new parameters.
-                self.native = None;
+                // Format descriptions are immutable. Finish the old async
+                // session before replacing it so no callback can outlive its
+                // output state or be attributed to the new session.
+                outputs.extend(self.finish_session());
             }
         }
         if self.native.is_none() {
             match self.create_session() {
                 Ok(decoder) => self.native = Some(decoder),
-                Err(_) => return None,
+                Err(_) => return outputs,
             }
         }
         let Some(native) = &self.native else {
-            return None;
+            return outputs;
         };
+        let submission = self.next_submission;
+        self.next_submission = self.next_submission.wrapping_add(1);
         let avcc = unit.to_avcc();
-        let result =
-            unsafe { decode_access_unit(native, &avcc, unit.timestamp, self.is_sync_unit(unit)) };
-        let frame = result.ok().flatten();
-        if frame.is_some() {
-            self.frames_decoded += 1;
+        let context = SourceFrameContext {
+            stream_index,
+            timestamp: unit.timestamp,
+            submission,
+            encoded_bytes: unit.avcc_len(),
+            is_last_subframe: false,
+            output_state: Arc::clone(&native.output_state),
+        };
+        if unsafe {
+            decode_access_unit(
+                native,
+                &avcc,
+                unit.timestamp,
+                self.is_sync_unit(unit),
+                context,
+            )
         }
-        frame
+        .is_err()
+            && std::env::var_os("ARD_MEDIA_TRACE").is_some()
+        {
+            eprintln!(
+                "VCP decode submission failed: stream={stream_index} timestamp={} submission={submission}",
+                unit.timestamp
+            );
+        }
+        outputs.extend(self.take_outputs());
+        outputs
+    }
+
+    pub(crate) fn take_outputs(&mut self) -> Vec<DecodedOutput> {
+        let outputs = self
+            .native
+            .as_ref()
+            .map(NativeDecoder::take_outputs)
+            .unwrap_or_default();
+        self.frames_decoded += outputs
+            .iter()
+            .filter(|output| output.frame.is_some())
+            .count() as u64;
+        outputs
+    }
+
+    pub(crate) fn flush(&mut self) -> Vec<DecodedOutput> {
+        let outputs = if let Some(native) = &self.native {
+            native.wait();
+            native.take_outputs()
+        } else {
+            Vec::new()
+        };
+        self.frames_decoded += outputs
+            .iter()
+            .filter(|output| output.frame.is_some())
+            .count() as u64;
+        outputs
+    }
+
+    fn finish_session(&mut self) -> Vec<DecodedOutput> {
+        let Some(native) = self.native.take() else {
+            return Vec::new();
+        };
+        native.wait();
+        let outputs = native.take_outputs();
+        self.frames_decoded += outputs
+            .iter()
+            .filter(|output| output.frame.is_some())
+            .count() as u64;
+        drop(native);
+        outputs
     }
 
     fn parameter_sets_for(&self, unit: &AccessUnit) -> Vec<Vec<u8>> {
@@ -322,11 +499,10 @@ impl VideoToolboxDecoder {
 
     fn is_sync_unit(&self, unit: &AccessUnit) -> bool {
         unit.nal_units.iter().any(|nal| match self.codec {
-            MediaStreamCodec::H264 => matches!(nal.first().map(|byte| byte & 0x1f), Some(5 | 7)),
-            MediaStreamCodec::Hevc => matches!(
-                nal.first().map(|byte| (byte >> 1) & 0x3f),
-                Some(16..=23 | 32..=34)
-            ),
+            MediaStreamCodec::H264 => matches!(nal.first().map(|byte| byte & 0x1f), Some(5)),
+            MediaStreamCodec::Hevc => {
+                matches!(nal.first().map(|byte| (byte >> 1) & 0x3f), Some(16..=23))
+            }
         })
     }
 
@@ -400,8 +576,9 @@ impl VideoToolboxDecoder {
             return Err(());
         }
 
-        let output_slot = Box::new(Mutex::new(None));
-        let refcon = &*output_slot as *const Mutex<Option<CVPixelBufferRef>> as *mut c_void;
+        let api = vcp_api().ok_or(())?;
+        let output_state = Arc::new(CallbackState::default());
+        let refcon = Arc::as_ptr(&output_state) as *mut c_void;
         let callback: VTDecompressionOutputCallback = decompression_output_callback;
         let record = VTDecompressionOutputCallbackRecord { callback, refcon };
         let Some(destination_attributes) =
@@ -411,16 +588,26 @@ impl VideoToolboxDecoder {
             return Err(());
         };
         let mut session: VTDecompressionSessionRef = std::ptr::null();
+        // Unlike the public VT entry point, VCP expects a real dictionary and
+        // dereferences it even when no private decoder properties are needed.
+        let decoder_specification = unsafe {
+            CFDictionaryCreateMutable(std::ptr::null(), 0, std::ptr::null(), std::ptr::null())
+        };
+        if decoder_specification.is_null() {
+            unsafe { CFRelease(format_description as *const c_void) };
+            return Err(());
+        }
         let status = unsafe {
-            VTDecompressionSessionCreate(
+            (api.create)(
                 std::ptr::null(),
                 format_description,
-                std::ptr::null(),
+                decoder_specification,
                 destination_attributes.dictionary,
                 &record,
                 &mut session,
             )
         };
+        unsafe { CFRelease(decoder_specification) };
         drop(destination_attributes);
         if status != 0 || session.is_null() {
             unsafe { CFRelease(format_description as *const c_void) };
@@ -429,7 +616,8 @@ impl VideoToolboxDecoder {
         Ok(NativeDecoder {
             format_description,
             session,
-            output_slot,
+            api,
+            output_state,
             dimensions: (dimensions.width as u32, dimensions.height as u32),
         })
     }
@@ -523,7 +711,8 @@ unsafe fn decode_access_unit(
     avcc: &[u8],
     rtp_timestamp: u32,
     is_sync: bool,
-) -> Result<Option<DecodedFrame>, ()> {
+    context: SourceFrameContext,
+) -> Result<(), ()> {
     let mut block_buffer: CMBlockBufferRef = std::ptr::null();
     let status = CMBlockBufferCreateWithMemoryBlock(
         std::ptr::null(),
@@ -600,45 +789,52 @@ unsafe fn decode_access_unit(
             }
         }
     }
+    let mut context = Box::new(context);
+    let last_status = (native.api.check_last_subframe)(
+        native.session,
+        sample_buffer,
+        &mut context.is_last_subframe,
+    );
+    if last_status != 0 && std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+        eprintln!(
+            "VCP last-subframe check failed: stream={} timestamp={} submission={} status={last_status}",
+            context.stream_index, context.timestamp, context.submission
+        );
+    }
+    let context = Box::into_raw(context);
     let mut info_flags: VTDecodeInfoFlags = 0;
-    let status = VTDecompressionSessionDecodeFrame(
+    let status = (native.api.decode)(
         native.session,
         sample_buffer,
         1, // kVTDecodeFrame_EnableAsynchronousDecompression
-        std::ptr::null_mut(),
+        context as *mut c_void,
         &mut info_flags,
     );
-    if status == 0 {
-        let _ = VTDecompressionSessionWaitForAsynchronousFrames(native.session);
-    }
     CFRelease(sample_buffer);
     CFRelease(block_buffer);
     if status != 0 {
+        // VCP does not issue a callback for a rejected submission, so reclaim
+        // the unique source-frame context here.
+        drop(Box::from_raw(context));
         if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
-            eprintln!("VideoToolbox decode failed: status={status} info_flags={info_flags:#x}");
+            eprintln!("VCP decode failed: status={status} info_flags={info_flags:#x}");
         }
         return Err(());
     }
-    let buffer = native
-        .output_slot
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take());
-    let Some(buffer) = buffer else {
-        if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
-            eprintln!("VideoToolbox produced no image: info_flags={info_flags:#x}");
-        }
-        return Ok(None);
-    };
-    let frame = pixel_buffer_to_rgba(buffer);
-    CFRelease(buffer);
-    Ok(frame)
+    Ok(())
 }
 
 unsafe fn pixel_buffer_to_rgba(buffer: CVPixelBufferRef) -> Option<DecodedFrame> {
     let width = CVPixelBufferGetWidth(buffer);
     let height = CVPixelBufferGetHeight(buffer);
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return None;
+    }
+    let pixel_format = CVPixelBufferGetPixelFormatType(buffer);
+    if pixel_format != kCVPixelFormatType_32BGRA && pixel_format != kCVPixelFormatType_32RGBA {
+        if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+            eprintln!("unsupported VCP pixel format: {pixel_format:#010x}");
+        }
         return None;
     }
     let status = CVPixelBufferLockBaseAddress(buffer, 0);
@@ -653,9 +849,12 @@ unsafe fn pixel_buffer_to_rgba(buffer: CVPixelBufferRef) -> Option<DecodedFrame>
         for row in 0..height {
             let src = (base as *const u8).add(row * bytes_per_row);
             let row_bytes = std::slice::from_raw_parts(src, width * 4);
-            // BGRA -> RGBA byte swap.
             for pixel in row_bytes.chunks_exact(4) {
-                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                if pixel_format == kCVPixelFormatType_32BGRA {
+                    rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                } else {
+                    rgba.extend_from_slice(pixel);
+                }
             }
         }
     }
@@ -735,7 +934,85 @@ mod tests {
     }
 
     #[test]
-    fn decodes_real_h264_sample_with_videotoolbox() {
+    fn callback_context_survives_no_output_and_reordered_callbacks() {
+        let state = Arc::new(CallbackState::default());
+        let make_context = |stream_index, timestamp, submission| {
+            Box::into_raw(Box::new(SourceFrameContext {
+                stream_index,
+                timestamp,
+                submission,
+                encoded_bytes: submission as usize + 10,
+                is_last_subframe: submission == 1,
+                output_state: Arc::clone(&state),
+            })) as *mut c_void
+        };
+        let first = make_context(0, 100, 0);
+        let second = make_context(3, 200, 1);
+        unsafe {
+            decompression_output_callback(
+                std::ptr::null_mut(),
+                second,
+                0,
+                0x20,
+                std::ptr::null(),
+                CMTime {
+                    value: 0,
+                    timescale: 0,
+                    flags: 0,
+                    epoch: 0,
+                },
+                CMTime {
+                    value: 0,
+                    timescale: 0,
+                    flags: 0,
+                    epoch: 0,
+                },
+            );
+            decompression_output_callback(
+                std::ptr::null_mut(),
+                first,
+                -1,
+                0x40,
+                std::ptr::null(),
+                CMTime {
+                    value: 0,
+                    timescale: 0,
+                    flags: 0,
+                    epoch: 0,
+                },
+                CMTime {
+                    value: 0,
+                    timescale: 0,
+                    flags: 0,
+                    epoch: 0,
+                },
+            );
+        }
+        let outputs = state
+            .outputs
+            .lock()
+            .expect("callback output lock")
+            .drain(..)
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| (
+                    output.stream_index,
+                    output.timestamp,
+                    output.submission,
+                    output.status,
+                    output.info_flags,
+                    output.frame.is_none(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![(3, 200, 1, 0, 0x20, true), (0, 100, 0, -1, 0x40, true)]
+        );
+    }
+
+    #[test]
+    fn decodes_real_h264_sample_with_vcp() {
         let path = "/tmp/ardre/avc_test/sample.h264";
         let Ok(bytes) = std::fs::read(path) else {
             return;
@@ -746,14 +1023,24 @@ mod tests {
         let mut decoded = 0;
         let mut first: Option<DecodedFrame> = None;
         for unit in &units {
-            if let Some(frame) = decoder.decode(unit) {
+            for output in decoder.decode(0, unit) {
+                if let Some(frame) = output.frame {
+                    decoded += 1;
+                    if first.is_none() {
+                        first = Some(frame);
+                    }
+                }
+            }
+        }
+        for output in decoder.flush() {
+            if let Some(frame) = output.frame {
                 decoded += 1;
                 if first.is_none() {
                     first = Some(frame);
                 }
             }
         }
-        assert!(decoded > 0, "VideoToolbox should decode at least one frame");
+        assert!(decoded > 0, "VCP should decode at least one frame");
         let first = first.expect("first frame");
         assert_eq!(first.width, 320);
         assert_eq!(first.height, 240);

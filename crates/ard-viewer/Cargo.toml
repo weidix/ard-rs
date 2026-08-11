@@ -25,3 +25,4 @@ objc2 = "0.5.2"
 [dev-dependencies]
 iced_test = { git = "https://github.com/iced-rs/iced.git", rev = "ee67bff38b89dafec8a42d1ed6b8c4b9faba817b", version = "0.15.0-dev" }
 naga = { version = "30.0.0", features = ["wgsl-in"] }
+png = "0.18"
