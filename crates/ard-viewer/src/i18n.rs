@@ -66,12 +66,9 @@ impl Language {
             "记住密码" => "Remember password",
             "添加到历史连接" => "Add to connection history",
             "连接参数" => "Connection options",
+            "画面" => "Display",
             "视频质量" => "Video quality",
             "远程分辨率" => "Remote resolution",
-            "仅高性能模式下生效" => "Only applies in high-performance mode",
-            "固定 2× 像素比例，仅高性能模式下生效" => {
-                "Fixed 2× pixel ratio; only applies in high-performance mode"
-            }
             "请选择受支持的固定分辨率" => "Select a supported fixed resolution",
             "请输入有效分辨率，例如 2560x1440 或 2560x1440,1920x1080" => {
                 "Enter a valid resolution, such as 2560x1440 or 2560x1440,1920x1080"
@@ -86,13 +83,7 @@ impl Language {
                 "Leave blank to use negotiated ports; overrides remote destinations only"
             }
             "帧率 (FPS)" => "Frame rate (FPS)",
-            "画面插值" => "Display interpolation",
-            "三次锐化采样" => "Bicubic sharp sampling",
-            "启用" => "Enabled",
             "自动" => "Auto",
-            "像素格式：服务器原生  ·  缩放：适应窗口  ·  自动重连：已启用" => {
-                "Pixel format: Server native  ·  Scaling: Fit window  ·  Auto reconnect: On"
-            }
             "密码使用应用本地加密凭据库保存，不写入明文配置文件。" => {
                 "Passwords are stored in the app's encrypted credential vault, not in plain-text configuration."
             }

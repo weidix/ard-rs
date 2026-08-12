@@ -15,10 +15,10 @@ use crate::widgets::{
 use crate::{ArdViewer, DropdownMenu, Message};
 
 const TITLEBAR_HEIGHT: f32 = 44.0;
-const PARAMETER_CONTROL_WIDTH: f32 = 220.0;
-const PARAMETER_TEXT_SIZE: f32 = BODY_SIZE - 2.0;
+const PARAMETER_TEXT_SIZE: f32 = BODY_SIZE - 1.0;
 const PARAMETER_LABEL_SIZE: f32 = BODY_SIZE - 1.0;
-const PARAMETER_CAPTION_SIZE: f32 = CAPTION_SIZE - 2.0;
+const PARAMETER_CAPTION_SIZE: f32 = CAPTION_SIZE - 1.0;
+const PARAMETER_ICON_SLOT: f32 = 16.0;
 
 pub fn connection(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.is_window_maximized(window_id);
@@ -424,29 +424,22 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     .spacing(18);
 
     let quality = quality_selector(app);
-    let resolution = column![
-        resolution_selector(app),
-        text(app.language.tr("固定 2× 像素比例，仅高性能模式下生效"))
-            .size(PARAMETER_CAPTION_SIZE)
-            .color(theme::palette().text_warm),
-    ]
-    .spacing(4)
-    .width(PARAMETER_CONTROL_WIDTH);
+    let resolution = resolution_selector(app);
     let media_port =
         |label: &'static str, id: &'static str, value: &str, on_input: fn(String) -> Message| {
             column![
                 text(app.language.tr(label))
-                    .size(MICRO_SIZE)
+                    .size(PARAMETER_LABEL_SIZE)
                     .color(theme::palette().text_muted),
                 iced::widget::text_input(app.language.tr("协商"), value)
                     .id(id)
                     .on_input(on_input)
-                    .padding([7.0, 6.0])
+                    .padding([10.0, CONTROL_PADDING_X])
                     .size(PARAMETER_TEXT_SIZE)
                     .style(theme::connection_parameter_input),
             ]
             .spacing(3)
-            .width(68)
+            .width(Fill)
         };
     let media_ports = column![
         row![
@@ -475,63 +468,51 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
             .color(theme::palette().text_warm),
     ]
     .spacing(3)
-    .width(PARAMETER_CONTROL_WIDTH);
+    .width(Fill);
     let frame_rate = iced::widget::text_input(app.language.tr("自动"), &app.frame_rate)
         .on_input(Message::FrameRateChanged)
-        .width(PARAMETER_CONTROL_WIDTH)
+        .width(Fill)
         .padding([10.0, CONTROL_PADDING_X])
         .size(PARAMETER_TEXT_SIZE)
         .style(theme::connection_parameter_input);
-    let interpolation = container(
-        checkbox(app.should_interpolate)
-            .label(app.language.tr("启用"))
-            .on_toggle(Message::ShouldInterpolateChanged)
-            .size(16)
-            .text_size(PARAMETER_TEXT_SIZE)
-            .style(theme::checkbox),
-    )
-    .width(PARAMETER_CONTROL_WIDTH)
-    .center_y(CONTROL_HEIGHT);
-    let sharp_sampling = container(
-        checkbox(app.sharp_sampling)
-            .label(app.language.tr("启用"))
-            .on_toggle(Message::SharpSamplingChanged)
-            .size(16)
-            .text_size(PARAMETER_TEXT_SIZE)
-            .style(theme::checkbox),
-    )
-    .width(PARAMETER_CONTROL_WIDTH)
-    .center_y(CONTROL_HEIGHT);
-    let parameter_rows = column![
-        connection_parameter_row(app.language.tr("视频质量"), quality, CONTROL_HEIGHT),
-        connection_parameter_row(app.language.tr("远程分辨率"), resolution, 52.0),
-        connection_parameter_row(app.language.tr("媒体 UDP 端口"), media_ports, 66.0),
-        connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate, CONTROL_HEIGHT),
-        connection_parameter_row(app.language.tr("画面插值"), interpolation, CONTROL_HEIGHT),
-        connection_parameter_row(
-            app.language.tr("三次锐化采样"),
-            sharp_sampling,
-            CONTROL_HEIGHT
-        ),
+    let display_parameters = column![
+        row![
+            connection_parameter_field(app.language.tr("视频质量"), quality),
+            connection_parameter_field(app.language.tr("帧率 (FPS)"), frame_rate),
+        ]
+        .spacing(10),
+        connection_parameter_field(app.language.tr("远程分辨率"), resolution),
     ]
-    .spacing(8)
+    .spacing(8);
+    let parameter_groups = column![
+        parameter_group(Icon::Monitor, app.language.tr("画面"), display_parameters),
+        parameter_group(Icon::Network, app.language.tr("媒体 UDP 端口"), media_ports),
+    ]
+    .spacing(14)
     .padding(iced::Padding {
         top: 0.0,
-        right: 12.0,
+        right: 8.0,
         bottom: 0.0,
         left: 0.0,
     });
     let advanced = container(
         column![
             row![
-                icon(Icon::Sliders, 14.0, theme::palette().text_muted),
+                container(icon(
+                    Icon::Sliders,
+                    PARAMETER_ICON_SLOT,
+                    theme::palette().text_muted,
+                ))
+                .width(PARAMETER_ICON_SLOT)
+                .height(PARAMETER_ICON_SLOT)
+                .center(PARAMETER_ICON_SLOT),
                 text(app.language.tr("连接参数"))
-                    .size(PARAMETER_TEXT_SIZE)
+                    .size(BODY_SIZE)
                     .color(theme::palette().text),
             ]
-            .spacing(7)
+            .spacing(8)
             .align_y(Alignment::Center),
-            scrollable(parameter_rows)
+            scrollable(parameter_groups)
                 .direction(iced::widget::scrollable::Direction::Vertical(
                     iced::widget::scrollable::Scrollbar::new()
                         .width(3)
@@ -541,12 +522,6 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
                 .style(theme::connection_scrollable)
                 .height(Fill)
                 .width(Fill),
-            text(
-                app.language
-                    .tr("像素格式：服务器原生  ·  缩放：适应窗口  ·  自动重连：已启用")
-            )
-            .size(PARAMETER_CAPTION_SIZE)
-            .color(theme::palette().text_muted),
         ]
         .spacing(8),
     )
@@ -600,7 +575,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let mut content = column![
         heading, address, username, password, remembers, advanced, security,
     ]
-    .spacing(12)
+    .spacing(10)
     .height(Fill)
     .width(Fill);
     if !app.status.is_empty() {
@@ -611,7 +586,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         );
     }
     let body = column![content, actions]
-        .spacing(12)
+        .spacing(10)
         .height(Fill)
         .width(Fill);
 
@@ -631,20 +606,43 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         .into()
 }
 
-fn connection_parameter_row<'a>(
+fn connection_parameter_field<'a>(
     label: &'a str,
     control: impl Into<Element<'a, Message>>,
-    height: f32,
 ) -> Element<'a, Message> {
-    row![
+    column![
         text(label)
             .size(PARAMETER_LABEL_SIZE)
             .color(theme::palette().text_muted)
             .width(Fill),
         control.into(),
     ]
-    .height(height)
-    .align_y(Alignment::Center)
+    .spacing(4)
+    .width(Fill)
+    .into()
+}
+
+fn parameter_group<'a>(
+    kind: Icon,
+    label: &'a str,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    column![
+        row![
+            container(icon(kind, 14.0, theme::palette().text_muted))
+                .width(PARAMETER_ICON_SLOT)
+                .height(PARAMETER_ICON_SLOT)
+                .center(PARAMETER_ICON_SLOT),
+            text(label)
+                .size(PARAMETER_LABEL_SIZE)
+                .color(theme::palette().text),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        content.into(),
+    ]
+    .spacing(7)
+    .width(Fill)
     .into()
 }
 
@@ -653,7 +651,7 @@ fn quality_selector(app: &ArdViewer) -> Element<'_, Message> {
     dropdown(
         app.language.tr(app.quality.label()),
         quality_dropdown_sections(app.language, app.quality),
-        PARAMETER_CONTROL_WIDTH,
+        Fill,
         PARAMETER_TEXT_SIZE,
         open,
         Message::ToggleDropdown(DropdownMenu::ConnectionQuality),
@@ -691,7 +689,7 @@ fn resolution_selector(app: &ArdViewer) -> Element<'_, Message> {
     dropdown(
         selected_label,
         vec![DropdownSection::new(None, options)],
-        PARAMETER_CONTROL_WIDTH,
+        Fill,
         PARAMETER_TEXT_SIZE,
         open,
         Message::ToggleDropdown(DropdownMenu::ConnectionResolution),

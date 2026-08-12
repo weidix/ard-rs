@@ -13,6 +13,7 @@ pub enum Icon {
     #[cfg(not(target_os = "macos"))]
     Close,
     Monitor,
+    Network,
     ChevronRight,
     ChevronDown,
     ChevronUp,
@@ -56,6 +57,7 @@ impl Icon {
             #[cfg(not(target_os = "macos"))]
             Self::Close => include_bytes!("../assets/icons/close.svg"),
             Self::Monitor => include_bytes!("../assets/icons/monitor.svg"),
+            Self::Network => include_bytes!("../assets/icons/network.svg"),
             Self::ChevronRight => include_bytes!("../assets/icons/chevron-right.svg"),
             Self::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
             Self::ChevronUp => include_bytes!("../assets/icons/chevron-up.svg"),

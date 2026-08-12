@@ -67,8 +67,6 @@ struct ArdViewer {
     media_video2_port: String,
     open_dropdown: Option<DropdownMenu>,
     frame_rate: String,
-    should_interpolate: bool,
-    sharp_sampling: bool,
     settings_section: SettingsSection,
     settings_transition: f32,
     key_profile: String,
@@ -166,8 +164,6 @@ enum Message {
     MediaVideo1PortChanged(String),
     MediaVideo2PortChanged(String),
     FrameRateChanged(String),
-    ShouldInterpolateChanged(bool),
-    SharpSamplingChanged(bool),
     KeyProfileChanged(String),
     AutoAdaptChanged(bool),
     CaptureShortcutsChanged(bool),
@@ -264,8 +260,6 @@ impl ArdViewer {
             } else {
                 cached.frame_rate.clone()
             },
-            should_interpolate: cached.should_interpolate,
-            sharp_sampling: cached.sharp_sampling,
             settings_section: SettingsSection::KeyMapping,
             settings_transition: 1.0,
             toolbar_buttons: config::toolbar_buttons_from_cache(&cached),
@@ -601,14 +595,6 @@ impl ArdViewer {
                         rate.min(240).to_string()
                     }
                 });
-                self.persist_config();
-            }
-            Message::ShouldInterpolateChanged(value) => {
-                self.should_interpolate = value;
-                self.persist_config();
-            }
-            Message::SharpSamplingChanged(value) => {
-                self.sharp_sampling = value;
                 self.persist_config();
             }
             Message::KeyProfileChanged(value) => {
@@ -1156,8 +1142,9 @@ impl ArdViewer {
             media_video2_port: self.media_video2_port.clone(),
             frame_rate: self.frame_rate.clone(),
             frame_interval_ms: frame_interval_from_rate(&self.frame_rate).to_string(),
-            should_interpolate: self.should_interpolate,
-            sharp_sampling: self.sharp_sampling,
+            // Rendering filters are intentionally automatic and no longer user-configurable.
+            should_interpolate: config::DEFAULT_SHOULD_INTERPOLATE,
+            sharp_sampling: config::DEFAULT_SHARP_SAMPLING,
             key_profile: self.key_profile.clone(),
             auto_adapt_keyboard: self.auto_adapt_keyboard,
             capture_system_shortcuts: self.capture_system_shortcuts,
@@ -1274,8 +1261,8 @@ impl ArdViewer {
                 .media_udp_port_overrides()
                 .expect("media UDP ports validated before starting a session"),
             frame_interval: frame_duration_from_rate(&self.frame_rate),
-            should_interpolate: self.should_interpolate,
-            sharp_sampling: self.sharp_sampling,
+            should_interpolate: config::DEFAULT_SHOULD_INTERPOLATE,
+            sharp_sampling: config::DEFAULT_SHARP_SAMPLING,
         }));
         self.status = self.language.tr("正在当前 Session 窗口中连接…").into();
     }
@@ -2588,21 +2575,9 @@ mod tests {
     }
 
     #[test]
-    fn native_interpolation_connection_parameter_can_be_changed() {
-        let (mut app, _task) = ArdViewer::new();
-        assert!(app.should_interpolate);
-
-        let _task = app.update(Message::ShouldInterpolateChanged(false));
-        assert!(!app.should_interpolate);
-    }
-
-    #[test]
-    fn sharp_sampling_connection_parameter_defaults_to_off() {
-        let (mut app, _task) = ArdViewer::new();
-        assert!(!app.sharp_sampling);
-
-        let _task = app.update(Message::SharpSamplingChanged(true));
-        assert!(app.sharp_sampling);
+    fn rendering_filters_use_automatic_defaults() {
+        assert!(config::DEFAULT_SHOULD_INTERPOLATE);
+        assert!(!config::DEFAULT_SHARP_SAMPLING);
     }
 
     #[test]
@@ -2816,7 +2791,7 @@ mod tests {
 
     #[test]
     #[ignore = "writes a visual QA snapshot to /tmp"]
-    fn render_native_interpolation_connection_parameter() -> Result<(), iced_test::Error> {
+    fn render_grouped_connection_parameters() -> Result<(), iced_test::Error> {
         let (mut app, _task) = ArdViewer::new();
         theme::set_dark(false);
         let settings = iced::Settings {
@@ -2834,7 +2809,7 @@ mod tests {
             views::connection(&app, window::Id::unique()),
         );
         let snapshot = ui.snapshot(&theme::app_theme())?;
-        assert!(snapshot.matches_image("/tmp/ard-viewer-native-interpolation-option-v10")?);
+        assert!(snapshot.matches_image("/tmp/ard-viewer-grouped-connection-parameters-v9")?);
         drop(ui);
 
         let mut compact = iced_test::Simulator::with_size(
@@ -2851,10 +2826,7 @@ mod tests {
             views::connection(&app, window::Id::unique()),
         );
         let compact_snapshot = compact.snapshot(&theme::app_theme())?;
-        assert!(
-            compact_snapshot
-                .matches_image("/tmp/ard-viewer-native-interpolation-option-compact-v4")?
-        );
+        assert!(compact_snapshot.matches_image("/tmp/ard-viewer-grouped-connection-compact-v9")?);
         drop(compact);
 
         app.open_dropdown = Some(DropdownMenu::ConnectionQuality);
@@ -2872,7 +2844,9 @@ mod tests {
             views::connection(&app, window::Id::unique()),
         );
         let grouped_quality_snapshot = grouped_quality.snapshot(&theme::app_theme())?;
-        assert!(grouped_quality_snapshot.matches_image("/tmp/ard-viewer-video-quality-groups-v3")?);
+        assert!(
+            grouped_quality_snapshot.matches_image("/tmp/ard-viewer-video-quality-groups-v11")?
+        );
         Ok(())
     }
 

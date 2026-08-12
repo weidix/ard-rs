@@ -23,6 +23,9 @@ use crate::state::{DeviceState, SavedDevice, ThemePreference, ToolbarButton};
 #[cfg(not(test))]
 const CREDENTIAL_FILE: &str = "credentials.json";
 
+pub const DEFAULT_SHOULD_INTERPOLATE: bool = true;
+pub const DEFAULT_SHARP_SAMPLING: bool = false;
+
 #[cfg(not(test))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredCredential {
@@ -88,8 +91,8 @@ impl Default for AppConfig {
             media_video2_port: String::new(),
             frame_rate: String::new(),
             frame_interval_ms: "0".into(),
-            should_interpolate: true,
-            sharp_sampling: false,
+            should_interpolate: DEFAULT_SHOULD_INTERPOLATE,
+            sharp_sampling: DEFAULT_SHARP_SAMPLING,
             key_profile: "macOS 默认".into(),
             auto_adapt_keyboard: true,
             capture_system_shortcuts: false,
