@@ -1,16 +1,19 @@
 //! Platform decode backends for the AVC media stream (encoding 1010).
 //!
 //! The core crate turns UDP/SRTP/RTP into whole access units; these backends
-//! turn access units into displayable native YUV frames. Only macOS is implemented
-//! today (VideoToolbox); Windows (MFT) is a follow-up.
+//! turn access units into displayable native YUV frames. macOS uses
+//! VideoToolbox and Windows uses Media Foundation Transforms (MFT).
 
 #[cfg(target_os = "macos")]
 pub mod vt;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "windows")]
+pub mod mft;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod pipeline;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use pipeline::spawn_avc_video_pipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,19 @@ pub struct DecodedFrame {
     pub range: YuvRange,
     pub matrix: YuvMatrix,
     pub updates: Vec<DecodedSliceUpdate>,
+}
+
+/// Platform-neutral outcome for one submitted compressed access unit.
+#[derive(Debug)]
+pub(crate) struct DecodedOutput {
+    pub(crate) stream_index: usize,
+    pub(crate) timestamp: u32,
+    pub(crate) submission: u64,
+    pub(crate) encoded_bytes: usize,
+    pub(crate) status: i32,
+    pub(crate) info_flags: u32,
+    pub(crate) conversion_error: Option<String>,
+    pub(crate) frame: Option<DecodedSlice>,
 }
 
 impl DecodedFrame {

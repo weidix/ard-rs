@@ -171,7 +171,7 @@ impl FramePacket {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn from_nv12(frame: crate::media::DecodedFrame, quality: ArdVideoQuality) -> Self {
         Self {
             width: u16::try_from(frame.width).unwrap_or(u16::MAX),
@@ -324,9 +324,9 @@ pub struct SessionRuntime {
     sharp_sampling: bool,
     cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     avc_worker: Option<JoinHandle<()>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     avc_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
@@ -348,9 +348,9 @@ impl SessionRuntime {
         let worker_mailbox = Arc::clone(&mailbox);
         let worker_frame_wake = Arc::clone(&frame_wake);
         let worker_cancel = Arc::clone(&cancel);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let avc_stop = Arc::new(Mutex::new(None));
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let worker_avc_stop = Arc::clone(&avc_stop);
         let worker = thread::Builder::new()
             .name("ard-session".into())
@@ -360,7 +360,7 @@ impl SessionRuntime {
                     worker_mailbox,
                     worker_frame_wake,
                     worker_cancel,
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     worker_avc_stop,
                 )
             })
@@ -372,9 +372,9 @@ impl SessionRuntime {
             sharp_sampling,
             cancel,
             worker: Some(worker),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             avc_worker: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             avc_stop,
         }
     }
@@ -409,7 +409,7 @@ impl SessionRuntime {
     pub fn disconnect(&mut self) {
         self.cancel.store(true, Ordering::Release);
         self.worker.take();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             if let Ok(mut avc_stop) = self.avc_stop.lock()
                 && let Some(stop) = avc_stop.take()
@@ -423,9 +423,9 @@ impl SessionRuntime {
     /// Start the AVC media stream video path (encoding 1010) on top of an
     /// already established RFB session. The negotiated UDP endpoints, the
     /// video1 server-to-viewer SRTP key and the negotiated codec come from
-    /// `ard_rs::media_stream`. Frames are decoded with VideoToolbox and pushed into
+    /// `ard_rs::media_stream`. Frames are decoded with VideoToolbox or MFT and pushed into
     /// the same mailbox as the rectangle/MVS paths.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[allow(dead_code)]
     pub fn start_avc_media_stream(
         &mut self,
@@ -481,18 +481,22 @@ fn run_receiver(
     mailbox: SharedMailbox,
     frame_wake: Arc<FrameWake>,
     cancel: Arc<AtomicBool>,
-    #[cfg(target_os = "macos")] avc_stop_registry: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] avc_stop_registry: Arc<
+        Mutex<Option<Arc<AtomicBool>>>,
+    >,
 ) {
     let mut reconnecting = false;
     let mut attempts = 0;
-    let requested_quality = if !cfg!(target_os = "macos") && config.quality.is_high_performance() {
+    let requested_quality = if !cfg!(any(target_os = "macos", target_os = "windows"))
+        && config.quality.is_high_performance()
+    {
         ArdVideoQuality::Adaptive
     } else {
         config.quality
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut avc_stop: Option<Arc<AtomicBool>> = None;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut avc_worker: Option<JoinHandle<()>> = None;
     while !cancel.load(Ordering::Acquire) {
         push_event(
@@ -553,11 +557,11 @@ fn run_receiver(
         let mut meter = RateMeter::new();
         loop {
             if cancel.load(Ordering::Acquire) {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if let Some(stop) = avc_stop.take() {
                     stop.store(true, Ordering::Release);
                 }
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if let Some(worker) = avc_worker.take() {
                     let _ = worker.join();
                 }
@@ -589,7 +593,7 @@ fn run_receiver(
                     push_event(&mailbox, &frame_wake, SessionEvent::Clipboard(text));
                 }
                 Ok(ArdClientEvent::MediaStream(media)) => {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     {
                         if let Some(stop) = avc_stop.take() {
                             stop.store(true, Ordering::Release);
@@ -675,7 +679,7 @@ fn run_receiver(
                             *registered = avc_stop.clone();
                         }
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                     {
                         let _ = media;
                         push_event(
@@ -688,15 +692,15 @@ fn run_receiver(
                 Ok(ArdClientEvent::Bell | ArdClientEvent::StateChange) => {}
                 Ok(ArdClientEvent::Reconnected) => unreachable!("automatic reconnect is disabled"),
                 Err(error) => {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     if let Some(stop) = avc_stop.take() {
                         stop.store(true, Ordering::Release);
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     if let Some(worker) = avc_worker.take() {
                         let _ = worker.join();
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     if let Ok(mut registered) = avc_stop_registry.lock() {
                         registered.take();
                     }

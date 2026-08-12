@@ -1,5 +1,5 @@
-//! Live decode pipeline: UDP/SRTP/RTP receive (ard-core) -> VideoToolbox ->
-//! native NV12 callback.
+//! Live decode pipeline: UDP/SRTP/RTP receive (ard-core) -> platform decoder
+//! (VideoToolbox or MFT) -> native NV12 callback.
 
 #![allow(dead_code)]
 
@@ -12,13 +12,16 @@ use ard_rs::ArdMediaStream;
 use ard_rs::media_stream::UdpStreamKind;
 use ard_rs::media_stream::udp::{AVC_VIDEO_SLICE_COUNT, AvcStreamCrypto, AvcVideoStreamReceiver};
 
-use super::vt::{DecodedOutput, VideoToolboxDecoder};
-use super::{DecodedFrame, DecodedSlice, DecodedSliceUpdate, YuvMatrix, YuvRange};
+#[cfg(target_os = "windows")]
+use super::mft::MftDecoder as PlatformVideoDecoder;
+#[cfg(target_os = "macos")]
+use super::vt::VideoToolboxDecoder as PlatformVideoDecoder;
+use super::{DecodedFrame, DecodedOutput, DecodedSlice, DecodedSliceUpdate, YuvMatrix, YuvRange};
 
 /// Spawn the AVC video receive/decode loop for one stream.
 ///
 /// The loop blocks on UDP, decrypts SRTP, reassembles RTP into access units
-/// (all inside ard-core), decodes with VideoToolbox and invokes `on_frame`
+/// (all inside ard-core), decodes with the platform backend and invokes `on_frame`
 /// with each displayable NV12 frame. It stops when `stop` is set or the
 /// remote end stays silent for `idle_timeout`.
 pub fn spawn_avc_video_pipeline(
@@ -74,7 +77,7 @@ pub fn spawn_avc_video_pipeline(
             // The four SSRCs are one serial reference chain. The receiver
             // schedules completed access units by timestamp and slice index,
             // matching AVConference's interleaved-stream scheduler.
-            let mut decoder = VideoToolboxDecoder::new(codec);
+            let mut decoder = PlatformVideoDecoder::new(codec);
             let mut compositor = SliceCompositor::new(target_dimensions);
             let mut observed_packet_losses = receiver.packet_losses();
             let mut last_frame = Instant::now();
@@ -143,7 +146,7 @@ pub fn spawn_avc_video_pipeline(
             }
             if !outputs.is_empty() {
                 on_frame(Err(format!(
-                    "VCP 停止时仍返回 {} 个未归属 RTP 帧批次的回调",
+                    "视频解码器停止时仍返回 {} 个未归属 RTP 帧批次的输出",
                     outputs.len()
                 )));
             }
@@ -159,7 +162,7 @@ fn apply_decoder_outputs(
     for output in outputs {
         if output.timestamp != timestamp {
             return Err(format!(
-                "VCP 回调跨越 RTP 帧边界：expected={timestamp} actual={}",
+                "视频解码输出跨越 RTP 帧边界：expected={timestamp} actual={}",
                 output.timestamp
             ));
         }
@@ -168,7 +171,7 @@ fn apply_decoder_outputs(
         }
         if output.status != 0 {
             return Err(format!(
-                "VCP 解码失败：status={} flags={:#x}",
+                "视频解码失败：status={} flags={:#x}",
                 output.status, output.info_flags
             ));
         }

@@ -867,7 +867,6 @@ a region.
 
 * One live session capture to confirm the exact server-reply TCP envelope and
   the real offer plist byte layout (milestone ④).
-* Windows MFT decode backend.
 * SRTP authentication (HMAC-SHA1) if the negotiated suite requires it.
 
 ## Live capture follow-up (2026-08-08)

@@ -51,10 +51,10 @@ ard-viewer --frame-interval-ms 16 192.168.1.20:5900 username
 
 High-performance mode advertises AVC (`1010`) as the preferred encoding, sends
 the media-stream offer, and decodes the negotiated video with macOS
-VideoToolbox. Keyboard, pointer, clipboard, and session control stay on the
-encrypted TCP RFB channel while video uses the negotiated UDP/RTP stream. On
-non-macOS platforms the setting falls back to adaptive MVS until a native AVC
-decoder backend is available.
+VideoToolbox or Windows Media Foundation Transforms. Keyboard, pointer,
+clipboard, and session control stay on the encrypted TCP RFB channel while
+video uses the negotiated UDP/RTP stream. Other platforms silently fall back
+to adaptive MVS until a native AVC decoder backend is available.
 
 For a remote Mac behind explicit port forwarding, the connection form accepts
 independent external UDP overrides for audio, primary video, and secondary
@@ -163,8 +163,8 @@ on a VNC library or a native operating-system library.
   clipboard synchronization, live FPS/traffic metrics, and
   Metal/D3D12/Vulkan presentation
 - high-performance AVC media mode (`1010`) with binary-plist negotiation,
-  SRTP/AES-CTR, RTP H.264/HEVC depacketization, and macOS VideoToolbox RGBA
-  presentation
+  SRTP/AES-CTR, RTP H.264/HEVC depacketization, macOS VideoToolbox or Windows
+  Media Foundation NV12 decode, and GPU presentation
 
 Apple MVS (`1011`) is identified as a distinct codec and is never fed to a VNC
 or zlib decoder. Its two bitstreams, Rice/DCT state, per-tile differential

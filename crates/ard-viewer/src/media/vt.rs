@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ard_rs::media_stream::{AccessUnit, MediaStreamCodec};
 
-use super::{DecodedSlice, YuvMatrix, YuvRange};
+use super::{DecodedOutput, DecodedSlice, YuvMatrix, YuvRange};
 
 type OSStatus = i32;
 type CFIndex = isize;
@@ -269,18 +269,6 @@ fn vcp_api() -> Option<&'static VcpApi> {
         })
     })
     .as_ref()
-}
-
-#[derive(Debug)]
-pub(crate) struct DecodedOutput {
-    pub(crate) stream_index: usize,
-    pub(crate) timestamp: u32,
-    pub(crate) submission: u64,
-    pub(crate) encoded_bytes: usize,
-    pub(crate) status: OSStatus,
-    pub(crate) info_flags: VTDecodeInfoFlags,
-    pub(crate) conversion_error: Option<String>,
-    pub(crate) frame: Option<DecodedSlice>,
 }
 
 #[derive(Default)]
