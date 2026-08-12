@@ -1,4 +1,6 @@
 use ard_rs::ArdVideoQuality;
+#[cfg(target_os = "windows")]
+use iced::mouse;
 use iced::widget::{button, column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Event, Fill, Length, Point, Rectangle, Size, Vector, window};
 
@@ -62,6 +64,95 @@ pub fn window_chrome_with_title(
     .width(Fill)
     .height(Fill)
     .into()
+}
+
+pub fn window_resize_regions<'a>(
+    content: impl Into<Element<'a, Message>>,
+    window_id: window::Id,
+    enabled: bool,
+) -> Element<'a, Message> {
+    let content = content.into();
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window_id, enabled);
+        content
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if !enabled {
+            return content;
+        }
+
+        const EDGE: f32 = 6.0;
+        const CORNER: f32 = 10.0;
+
+        let handle = |direction, width: Length, height: Length, interaction| {
+            mouse_area(container(space()).width(width).height(height))
+                .on_press(Message::DragResizeWindow(window_id, direction))
+                .interaction(interaction)
+        };
+
+        let north_west = handle(
+            window::Direction::NorthWest,
+            Length::Fixed(CORNER),
+            Length::Fixed(CORNER),
+            mouse::Interaction::ResizingDiagonallyDown,
+        );
+        let north = handle(
+            window::Direction::North,
+            Length::Fill,
+            Length::Fixed(CORNER),
+            mouse::Interaction::ResizingVertically,
+        );
+        let north_east = handle(
+            window::Direction::NorthEast,
+            Length::Fixed(CORNER),
+            Length::Fixed(CORNER),
+            mouse::Interaction::ResizingDiagonallyUp,
+        );
+        let west = handle(
+            window::Direction::West,
+            Length::Fixed(EDGE),
+            Length::Fill,
+            mouse::Interaction::ResizingHorizontally,
+        );
+        let east = handle(
+            window::Direction::East,
+            Length::Fixed(EDGE),
+            Length::Fill,
+            mouse::Interaction::ResizingHorizontally,
+        );
+        let south_west = handle(
+            window::Direction::SouthWest,
+            Length::Fixed(CORNER),
+            Length::Fixed(CORNER),
+            mouse::Interaction::ResizingDiagonallyUp,
+        );
+        let south = handle(
+            window::Direction::South,
+            Length::Fill,
+            Length::Fixed(CORNER),
+            mouse::Interaction::ResizingVertically,
+        );
+        let south_east = handle(
+            window::Direction::SouthEast,
+            Length::Fixed(CORNER),
+            Length::Fixed(CORNER),
+            mouse::Interaction::ResizingDiagonallyDown,
+        );
+
+        let regions = column![
+            row![north_west, north, north_east].height(CORNER),
+            row![west, space().width(Fill).height(Fill), east].height(Fill),
+            row![south_west, south, south_east].height(CORNER),
+        ]
+        .width(Fill)
+        .height(Fill);
+
+        stack![content, regions].width(Fill).height(Fill).into()
+    }
 }
 
 fn window_drag_region_with_height(window_id: window::Id, height: f32) -> Element<'static, Message> {

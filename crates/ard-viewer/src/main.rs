@@ -134,6 +134,8 @@ enum Message {
     #[cfg(not(target_os = "macos"))]
     CloseWindow(window::Id),
     DragWindow(window::Id),
+    #[cfg(target_os = "windows")]
+    DragResizeWindow(window::Id, window::Direction),
     #[cfg(not(target_os = "macos"))]
     MinimizeWindow(window::Id),
     ToggleMaximizeWindow(window::Id),
@@ -413,6 +415,10 @@ impl ArdViewer {
                 return reveal_and_focus(id);
             }
             Message::DragWindow(id) => return window::drag(id),
+            #[cfg(target_os = "windows")]
+            Message::DragResizeWindow(id, direction) => {
+                return window::drag_resize(id, direction);
+            }
             #[cfg(not(target_os = "macos"))]
             Message::MinimizeWindow(id) => return window::minimize(id, true),
             Message::ToggleMaximizeWindow(id) => {
@@ -967,11 +973,17 @@ impl ArdViewer {
             WindowKind::Settings => views::settings(self, id),
             WindowKind::Session => views::session(self, id),
         };
-        if self.pending_close == Some(id) {
+        let content = if self.pending_close == Some(id) {
             close_confirmation(content, kind, self.close_modal_progress, self.language)
         } else {
             content
-        }
+        };
+        widgets::window_resize_regions(
+            content,
+            id,
+            !self.is_window_maximized(id)
+                && !(kind == WindowKind::Session && self.session_fullscreen),
+        )
     }
 
     fn theme(&self, _id: window::Id) -> Option<Theme> {
