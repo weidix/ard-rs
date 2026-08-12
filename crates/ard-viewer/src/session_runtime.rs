@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use crate::i18n::Language;
 use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdDisplayConfiguration, ArdKey,
-    ArdNamedKey, ArdScrollWheelEvent, ArdVideoQuality, Framebuffer, MvsGpuFrame, MvsGpuTile,
-    MvsGpuTileUpdate, keysym_for_key,
+    ArdNamedKey, ArdScrollWheelEvent, ArdVideoQuality, Framebuffer, MediaUdpPortOverrides,
+    MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
 };
 use iced::futures::StreamExt;
 use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -37,6 +37,7 @@ pub struct SessionConfig {
     pub password: Vec<u8>,
     pub quality: ArdVideoQuality,
     pub display_configuration: Option<ArdDisplayConfiguration>,
+    pub media_udp_port_overrides: MediaUdpPortOverrides,
     pub frame_interval: Duration,
     pub should_interpolate: bool,
     pub sharp_sampling: bool,
@@ -512,6 +513,7 @@ fn run_receiver(
         );
         client_config.video_quality = requested_quality;
         client_config.display_configuration = config.display_configuration.clone();
+        client_config.media_udp_port_overrides = config.media_udp_port_overrides;
         client_config.timeout = Duration::from_secs(2);
         client_config.frame_interval = config.frame_interval;
         let mut client = match ArdClient::connect(client_config) {
@@ -621,7 +623,7 @@ fn run_receiver(
                         let mut media_meter = RateMeter::new();
                         let mut render_failed = false;
                         let handle = crate::media::spawn_avc_video_pipeline(
-                            media,
+                            *media,
                             target_dimensions,
                             pipeline_stop,
                             move |result| {

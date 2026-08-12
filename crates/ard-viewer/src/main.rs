@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use ard_input_hook::{HookConfig, HookEvent};
 use ard_rs::{
-    ArdDisplayConfiguration, ArdVideoQuality, ArdVirtualDisplay, XK_CONTROL_LEFT, XK_F1,
-    XK_META_LEFT, XK_SHIFT_LEFT, XK_TAB, XK_UP,
+    ArdDisplayConfiguration, ArdVideoQuality, ArdVirtualDisplay, MediaUdpPortOverrides,
+    XK_CONTROL_LEFT, XK_F1, XK_META_LEFT, XK_SHIFT_LEFT, XK_TAB, XK_UP,
 };
 use iced::widget::{column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, Subscription, Task, Theme, window};
@@ -62,6 +62,9 @@ struct ArdViewer {
     remember_device: bool,
     quality: ArdVideoQuality,
     resolution: String,
+    media_audio_port: String,
+    media_video1_port: String,
+    media_video2_port: String,
     open_dropdown: Option<DropdownMenu>,
     frame_rate: String,
     should_interpolate: bool,
@@ -159,6 +162,9 @@ enum Message {
     CloseDropdown,
     QualityChanged(ArdVideoQuality),
     ResolutionChanged(String),
+    MediaAudioPortChanged(String),
+    MediaVideo1PortChanged(String),
+    MediaVideo2PortChanged(String),
     FrameRateChanged(String),
     ShouldInterpolateChanged(bool),
     SharpSamplingChanged(bool),
@@ -249,6 +255,9 @@ impl ArdViewer {
             remember_device: cached.remember_device,
             quality: config::quality_from_cache(&cached.quality),
             resolution,
+            media_audio_port: cached.media_audio_port.clone(),
+            media_video1_port: cached.media_video1_port.clone(),
+            media_video2_port: cached.media_video2_port.clone(),
             open_dropdown: None,
             frame_rate: if cached.frame_rate.is_empty() {
                 frame_rate_from_interval(&cached.frame_interval_ms)
@@ -571,6 +580,18 @@ impl ArdViewer {
                 self.open_dropdown = None;
                 self.persist_config();
             }
+            Message::MediaAudioPortChanged(value) => {
+                self.media_audio_port = sanitize_port_input(value);
+                self.persist_config();
+            }
+            Message::MediaVideo1PortChanged(value) => {
+                self.media_video1_port = sanitize_port_input(value);
+                self.persist_config();
+            }
+            Message::MediaVideo2PortChanged(value) => {
+                self.media_video2_port = sanitize_port_input(value);
+                self.persist_config();
+            }
             Message::FrameRateChanged(value) => {
                 let value: String = value.chars().filter(char::is_ascii_digit).take(3).collect();
                 self.frame_rate = value.parse::<u16>().map_or(value.clone(), |rate| {
@@ -681,6 +702,8 @@ impl ArdViewer {
                     self.status = self.language.tr("请输入有效端口（1–65535）").into();
                 } else if parse_display_configuration(&self.resolution).is_err() {
                     self.status = self.language.tr("请选择受支持的固定分辨率").into();
+                } else if self.media_udp_port_overrides().is_err() {
+                    self.status = self.language.tr("请输入有效的媒体 UDP 端口").into();
                 } else if self.password.is_empty() && !self.has_saved_password {
                     self.status = self.language.tr("请输入密码").into();
                 } else {
@@ -1083,6 +1106,14 @@ impl ArdViewer {
         Ok(format_endpoint(host, &port.to_string()))
     }
 
+    fn media_udp_port_overrides(&self) -> Result<MediaUdpPortOverrides, ()> {
+        Ok(MediaUdpPortOverrides {
+            audio: parse_optional_port(&self.media_audio_port)?,
+            video1: parse_optional_port(&self.media_video1_port)?,
+            video2: parse_optional_port(&self.media_video2_port)?,
+        })
+    }
+
     fn clamp_session_toolbar_position(&mut self) {
         let toolbar_half_width = self.session_toolbar_width() / 2.0;
         if let Some(x) = self.session_toolbar_x.as_mut() {
@@ -1120,6 +1151,9 @@ impl ArdViewer {
             remember_device: self.remember_device,
             quality: config::quality_to_cache(self.quality).into(),
             resolution: self.resolution.clone(),
+            media_audio_port: self.media_audio_port.clone(),
+            media_video1_port: self.media_video1_port.clone(),
+            media_video2_port: self.media_video2_port.clone(),
             frame_rate: self.frame_rate.clone(),
             frame_interval_ms: frame_interval_from_rate(&self.frame_rate).to_string(),
             should_interpolate: self.should_interpolate,
@@ -1236,6 +1270,9 @@ impl ArdViewer {
             quality: self.quality,
             display_configuration: parse_display_configuration(&self.resolution)
                 .expect("resolution validated before starting a session"),
+            media_udp_port_overrides: self
+                .media_udp_port_overrides()
+                .expect("media UDP ports validated before starting a session"),
             frame_interval: frame_duration_from_rate(&self.frame_rate),
             should_interpolate: self.should_interpolate,
             sharp_sampling: self.sharp_sampling,
@@ -1577,6 +1614,19 @@ fn format_endpoint(host: &str, port: &str) -> String {
     }
 }
 
+fn sanitize_port_input(value: String) -> String {
+    value.chars().filter(char::is_ascii_digit).take(5).collect()
+}
+
+fn parse_optional_port(value: &str) -> Result<Option<u16>, ()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let port = value.parse::<u16>().map_err(|_| ())?;
+    if port == 0 { Err(()) } else { Ok(Some(port)) }
+}
+
 fn frame_interval_from_rate(value: &str) -> u64 {
     let frames_per_second = value.trim().parse::<u64>().unwrap_or(0).min(240);
     match frames_per_second {
@@ -1883,6 +1933,10 @@ mod tests {
         assert!(!app.session_toolbar_pinned);
         assert_eq!(app.pending_close, None);
         assert_eq!(app.port, "5900");
+        assert_eq!(
+            app.media_udp_port_overrides(),
+            Ok(MediaUdpPortOverrides::default())
+        );
     }
 
     #[test]
@@ -2013,6 +2067,28 @@ mod tests {
         app.port.clear();
 
         assert_eq!(app.remote_endpoint(), Ok("host.local:5900".into()));
+    }
+
+    #[test]
+    fn media_udp_port_overrides_are_optional_and_strictly_validated() {
+        let (mut app, _task) = ArdViewer::new();
+        app.media_audio_port = "15900".into();
+        app.media_video1_port = "15901".into();
+        app.media_video2_port = "15902".into();
+        assert_eq!(
+            app.media_udp_port_overrides(),
+            Ok(MediaUdpPortOverrides {
+                audio: Some(15900),
+                video1: Some(15901),
+                video2: Some(15902),
+            })
+        );
+
+        app.media_video1_port = "0".into();
+        assert!(app.media_udp_port_overrides().is_err());
+        app.media_video1_port = "65536".into();
+        assert!(app.media_udp_port_overrides().is_err());
+        assert_eq!(sanitize_port_input("15x90-1".into()), "15901");
     }
 
     #[test]

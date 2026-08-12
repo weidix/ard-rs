@@ -432,6 +432,50 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     ]
     .spacing(4)
     .width(PARAMETER_CONTROL_WIDTH);
+    let media_port =
+        |label: &'static str, id: &'static str, value: &str, on_input: fn(String) -> Message| {
+            column![
+                text(app.language.tr(label))
+                    .size(MICRO_SIZE)
+                    .color(theme::palette().text_muted),
+                iced::widget::text_input(app.language.tr("协商"), value)
+                    .id(id)
+                    .on_input(on_input)
+                    .padding([7.0, 6.0])
+                    .size(PARAMETER_TEXT_SIZE)
+                    .style(theme::connection_parameter_input),
+            ]
+            .spacing(3)
+            .width(68)
+        };
+    let media_ports = column![
+        row![
+            media_port(
+                "音频",
+                "media-audio-port-input",
+                &app.media_audio_port,
+                Message::MediaAudioPortChanged,
+            ),
+            media_port(
+                "主视频",
+                "media-video1-port-input",
+                &app.media_video1_port,
+                Message::MediaVideo1PortChanged,
+            ),
+            media_port(
+                "第二视频",
+                "media-video2-port-input",
+                &app.media_video2_port,
+                Message::MediaVideo2PortChanged,
+            ),
+        ]
+        .spacing(8),
+        text(app.language.tr("留空使用协商端口；仅覆盖远端目标端口"))
+            .size(PARAMETER_CAPTION_SIZE)
+            .color(theme::palette().text_warm),
+    ]
+    .spacing(3)
+    .width(PARAMETER_CONTROL_WIDTH);
     let frame_rate = iced::widget::text_input(app.language.tr("自动"), &app.frame_rate)
         .on_input(Message::FrameRateChanged)
         .width(PARAMETER_CONTROL_WIDTH)
@@ -461,6 +505,7 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
     let parameter_rows = column![
         connection_parameter_row(app.language.tr("视频质量"), quality, CONTROL_HEIGHT),
         connection_parameter_row(app.language.tr("远程分辨率"), resolution, 52.0),
+        connection_parameter_row(app.language.tr("媒体 UDP 端口"), media_ports, 66.0),
         connection_parameter_row(app.language.tr("帧率 (FPS)"), frame_rate, CONTROL_HEIGHT),
         connection_parameter_row(app.language.tr("画面插值"), interpolation, CONTROL_HEIGHT),
         connection_parameter_row(

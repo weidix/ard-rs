@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     payload_type,
                     remote_ssrc,
                     local_ssrc,
-                ) = media.into_video_pipeline_parts();
+                ) = (*media).into_video_pipeline_parts();
                 let mut receiver = AvcVideoStreamReceiver::new(
                     &endpoints,
                     UdpStreamKind::Video1,

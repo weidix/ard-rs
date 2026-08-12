@@ -776,12 +776,20 @@ both the raw 68-byte struct and the 16-byte-wrapped form.
 ### UDP transport (confirmed)
 
 After `Message1`, the client binds one UDP socket per stream and talks to
-consecutive server ports: video1 = base, video2 = base+1, audio = base+2.
+consecutive server ports: audio = base, video1 = base+1, video2 = base+2.
 Packets are RFC 3550 RTP. Payload encryption is SRTP AES-128-CM (RFC 3711):
 each 46-byte negotiated key is 16-byte master key + 14-byte master salt; the
 remaining 16 bytes are unused by AES-128-CM (reserved for the integrity layer).
 Confirmed from `SSUDPSender`/`AVCVideoStream` in ScreensharingAgent and the
 `AuthGetRandomBytes(0x2e)` key generation in the viewer.
+
+When the remote Mac is behind an explicit UDP port forward, the external
+destination can differ from the port carried by `Message1`. The viewer keeps
+the advertised value as its local bind port and applies the configured
+external value only to the remote socket address. Replacing both values would
+break Screen Sharing's symmetric local-port assumption and can prevent the
+server's first RTP datagram from reaching the viewer. Empty overrides preserve
+the negotiated endpoint exactly.
 
 ### Codec and frame format (confirmed)
 

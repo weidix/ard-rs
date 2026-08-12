@@ -77,6 +77,14 @@ impl Language {
                 "Enter a valid resolution, such as 2560x1440 or 2560x1440,1920x1080"
             }
             "高性能编码" => "High-performance codecs",
+            "媒体 UDP 端口" => "Media UDP ports",
+            "音频" => "Audio",
+            "主视频" => "Primary video",
+            "第二视频" => "Secondary video",
+            "协商" => "Negotiated",
+            "留空使用协商端口；仅覆盖远端目标端口" => {
+                "Leave blank to use negotiated ports; overrides remote destinations only"
+            }
             "帧率 (FPS)" => "Frame rate (FPS)",
             "画面插值" => "Display interpolation",
             "三次锐化采样" => "Bicubic sharp sampling",
@@ -193,6 +201,7 @@ impl Language {
             "按键映射已恢复默认" => "Key mappings restored to defaults",
             "请输入设备地址和用户名" => "Enter a device address and username",
             "请输入有效端口（1–65535）" => "Enter a valid port (1-65535)",
+            "请输入有效的媒体 UDP 端口" => "Enter valid media UDP ports",
             "请输入密码" => "Enter a password",
             "保存的密码不可用，请重新输入" => {
                 "The saved password is unavailable. Enter it again."

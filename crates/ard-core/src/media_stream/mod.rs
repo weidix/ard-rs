@@ -34,7 +34,7 @@ pub use negotiation::{
     parse_negotiation_payload,
 };
 pub use rtp::{AccessUnit, H264Depacketizer, HevcDepacketizer, RtpHeader, RtpPacket};
-pub use udp::{MediaUdpEndpoints, MediaUdpSession, UdpStreamKind};
+pub use udp::{MediaUdpEndpoints, MediaUdpPortOverrides, MediaUdpSession, UdpStreamKind};
 pub use wire::{
     MediaStreamAnswer, MediaStreamConfiguration, MediaStreamError, MediaStreamFlags,
     MediaStreamKeyMaterial, MediaStreamMessage1, MediaStreamServerReply,

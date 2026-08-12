@@ -48,6 +48,9 @@ pub struct AppConfig {
     pub remember_device: bool,
     pub quality: String,
     pub resolution: String,
+    pub media_audio_port: String,
+    pub media_video1_port: String,
+    pub media_video2_port: String,
     pub frame_rate: String,
     pub frame_interval_ms: String,
     pub should_interpolate: bool,
@@ -80,6 +83,9 @@ impl Default for AppConfig {
             remember_device: true,
             quality: "adaptive".into(),
             resolution: String::new(),
+            media_audio_port: String::new(),
+            media_video1_port: String::new(),
+            media_video2_port: String::new(),
             frame_rate: String::new(),
             frame_interval_ms: "0".into(),
             should_interpolate: true,
@@ -411,6 +417,28 @@ mod tests {
         )
         .expect("serialized sharp sampling config parses");
         assert!(restored.sharp_sampling);
+    }
+
+    #[test]
+    fn media_udp_port_overrides_are_backward_compatible_and_round_trip() {
+        let legacy: AppConfig = serde_json::from_str("{}").expect("legacy config parses");
+        assert!(legacy.media_audio_port.is_empty());
+        assert!(legacy.media_video1_port.is_empty());
+        assert!(legacy.media_video2_port.is_empty());
+
+        let configured = AppConfig {
+            media_audio_port: "15900".into(),
+            media_video1_port: "15901".into(),
+            media_video2_port: "15902".into(),
+            ..AppConfig::default()
+        };
+        let restored: AppConfig = serde_json::from_slice(
+            &serde_json::to_vec(&configured).expect("media ports serialize"),
+        )
+        .expect("media ports parse");
+        assert_eq!(restored.media_audio_port, "15900");
+        assert_eq!(restored.media_video1_port, "15901");
+        assert_eq!(restored.media_video2_port, "15902");
     }
 
     #[test]

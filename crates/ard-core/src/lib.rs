@@ -46,9 +46,9 @@ pub use media_stream::{
     HevcDepacketizer, MEDIA_STREAM_KEY_LEN, MEDIA_STREAM_MESSAGE_VERSION, MediaStreamAnswer,
     MediaStreamCodec, MediaStreamConfiguration, MediaStreamError, MediaStreamFlags,
     MediaStreamKeyMaterial, MediaStreamMessage1, MediaStreamOffer, MediaStreamServerReply,
-    MediaUdpEndpoints, MediaUdpSession, RtpHeader, RtpPacket, SERVER_MEDIA_STREAM_MESSAGE_TYPE,
-    UdpStreamKind, VideoCodecConfig, VideoFormatParameters, VideoPayloadConfig,
-    parse_negotiation_payload,
+    MediaUdpEndpoints, MediaUdpPortOverrides, MediaUdpSession, RtpHeader, RtpPacket,
+    SERVER_MEDIA_STREAM_MESSAGE_TYPE, UdpStreamKind, VideoCodecConfig, VideoFormatParameters,
+    VideoPayloadConfig, parse_negotiation_payload,
 };
 pub use mvs::{MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate};
 pub use oracle::{EncryptedTransportOracle, OracleReport};

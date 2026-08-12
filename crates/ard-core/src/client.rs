@@ -11,7 +11,7 @@ use crate::media_stream::{
     CLIENT_MEDIA_STREAM_MESSAGE_TYPE, ENCODING_AVC_MEDIA_STREAM, MEDIA_STREAM_MESSAGE_VERSION,
     MediaStreamAnswer, MediaStreamCodec, MediaStreamConfiguration, MediaStreamFlags,
     MediaStreamKeyMaterial, MediaStreamOffer, MediaStreamServerReply, MediaUdpEndpoints,
-    VideoCodecConfig, build_media_stream_offer_with_ssrc,
+    MediaUdpPortOverrides, VideoCodecConfig, build_media_stream_offer_with_ssrc,
     build_media_stream_offer_with_ssrc_and_codec, build_remote_endpoint_info,
 };
 use crate::{
@@ -172,6 +172,9 @@ pub struct ArdClientConfig {
     /// Optional fixed virtual-display layout requested from the server.
     /// `None` keeps the server's existing physical display layout.
     pub display_configuration: Option<ArdDisplayConfiguration>,
+    /// Optional external UDP destinations for a remote Mac behind explicit
+    /// port forwarding. Empty fields keep the ports negotiated over RFB.
+    pub media_udp_port_overrides: MediaUdpPortOverrides,
     /// RFB pixel layout requested from the server and retained by the core.
     pub output_format: ArdFrameOutput,
     /// Use Apple's server-driven update stream instead of serial
@@ -193,6 +196,7 @@ impl fmt::Debug for ArdClientConfig {
             .field("timeout", &self.timeout)
             .field("video_quality", &self.video_quality)
             .field("display_configuration", &self.display_configuration)
+            .field("media_udp_port_overrides", &self.media_udp_port_overrides)
             .field("output_format", &self.output_format)
             .field("automatic_updates", &self.automatic_updates)
             .field("frame_interval", &self.frame_interval)
@@ -214,6 +218,7 @@ impl ArdClientConfig {
             timeout: Duration::from_secs(20),
             video_quality: ArdVideoQuality::Adaptive,
             display_configuration: None,
+            media_udp_port_overrides: MediaUdpPortOverrides::default(),
             output_format: ArdFrameOutput::ServerNative,
             automatic_updates: true,
             frame_interval: Duration::ZERO,
@@ -285,7 +290,7 @@ pub enum ArdClientEvent {
     StateChange,
     /// The server accepted the AVC media path and the viewer can start its
     /// UDP/SRTP decoder with the supplied video1 material.
-    MediaStream(ArdMediaStream),
+    MediaStream(Box<ArdMediaStream>),
     /// The transport was recreated after a read-side disconnect. The next
     /// call waits for the first frame from the new session.
     Reconnected,
@@ -601,6 +606,7 @@ impl ArdClient {
     }
 
     fn connect_inner(config: &mut ArdClientConfig) -> Result<Self, ArdClientError> {
+        config.media_udp_port_overrides.validate()?;
         let mut stream = TcpStream::connect(&config.address)?;
         let media_host = stream.peer_addr()?.ip();
         stream.set_nodelay(true)?;
@@ -971,8 +977,10 @@ impl ArdClient {
                 video1_server_to_viewer.fill(0);
                 video_call_id_bytes.fill(0);
                 self.media_offer_sent = true;
+                let endpoints = MediaUdpEndpoints::from_message1(self.media_host, &message)
+                    .with_remote_port_overrides(self.reconnect_config.media_udp_port_overrides)?;
                 self.pending_media_stream = Some(PendingMediaStream {
-                    endpoints: MediaUdpEndpoints::from_message1(self.media_host, &message),
+                    endpoints,
                     video1_server_to_viewer: video1_key_blob,
                     video1_viewer_to_server: video1_feedback_key_blob,
                     video1_local_ssrc: video1_derived_ssrc,
@@ -1056,16 +1064,18 @@ impl ArdClient {
                 })?;
                 let key_blob = core::mem::take(&mut pending.video1_server_to_viewer);
                 let feedback_key_blob = core::mem::take(&mut pending.video1_viewer_to_server);
-                Ok(Some(ArdClientEvent::MediaStream(ArdMediaStream {
-                    endpoints: pending.endpoints,
-                    key_blob,
-                    feedback_key_blob,
-                    codec,
-                    payload_type,
-                    codec_config,
-                    derived_ssrc,
-                    local_ssrc: pending.video1_local_ssrc,
-                })))
+                Ok(Some(ArdClientEvent::MediaStream(Box::new(
+                    ArdMediaStream {
+                        endpoints: pending.endpoints,
+                        key_blob,
+                        feedback_key_blob,
+                        codec,
+                        payload_type,
+                        codec_config,
+                        derived_ssrc,
+                        local_ssrc: pending.video1_local_ssrc,
+                    },
+                ))))
             }
             MediaStreamServerReply::Error(error) => Err(ArdClientError::Message(format!(
                 "server rejected AVC media stream (type={}, subcode={})",

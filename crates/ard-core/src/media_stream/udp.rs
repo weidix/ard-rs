@@ -46,6 +46,46 @@ impl UdpStreamKind {
     }
 }
 
+/// Optional remote UDP destination ports for a forwarded AVC media session.
+///
+/// Screen Sharing advertises the ports that the viewer must bind locally in
+/// `MediaStreamMessage1`. A router may expose the remote Mac on different
+/// external ports, so these values replace only the remote destination. They
+/// deliberately do not change the negotiated local bind ports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaUdpPortOverrides {
+    pub video1: Option<u16>,
+    pub video2: Option<u16>,
+    pub audio: Option<u16>,
+}
+
+impl MediaUdpPortOverrides {
+    pub const fn is_empty(self) -> bool {
+        self.video1.is_none() && self.video2.is_none() && self.audio.is_none()
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if [self.video1, self.video2, self.audio]
+            .into_iter()
+            .flatten()
+            .any(|port| port == 0)
+        {
+            return Err(Error::Invalid(
+                "remote media UDP port override must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn port_for(self, kind: UdpStreamKind) -> Option<u16> {
+        match kind {
+            UdpStreamKind::Video1 => self.video1,
+            UdpStreamKind::Video2 => self.video2,
+            UdpStreamKind::Audio => self.audio,
+        }
+    }
+}
+
 /// Remote UDP endpoints derived from the server's base port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaUdpEndpoints {
@@ -53,6 +93,7 @@ pub struct MediaUdpEndpoints {
     pub video1_port: u16,
     pub video2_port: Option<u16>,
     pub audio_port: Option<u16>,
+    remote_port_overrides: MediaUdpPortOverrides,
 }
 
 impl MediaUdpEndpoints {
@@ -63,7 +104,20 @@ impl MediaUdpEndpoints {
             video1_port: message.video1_port,
             video2_port: message.video2_port,
             audio_port: message.audio_port,
+            remote_port_overrides: MediaUdpPortOverrides::default(),
         }
+    }
+
+    /// Apply external destination ports without changing the local ports
+    /// advertised by Screen Sharing.
+    pub fn with_remote_port_overrides(mut self, overrides: MediaUdpPortOverrides) -> Result<Self> {
+        overrides.validate()?;
+        self.remote_port_overrides = overrides;
+        Ok(self)
+    }
+
+    pub const fn remote_port_overrides(&self) -> MediaUdpPortOverrides {
+        self.remote_port_overrides
     }
 
     pub fn port_for(&self, kind: UdpStreamKind) -> Option<u16> {
@@ -72,6 +126,13 @@ impl MediaUdpEndpoints {
             UdpStreamKind::Video2 => self.video2_port,
             UdpStreamKind::Audio => self.audio_port,
         }
+    }
+
+    /// Remote destination after applying an optional port-forward override.
+    pub fn remote_port_for(&self, kind: UdpStreamKind) -> Option<u16> {
+        self.remote_port_overrides
+            .port_for(kind)
+            .or_else(|| self.port_for(kind))
     }
 }
 
@@ -86,14 +147,19 @@ impl MediaUdpSession {
     /// Bind the negotiated port locally and connect to the remote endpoint.
     /// Screen Sharing uses the same port number on both sides so that the
     /// server can send the first RTP packet before receiving client traffic.
+    /// A configured forwarding override changes only `remote`, never the
+    /// local bind address.
     pub fn connect(endpoints: &MediaUdpEndpoints, kind: UdpStreamKind) -> Result<Self> {
-        let port = endpoints
+        let local_port = endpoints
             .port_for(kind)
             .ok_or(Error::Invalid("endpoint not offered for stream kind"))?;
-        let remote = SocketAddr::new(endpoints.host, port);
+        let remote_port = endpoints
+            .remote_port_for(kind)
+            .ok_or(Error::Invalid("endpoint not offered for stream kind"))?;
+        let remote = SocketAddr::new(endpoints.host, remote_port);
         let bind_addr = match endpoints.host {
-            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_port),
+            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_port),
         };
         let socket = UdpSocket::bind(bind_addr).map_err(io_error)?;
         socket
@@ -620,10 +686,14 @@ fn io_error(error: std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
     use std::time::{Duration, Instant};
 
-    use super::{AVC_VIDEO_SLICE_COUNT, AccessUnitBatcher, insert_scheduled_item, is_rtcp};
-    use crate::media_stream::AccessUnit;
+    use super::{
+        AVC_VIDEO_SLICE_COUNT, AccessUnitBatcher, MediaUdpEndpoints, MediaUdpPortOverrides,
+        MediaUdpSession, UdpStreamKind, insert_scheduled_item, is_rtcp,
+    };
+    use crate::media_stream::{AccessUnit, ENCODING_AVC_MEDIA_STREAM, MediaStreamMessage1};
 
     #[test]
     fn distinguishes_rtcp_from_rtp() {
@@ -636,6 +706,67 @@ mod tests {
     #[test]
     fn native_desktop_uses_four_video_slices() {
         assert_eq!(AVC_VIDEO_SLICE_COUNT, 4);
+    }
+
+    #[test]
+    fn forwarded_destination_keeps_the_negotiated_local_bind_port() {
+        let local_reservation = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("local port");
+        let local_port = local_reservation
+            .local_addr()
+            .expect("local address")
+            .port();
+        drop(local_reservation);
+
+        let remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("remote port");
+        remote
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout");
+        let remote_port = remote.local_addr().expect("remote address").port();
+        assert_ne!(local_port, remote_port);
+
+        let message = MediaStreamMessage1 {
+            encoding: ENCODING_AVC_MEDIA_STREAM,
+            video1_port: local_port,
+            video2_port: Some(5902),
+            audio_port: Some(5900),
+            video1_hdr: false,
+            video2_hdr: false,
+            stream_count: 1,
+        };
+        let endpoints = MediaUdpEndpoints::from_message1(IpAddr::V4(Ipv4Addr::LOCALHOST), &message)
+            .with_remote_port_overrides(MediaUdpPortOverrides {
+                video1: Some(remote_port),
+                ..MediaUdpPortOverrides::default()
+            })
+            .expect("valid override");
+        let session =
+            MediaUdpSession::connect(&endpoints, UdpStreamKind::Video1).expect("forwarded session");
+
+        session.send(b"forwarded").expect("send datagram");
+        let mut buffer = [0_u8; 32];
+        let (len, source) = remote.recv_from(&mut buffer).expect("receive datagram");
+        assert_eq!(&buffer[..len], b"forwarded");
+        assert_eq!(source.port(), local_port);
+        assert_eq!(session.remote().port(), remote_port);
+        assert_eq!(endpoints.port_for(UdpStreamKind::Video1), Some(local_port));
+        assert_eq!(
+            endpoints.remote_port_for(UdpStreamKind::Video1),
+            Some(remote_port)
+        );
+        assert_eq!(endpoints.remote_port_for(UdpStreamKind::Audio), Some(5900));
+        assert_eq!(endpoints.remote_port_for(UdpStreamKind::Video2), Some(5902));
+    }
+
+    #[test]
+    fn remote_port_overrides_reject_zero() {
+        assert!(
+            MediaUdpPortOverrides {
+                video1: Some(0),
+                ..MediaUdpPortOverrides::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     fn unit(timestamp: u32, value: u8) -> AccessUnit {

@@ -56,6 +56,14 @@ encrypted TCP RFB channel while video uses the negotiated UDP/RTP stream. On
 non-macOS platforms the setting falls back to adaptive MVS until a native AVC
 decoder backend is available.
 
+For a remote Mac behind explicit port forwarding, the connection form accepts
+independent external UDP overrides for audio, primary video, and secondary
+video. Empty fields use the ports advertised by the server. An override changes
+only the remote destination: the viewer continues to bind the original
+negotiated local port required by Screen Sharing. For example, a router mapping
+external UDP `15900-15902` to the Mac's UDP `5900-5902` should be configured as
+audio `15900`, primary video `15901`, and secondary video `15902`.
+
 After encrypted transport activation, the client requests and decodes one
 non-incremental full-frame baseline, then sends Apple's automatic frame-update
 subscription with a zero interval by default. This preserves MVS copy/cache
