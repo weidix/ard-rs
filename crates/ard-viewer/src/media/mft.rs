@@ -108,16 +108,31 @@ impl NativeDecoder {
                         .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
                 })
                 .and_then(|_| transform.SetInputType(0, &input_type, 0))
-                .and_then(|_| transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0))
-                .and_then(|_| transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0))
                 .map_err(|error| format!("配置系统视频解码 MFT 失败：{error}"))?;
         }
-        Ok(Self {
+        let mut decoder = Self {
             transform,
             output_format: None,
             pending: BTreeMap::new(),
             _runtime: runtime,
-        })
+        };
+        // The inbox H.264 decoder exposes a placeholder output type after the
+        // input type is set. It will not process samples until the client
+        // selects that type; SPS/PPS later triggers STREAM_CHANGE with the
+        // actual dimensions. HEVC follows the same MFT negotiation model.
+        decoder.select_nv12_output_type()?;
+        unsafe {
+            decoder
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+                .and_then(|_| {
+                    decoder
+                        .transform
+                        .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+                })
+                .map_err(|error| format!("启动系统视频解码 MFT 失败：{error}"))?;
+        }
+        Ok(decoder)
     }
 
     fn submit(
@@ -181,6 +196,9 @@ impl NativeDecoder {
                 Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     self.select_nv12_output_type()?;
                 }
+                Err(error) if error.code() == MF_E_TRANSFORM_TYPE_NOT_SET => {
+                    self.select_nv12_output_type()?;
+                }
                 Err(error) => return Err(format!("MFT 获取解码输出失败：{error}")),
             }
         }
@@ -230,12 +248,17 @@ impl NativeDecoder {
             }
             unsafe { self.transform.SetOutputType(0, &media_type, 0) }
                 .map_err(|error| format!("选择 MFT NV12 输出失败：{error}"))?;
-            let packed_size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }
-                .map_err(|error| format!("MFT NV12 输出缺少帧尺寸：{error}"))?;
+            let Some(packed_size) = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }.ok() else {
+                // H.264's documented initial placeholder can omit dimensions.
+                // Keep the type selected and wait for STREAM_CHANGE after SPS.
+                self.output_format = None;
+                return Ok(());
+            };
             let width = (packed_size >> 32) as u32;
             let height = packed_size as u32;
             if width == 0 || height == 0 {
-                return Err("MFT 返回了零尺寸 NV12 输出".into());
+                self.output_format = None;
+                return Ok(());
             }
             let stride = unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
                 .ok()
