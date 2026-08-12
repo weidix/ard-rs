@@ -62,8 +62,6 @@ struct ArdViewer {
     remember_device: bool,
     quality: ArdVideoQuality,
     resolution: String,
-    resolution_width: String,
-    resolution_height: String,
     open_dropdown: Option<DropdownMenu>,
     frame_rate: String,
     should_interpolate: bool,
@@ -115,6 +113,7 @@ struct ArdViewer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropdownMenu {
     ConnectionQuality,
+    ConnectionResolution,
     Theme,
     Language,
     KeyProfile,
@@ -159,8 +158,7 @@ enum Message {
     ToggleDropdown(DropdownMenu),
     CloseDropdown,
     QualityChanged(ArdVideoQuality),
-    ResolutionWidthChanged(String),
-    ResolutionHeightChanged(String),
+    ResolutionChanged(String),
     FrameRateChanged(String),
     ShouldInterpolateChanged(bool),
     SharpSamplingChanged(bool),
@@ -224,7 +222,11 @@ impl ArdViewer {
             && cached.remember_password
             && config::load_password(&endpoint, &username).is_some();
         let mappings = profile_mappings(&cached.key_profile);
-        let (resolution_width, resolution_height) = split_resolution(&cached.resolution);
+        let resolution = if parse_display_configuration(&cached.resolution).is_ok() {
+            cached.resolution.clone()
+        } else {
+            String::new()
+        };
         let app = Self {
             windows: BTreeMap::new(),
             maximized_windows: BTreeSet::new(),
@@ -246,9 +248,7 @@ impl ArdViewer {
             remember_password: cached.remember_password,
             remember_device: cached.remember_device,
             quality: config::quality_from_cache(&cached.quality),
-            resolution: cached.resolution.clone(),
-            resolution_width,
-            resolution_height,
+            resolution,
             open_dropdown: None,
             frame_rate: if cached.frame_rate.is_empty() {
                 frame_rate_from_interval(&cached.frame_interval_ms)
@@ -566,22 +566,9 @@ impl ArdViewer {
                 self.open_dropdown = None;
                 self.persist_config();
             }
-            Message::ResolutionWidthChanged(value) => {
-                self.resolution_width = value
-                    .chars()
-                    .filter(char::is_ascii_digit)
-                    .take(5)
-                    .collect();
-                self.join_resolution();
-                self.persist_config();
-            }
-            Message::ResolutionHeightChanged(value) => {
-                self.resolution_height = value
-                    .chars()
-                    .filter(char::is_ascii_digit)
-                    .take(5)
-                    .collect();
-                self.join_resolution();
+            Message::ResolutionChanged(value) => {
+                self.resolution = value;
+                self.open_dropdown = None;
                 self.persist_config();
             }
             Message::FrameRateChanged(value) => {
@@ -693,10 +680,7 @@ impl ArdViewer {
                 } else if self.remote_endpoint().is_err() {
                     self.status = self.language.tr("请输入有效端口（1–65535）").into();
                 } else if parse_display_configuration(&self.resolution).is_err() {
-                    self.status = self
-                        .language
-                        .tr("请输入有效分辨率，例如 2560x1440 或 2560x1440,1920x1080")
-                        .into();
+                    self.status = self.language.tr("请选择受支持的固定分辨率").into();
                 } else if self.password.is_empty() && !self.has_saved_password {
                     self.status = self.language.tr("请输入密码").into();
                 } else {
@@ -1109,15 +1093,6 @@ impl ArdViewer {
         }
     }
 
-    fn join_resolution(&mut self) {
-        self.resolution =
-            if self.resolution_width.is_empty() && self.resolution_height.is_empty() {
-                String::new()
-            } else {
-                format!("{}x{}", self.resolution_width, self.resolution_height)
-            };
-    }
-
     fn persist_config(&mut self) {
         let has_history = !self.devices.is_empty();
         let cached = config::AppConfig {
@@ -1332,6 +1307,7 @@ impl ArdViewer {
                     format!("渲染失败：{error}")
                 });
             }
+            SessionEvent::RenderRecovered => self.session_error = None,
         }
         Task::none()
     }
@@ -1609,17 +1585,6 @@ fn frame_interval_from_rate(value: &str) -> u64 {
     }
 }
 
-fn split_resolution(value: &str) -> (String, String) {
-    let Some((width, height)) = value
-        .split(',')
-        .next()
-        .and_then(|dimensions| dimensions.trim().split_once(['x', 'X']))
-    else {
-        return (String::new(), String::new());
-    };
-    (width.trim().to_owned(), height.trim().to_owned())
-}
-
 fn parse_display_configuration(value: &str) -> Result<Option<ArdDisplayConfiguration>, ()> {
     let value = value.trim();
     if value.is_empty() {
@@ -1632,7 +1597,7 @@ fn parse_display_configuration(value: &str) -> Result<Option<ArdDisplayConfigura
             let (width, height) = dimensions.trim().split_once(['x', 'X']).ok_or(())?;
             let width = width.trim().parse::<u32>().map_err(|_| ())?;
             let height = height.trim().parse::<u32>().map_err(|_| ())?;
-            if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+            if !ArdVirtualDisplay::is_supported_size(width, height) {
                 return Err(());
             }
             Ok(ArdVirtualDisplay::named(
@@ -2067,15 +2032,16 @@ mod tests {
     #[test]
     fn resolution_configuration_is_explicit_and_supports_two_displays() {
         assert_eq!(parse_display_configuration(""), Ok(None));
-        let configuration = parse_display_configuration("2560x1440, 1920X1080")
+        let configuration = parse_display_configuration("1440x900, 1920X1080")
             .expect("valid resolution syntax")
             .expect("configured displays");
         assert_eq!(configuration.displays.len(), 2);
-        assert_eq!(configuration.displays[0].width, 2560);
-        assert_eq!(configuration.displays[0].height, 1440);
+        assert_eq!(configuration.displays[0].width, 1440);
+        assert_eq!(configuration.displays[0].height, 900);
         assert_eq!(configuration.displays[1].width, 1920);
         assert_eq!(configuration.displays[1].height, 1080);
         assert!(parse_display_configuration("dynamic").is_err());
+        assert!(parse_display_configuration("2560x1440").is_err());
         assert!(parse_display_configuration("1920x1080,1280x720,800x600").is_err());
     }
 

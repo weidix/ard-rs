@@ -5,6 +5,10 @@ edition = "2024"
 description = "Native GUI viewer for Apple Remote Desktop sessions"
 license = "MIT OR Apache-2.0"
 
+[[example]]
+name = "avc_nv12_frame_probe"
+path = "examples/avc_frame_probe.rs"
+
 [dependencies]
 ard_rs = { package = "ard-core", path = "../ard-core" }
 ard-input-hook = { path = "../ard-input-hook" }

@@ -9,7 +9,8 @@ use crate::theme::{
     CONTROL_PADDING_X, CONTROL_RADIUS, ICON_SIZE, MICRO_SIZE, TITLE_SIZE, WINDOW_RADIUS,
 };
 use crate::widgets::{
-    dropdown, icon_button, primary, quality_dropdown_sections, secondary, window_chrome_with_title,
+    DropdownOption, DropdownSection, dropdown, icon_button, primary, quality_dropdown_sections,
+    secondary, window_chrome_with_title,
 };
 use crate::{ArdViewer, DropdownMenu, Message};
 
@@ -424,27 +425,8 @@ fn form(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
 
     let quality = quality_selector(app);
     let resolution = column![
-        row![
-            iced::widget::text_input("2560", &app.resolution_width)
-                .on_input(Message::ResolutionWidthChanged)
-                .width(Fill)
-                .padding([10.0, CONTROL_PADDING_X])
-                .size(PARAMETER_TEXT_SIZE)
-                .style(theme::connection_parameter_input),
-            text("×")
-                .size(PARAMETER_TEXT_SIZE)
-                .color(theme::palette().text_muted),
-            iced::widget::text_input("1440", &app.resolution_height)
-                .on_input(Message::ResolutionHeightChanged)
-                .width(Fill)
-                .padding([10.0, CONTROL_PADDING_X])
-                .size(PARAMETER_TEXT_SIZE)
-                .style(theme::connection_parameter_input),
-        ]
-        .spacing(6)
-        .width(Fill)
-        .align_y(Alignment::Center),
-        text(app.language.tr("仅高性能模式下生效"))
+        resolution_selector(app),
+        text(app.language.tr("固定 2× 像素比例，仅高性能模式下生效"))
             .size(PARAMETER_CAPTION_SIZE)
             .color(theme::palette().text_warm),
     ]
@@ -630,6 +612,44 @@ fn quality_selector(app: &ArdViewer) -> Element<'_, Message> {
         PARAMETER_TEXT_SIZE,
         open,
         Message::ToggleDropdown(DropdownMenu::ConnectionQuality),
+        Message::CloseDropdown,
+    )
+}
+
+fn resolution_selector(app: &ArdViewer) -> Element<'_, Message> {
+    let open = app.open_dropdown == Some(DropdownMenu::ConnectionResolution);
+    let selected_label = if app.resolution.is_empty() {
+        app.language.tr("自动").to_owned()
+    } else {
+        app.resolution.clone()
+    };
+    let mut options = vec![
+        DropdownOption::new(
+            app.language.tr("自动"),
+            app.resolution.is_empty(),
+            Message::ResolutionChanged(String::new()),
+        )
+        .id("resolution-option-auto"),
+    ];
+    options.extend(
+        ard_rs::ArdVirtualDisplay::SUPPORTED_LOGICAL_SIZES
+            .into_iter()
+            .map(|(width, height)| {
+                let value = format!("{width}x{height}");
+                DropdownOption::new(
+                    value.clone(),
+                    app.resolution.eq_ignore_ascii_case(&value),
+                    Message::ResolutionChanged(value),
+                )
+            }),
+    );
+    dropdown(
+        selected_label,
+        vec![DropdownSection::new(None, options)],
+        PARAMETER_CONTROL_WIDTH,
+        PARAMETER_TEXT_SIZE,
+        open,
+        Message::ToggleDropdown(DropdownMenu::ConnectionResolution),
         Message::CloseDropdown,
     )
 }

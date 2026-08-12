@@ -4,7 +4,7 @@ use ard_rs::{MvsGpuTile, MvsGpuTileUpdate};
 use iced::widget::shader::{self, Program};
 use iced::{Element, Fill, Rectangle, Size};
 
-use crate::session_runtime::{FramePacket, SharedMailbox, TileSet, fitted_viewport};
+use crate::session_runtime::{FramePacket, SessionEvent, SharedMailbox, TileSet, fitted_viewport};
 
 #[derive(Debug, Clone)]
 pub struct RemoteProgram {
@@ -115,7 +115,16 @@ impl shader::Primitive for RemotePrimitive {
             .ok()
             .and_then(|mut mailbox| mailbox.latest.take());
         let Some(mut frame) = frame else { return };
-        pipeline.upload(&mut frame);
+        let native_upload = frame.nv12.is_some();
+        let uploaded = pipeline.upload(&mut frame);
+        if native_upload
+            && !uploaded
+            && let Ok(mut mailbox) = self.mailbox.lock()
+        {
+            mailbox.push_event(SessionEvent::RenderFailed(
+                "原生 NV12 帧未通过 GPU 纹理布局校验".into(),
+            ));
+        }
         if let Some(buffer) = frame.rgba.take()
             && let Ok(mut mailbox) = self.mailbox.lock()
         {
@@ -142,6 +151,15 @@ struct DecodedTexture {
     render_bind_group: wgpu::BindGroup,
 }
 
+struct NativeNv12Texture {
+    width: u32,
+    height: u32,
+    y_texture: wgpu::Texture,
+    uv_texture: wgpu::Texture,
+    conversion_buffer: wgpu::Buffer,
+    render_bind_group: wgpu::BindGroup,
+}
+
 struct UploadBuffer {
     buffer: wgpu::Buffer,
     capacity: u64,
@@ -154,11 +172,17 @@ pub struct RemotePipeline {
     interpolated_render_pipeline: wgpu::RenderPipeline,
     sharp_render_pipeline: wgpu::RenderPipeline,
     nearest_render_pipeline: wgpu::RenderPipeline,
+    native_interpolated_render_pipeline: wgpu::RenderPipeline,
+    native_sharp_render_pipeline: wgpu::RenderPipeline,
+    native_nearest_render_pipeline: wgpu::RenderPipeline,
     compute_layout: wgpu::BindGroupLayout,
     render_layout: wgpu::BindGroupLayout,
+    native_render_layout: wgpu::BindGroupLayout,
     empty_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     decoded: Option<DecodedTexture>,
+    native_nv12: Option<NativeNv12Texture>,
+    present_native_nv12: bool,
     records_buffer: Option<UploadBuffer>,
     payload_buffer: Option<UploadBuffer>,
     quantization_buffer: Option<UploadBuffer>,
@@ -227,9 +251,55 @@ impl shader::Pipeline for RemotePipeline {
                 },
             ],
         });
+        let native_render_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ARD native NV12 presentation bindings"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ARD GPU MVS decoder"),
             source: wgpu::ShaderSource::Wgsl(include_str!("viewer_mvs.wgsl").into()),
+        });
+        let native_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ARD native NV12 presenter"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("viewer_nv12.wgsl").into()),
         });
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -253,6 +323,12 @@ impl shader::Pipeline for RemotePipeline {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ARD presentation pipeline layout"),
                 bind_group_layouts: &[Some(&empty_layout), Some(&render_layout)],
+                immediate_size: 0,
+            });
+        let native_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ARD native NV12 presentation pipeline layout"),
+                bind_group_layouts: &[Some(&empty_layout), Some(&native_render_layout)],
                 immediate_size: 0,
             });
         let empty_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -293,6 +369,45 @@ impl shader::Pipeline for RemotePipeline {
             create_render_pipeline("ARD sharp presentation pipeline", "fs_sharp");
         let nearest_render_pipeline =
             create_render_pipeline("ARD nearest presentation pipeline", "fs_nearest");
+        let create_native_render_pipeline = |label, entry_point| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&native_render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &native_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &native_shader,
+                    entry_point: Some(entry_point),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let native_interpolated_render_pipeline = create_native_render_pipeline(
+            "ARD native NV12 interpolated presentation pipeline",
+            "fs_interpolated",
+        );
+        let native_sharp_render_pipeline = create_native_render_pipeline(
+            "ARD native NV12 sharp presentation pipeline",
+            "fs_sharp",
+        );
+        let native_nearest_render_pipeline = create_native_render_pipeline(
+            "ARD native NV12 nearest presentation pipeline",
+            "fs_nearest",
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ARD decoded frame sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -308,11 +423,17 @@ impl shader::Pipeline for RemotePipeline {
             interpolated_render_pipeline,
             sharp_render_pipeline,
             nearest_render_pipeline,
+            native_interpolated_render_pipeline,
+            native_sharp_render_pipeline,
+            native_nearest_render_pipeline,
             compute_layout,
             render_layout,
+            native_render_layout,
             empty_bind_group,
             sampler,
             decoded: None,
+            native_nv12: None,
+            present_native_nv12: false,
             records_buffer: None,
             payload_buffer: None,
             quantization_buffer: None,
@@ -337,6 +458,8 @@ impl shader::Pipeline for RemotePipeline {
 impl RemotePipeline {
     fn reset_session(&mut self) {
         self.decoded = None;
+        self.native_nv12 = None;
+        self.present_native_nv12 = false;
         self.records_buffer = None;
         self.payload_buffer = None;
         self.quantization_buffer = None;
@@ -402,11 +525,205 @@ impl RemotePipeline {
     }
 
     fn upload(&mut self, frame: &mut FramePacket) -> bool {
-        if frame.rgba.is_some() {
+        if let Some(native) = frame.nv12.as_ref() {
+            self.upload_nv12(native)
+        } else if frame.rgba.is_some() {
             self.upload_rgba(frame)
         } else {
             self.upload_mvs(frame)
         }
+    }
+
+    fn ensure_nv12_texture(&mut self, width: u32, height: u32) -> bool {
+        if width == 0 || height == 0 {
+            return false;
+        }
+        if self
+            .native_nv12
+            .as_ref()
+            .is_some_and(|native| native.width == width && native.height == height)
+        {
+            return false;
+        }
+        let make_texture = |label, format, width, height| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let y_texture = make_texture(
+            "ARD native NV12 luma",
+            wgpu::TextureFormat::R8Unorm,
+            width,
+            height,
+        );
+        let uv_texture = make_texture(
+            "ARD native NV12 chroma",
+            wgpu::TextureFormat::Rg8Unorm,
+            width.div_ceil(2),
+            height.div_ceil(2),
+        );
+        let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let uv_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let conversion_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ARD NV12 YCbCr conversion"),
+            size: 48,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let render_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ARD native NV12 presentation bind group"),
+            layout: &self.native_render_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&y_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&uv_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: conversion_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        self.native_nv12 = Some(NativeNv12Texture {
+            width,
+            height,
+            y_texture,
+            uv_texture,
+            conversion_buffer,
+            render_bind_group,
+        });
+        true
+    }
+
+    fn upload_nv12(&mut self, frame: &crate::media::DecodedFrame) -> bool {
+        let width = frame.width;
+        let height = frame.height;
+        let uv_width = width.div_ceil(2);
+        let uv_height = height.div_ceil(2);
+        let Some(uv_bytes_per_row) = uv_width.checked_mul(2) else {
+            return false;
+        };
+        for update in &frame.updates {
+            let pixels = &update.pixels;
+            let expected_y = usize::try_from(width)
+                .ok()
+                .and_then(|row| row.checked_mul(pixels.height as usize));
+            let expected_uv = usize::try_from(uv_bytes_per_row)
+                .ok()
+                .and_then(|row| row.checked_mul(pixels.height.div_ceil(2) as usize));
+            if pixels.width != width
+                || pixels.range != frame.range
+                || pixels.matrix != frame.matrix
+                || expected_y != Some(pixels.y_plane.len())
+                || expected_uv != Some(pixels.uv_plane.len())
+                || update.y_origin.saturating_add(update.y_rows) > height
+                || update.uv_origin.saturating_add(update.uv_rows) > uv_height
+                || update.y_rows > pixels.height
+                || update.uv_rows > pixels.height.div_ceil(2)
+            {
+                return false;
+            }
+        }
+        let recreated = self.ensure_nv12_texture(width, height);
+        if !recreated && self.native_nv12.is_none() {
+            return false;
+        }
+        if recreated && frame.updates.len() < 4 {
+            // A fresh texture must be initialized by all four native desktop
+            // slices. The compositor guarantees this after startup, loss, or
+            // a dimension change.
+            self.native_nv12 = None;
+            return false;
+        }
+        *self.pending_mvs_decode.lock().expect("decode lock") = None;
+        self.present_native_nv12 = true;
+        let native = self.native_nv12.as_ref().expect("native textures exist");
+        for update in &frame.updates {
+            if update.y_rows != 0 {
+                let y_bytes = usize::try_from(width)
+                    .expect("width fits usize")
+                    .checked_mul(update.y_rows as usize)
+                    .expect("validated slice size");
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &native.y_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: update.y_origin,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &update.pixels.y_plane[..y_bytes],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width),
+                        rows_per_image: Some(update.y_rows),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height: update.y_rows,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            if update.uv_rows != 0 {
+                let uv_bytes = usize::try_from(uv_bytes_per_row)
+                    .expect("chroma row fits usize")
+                    .checked_mul(update.uv_rows as usize)
+                    .expect("validated chroma size");
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &native.uv_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: update.uv_origin,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &update.pixels.uv_plane[..uv_bytes],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(uv_bytes_per_row),
+                        rows_per_image: Some(update.uv_rows),
+                    },
+                    wgpu::Extent3d {
+                        width: uv_width,
+                        height: update.uv_rows,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+        let conversion = yuv_conversion(frame.range, frame.matrix);
+        self.queue.write_buffer(
+            &native.conversion_buffer,
+            0,
+            bytemuck::cast_slice(&conversion),
+        );
+        true
     }
 
     fn upload_rgba(&mut self, frame: &FramePacket) -> bool {
@@ -431,6 +748,7 @@ impl RemotePipeline {
             return false;
         }
         *self.pending_mvs_decode.lock().expect("decode lock") = None;
+        self.present_native_nv12 = false;
         let decoded = self.decoded.as_ref().expect("texture exists");
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -455,6 +773,7 @@ impl RemotePipeline {
     }
 
     fn upload_mvs(&mut self, frame: &mut FramePacket) -> bool {
+        self.present_native_nv12 = false;
         let incoming = std::mem::replace(&mut frame.tiles, TileSet::new(0, 0, 0));
         let recreated = self.ensure_texture(u32::from(frame.width), u32::from(frame.height));
         if self.decoded.is_none() {
@@ -577,7 +896,17 @@ impl RemotePipeline {
             let (workgroups_x, workgroups_y) = mvs_dispatch_size(workgroups);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
-        let Some(decoded) = &self.decoded else { return };
+        let (frame_width, frame_height) = if self.present_native_nv12 {
+            let Some(native) = &self.native_nv12 else {
+                return;
+            };
+            (native.width, native.height)
+        } else {
+            let Some(decoded) = &self.decoded else {
+                return;
+            };
+            (decoded.width, decoded.height)
+        };
         let scale = self.scale_factor;
         let bounds = Rectangle::new(
             iced::Point::new(self.bounds.x * scale, self.bounds.y * scale),
@@ -585,7 +914,7 @@ impl RemotePipeline {
         );
         let viewport = fitted_viewport(
             bounds,
-            Size::new(decoded.width as u16, decoded.height as u16),
+            Size::new(frame_width as u16, frame_height as u16),
             self.zoom,
             self.actual_size,
         );
@@ -622,19 +951,81 @@ impl RemotePipeline {
             0.0,
             1.0,
         );
-        pass.set_pipeline(if self.should_interpolate {
-            if self.sharp_sampling {
-                &self.sharp_render_pipeline
+        if self.present_native_nv12 {
+            pass.set_pipeline(if self.should_interpolate {
+                if self.sharp_sampling {
+                    &self.native_sharp_render_pipeline
+                } else {
+                    &self.native_interpolated_render_pipeline
+                }
             } else {
-                &self.interpolated_render_pipeline
-            }
+                &self.native_nearest_render_pipeline
+            });
+            pass.set_bind_group(0, &self.empty_bind_group, &[]);
+            pass.set_bind_group(
+                1,
+                &self
+                    .native_nv12
+                    .as_ref()
+                    .expect("native texture selected")
+                    .render_bind_group,
+                &[],
+            );
         } else {
-            &self.nearest_render_pipeline
-        });
-        pass.set_bind_group(0, &self.empty_bind_group, &[]);
-        pass.set_bind_group(1, &decoded.render_bind_group, &[]);
+            pass.set_pipeline(if self.should_interpolate {
+                if self.sharp_sampling {
+                    &self.sharp_render_pipeline
+                } else {
+                    &self.interpolated_render_pipeline
+                }
+            } else {
+                &self.nearest_render_pipeline
+            });
+            pass.set_bind_group(0, &self.empty_bind_group, &[]);
+            pass.set_bind_group(
+                1,
+                &self
+                    .decoded
+                    .as_ref()
+                    .expect("RGBA texture selected")
+                    .render_bind_group,
+                &[],
+            );
+        }
         pass.draw(0..3, 0..1);
     }
+}
+
+fn yuv_conversion(range: crate::media::YuvRange, matrix: crate::media::YuvMatrix) -> [f32; 12] {
+    let (kr, kb) = match matrix {
+        crate::media::YuvMatrix::Bt601 => (0.299_f32, 0.114_f32),
+        crate::media::YuvMatrix::Bt709 => (0.2126_f32, 0.0722_f32),
+        crate::media::YuvMatrix::Bt2020 => (0.2627_f32, 0.0593_f32),
+    };
+    let kg = 1.0 - kr - kb;
+    let (y_scale, chroma_scale, y_offset) = match range {
+        crate::media::YuvRange::Video => (255.0 / 219.0, 255.0 / 224.0, 16.0 / 255.0),
+        crate::media::YuvRange::Full => (1.0, 1.0, 0.0),
+    };
+    let chroma_offset = 128.0 / 255.0;
+    let red_cr = 2.0 * (1.0 - kr) * chroma_scale;
+    let blue_cb = 2.0 * (1.0 - kb) * chroma_scale;
+    let green_cb = -2.0 * kb * (1.0 - kb) / kg * chroma_scale;
+    let green_cr = -2.0 * kr * (1.0 - kr) / kg * chroma_scale;
+    [
+        y_scale,
+        0.0,
+        red_cr,
+        -y_scale * y_offset - red_cr * chroma_offset,
+        y_scale,
+        green_cb,
+        green_cr,
+        -y_scale * y_offset - (green_cb + green_cr) * chroma_offset,
+        y_scale,
+        blue_cb,
+        0.0,
+        -y_scale * y_offset - blue_cb * chroma_offset,
+    ]
 }
 
 fn storage_buffer_layout(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -756,25 +1147,121 @@ mod tests {
 
     use ard_rs::{ArdVideoQuality, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, PixelFormat};
 
-    use super::{mvs_dispatch_size, remote_display};
+    use super::{mvs_dispatch_size, remote_display, yuv_conversion};
     use crate::session_runtime::{FrameMailbox, FramePacket, framebuffer_to_rgba};
 
     #[test]
     fn gpu_shader_is_valid_wgsl() {
-        let module =
-            naga::front::wgsl::parse_str(include_str!("viewer_mvs.wgsl")).expect("shader parses");
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .expect("shader validates");
+        for source in [
+            include_str!("viewer_mvs.wgsl"),
+            include_str!("viewer_nv12.wgsl"),
+        ] {
+            let module = naga::front::wgsl::parse_str(source).expect("shader parses");
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .expect("shader validates");
+        }
     }
 
     #[test]
     fn mvs_dispatch_spreads_large_frames_across_two_dimensions() {
         assert_eq!(mvs_dispatch_size(65_535), (65_535, 1));
         assert_eq!(mvs_dispatch_size(118_984), (59_492, 2));
+    }
+
+    #[test]
+    fn bt709_video_range_conversion_maps_nominal_black_and_white() {
+        let matrix = yuv_conversion(
+            crate::media::YuvRange::Video,
+            crate::media::YuvMatrix::Bt709,
+        );
+        let convert = |y: f32, cb: f32, cr: f32| {
+            [0, 4, 8].map(|row| {
+                matrix[row] * y + matrix[row + 1] * cb + matrix[row + 2] * cr + matrix[row + 3]
+            })
+        };
+        for value in convert(16.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0) {
+            assert!(value.abs() < 1.0e-5);
+        }
+        for value in convert(235.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0) {
+            assert!((value - 1.0).abs() < 1.0e-5);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a GPU and writes a visual QA snapshot to /tmp"]
+    fn nv12_frame_renders_through_the_iced_gpu_pipeline() -> Result<(), iced_test::Error> {
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
+        mailbox.lock().expect("mailbox").latest = Some(FramePacket::from_nv12(
+            crate::media::DecodedFrame {
+                width: 2,
+                height: 4,
+                encoded_bytes: 12,
+                range: crate::media::YuvRange::Video,
+                matrix: crate::media::YuvMatrix::Bt709,
+                updates: (0..4)
+                    .map(|slice_index| crate::media::DecodedSliceUpdate {
+                        slice_index,
+                        y_origin: slice_index as u32,
+                        y_rows: 1,
+                        uv_origin: slice_index.min(1) as u32,
+                        uv_rows: u32::from(slice_index < 2),
+                        pixels: crate::media::DecodedSlice {
+                            width: 2,
+                            height: 1,
+                            y_plane: vec![[16, 81, 145, 235][slice_index.min(3)]; 2],
+                            uv_plane: vec![128, 128],
+                            range: crate::media::YuvRange::Video,
+                            matrix: crate::media::YuvMatrix::Bt709,
+                        },
+                    })
+                    .collect(),
+            },
+            ArdVideoQuality::HighPerformanceAvc,
+        ));
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(320.0, 200.0),
+            remote_display::<()>(mailbox, 1.0, false, true, false),
+        );
+        let snapshot = ui.snapshot(&iced::Theme::Dark)?;
+        let snapshot_base = "/tmp/ard-viewer-iced-nv12-slice-pipeline";
+        assert!(snapshot.matches_image(snapshot_base)?);
+
+        // Do not let a pre-existing all-black baseline make this GPU test a
+        // false positive. Inspect the four scaled source rows in the actual
+        // wgpu snapshot and require the expected video-range luma ramp.
+        let file = std::fs::File::open(format!("{snapshot_base}-wgpu.png"))?;
+        let mut reader = png::Decoder::new(std::io::BufReader::new(file)).read_info()?;
+        let mut rgba = vec![0; reader.output_buffer_size().expect("snapshot size")];
+        let info = reader.next_frame(&mut rgba)?;
+        assert_eq!((info.width, info.height), (640, 400));
+        let level = |y: usize| {
+            let offset = (y * info.width as usize + 320) * 4;
+            let pixel = &rgba[offset..offset + 4];
+            assert_eq!(pixel[3], 255);
+            assert_eq!(pixel[0], pixel[1]);
+            assert_eq!(pixel[1], pixel[2]);
+            pixel[0]
+        };
+        let levels = [level(50), level(150), level(250), level(350)];
+        assert!(levels[0] <= 2, "nominal black was {}", levels[0]);
+        assert!(
+            (70..=85).contains(&levels[1]),
+            "dark gray was {}",
+            levels[1]
+        );
+        assert!(
+            (140..=160).contains(&levels[2]),
+            "light gray was {}",
+            levels[2]
+        );
+        assert!(levels[3] >= 250, "nominal white was {}", levels[3]);
+        Ok(())
     }
 
     #[test]

@@ -26,7 +26,7 @@ fn client_sends_fixed_display_configuration_inside_encrypted_transport() {
 
     let mut config =
         ArdClientConfig::new(address.to_string(), b"viewer".to_vec(), b"oracle".to_vec());
-    config.display_configuration = Some(ArdDisplayConfiguration::single(2560, 1440));
+    config.display_configuration = Some(ArdDisplayConfiguration::single(1920, 1080));
     let mut client = ArdClient::connect(config).unwrap();
     client.next_frame().unwrap();
     drop(client);

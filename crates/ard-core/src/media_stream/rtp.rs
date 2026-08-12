@@ -187,6 +187,7 @@ pub(crate) struct RtpReorderBuffer {
     continuation: Option<(u16, u32)>,
     codec: MediaStreamCodec,
     marker_pending: bool,
+    dropped_access_units: usize,
 }
 
 impl RtpReorderBuffer {
@@ -197,6 +198,7 @@ impl RtpReorderBuffer {
             continuation: None,
             codec,
             marker_pending: false,
+            dropped_access_units: 0,
         }
     }
 
@@ -219,6 +221,7 @@ impl RtpReorderBuffer {
         }) {
             return Ok(Vec::new());
         }
+        self.drop_stale_access_units_before(&parsed);
         self.packets.push(packet.to_vec());
         self.marker_pending |= parsed.header.marker;
         if self.packets.len() >= MAX_RTP_REORDER_PACKETS
@@ -227,6 +230,63 @@ impl RtpReorderBuffer {
             return Ok(self.drain_sorted());
         }
         Ok(Vec::new())
+    }
+
+    /// Number of access units that were conclusively missing one or more RTP
+    /// packets. The caller must reset prediction/depacketization state before
+    /// consuming later frames.
+    pub(crate) fn take_dropped_access_units(&mut self) -> usize {
+        std::mem::take(&mut self.dropped_access_units)
+    }
+
+    fn drop_stale_access_units_before(&mut self, incoming: &RtpPacket<'_>) {
+        // Wait until the marker of a newer frame. This gives a late packet an
+        // entire frame interval to close the older burst while keeping loss
+        // recovery bounded to one frame instead of the 64-packet hard cap.
+        if !incoming.header.marker {
+            return;
+        }
+        let stale_headers: Vec<_> = self
+            .packets
+            .iter()
+            .filter_map(|packet| RtpPacket::parse(packet).ok().map(|packet| packet.header))
+            .filter(|header| header.timestamp != incoming.header.timestamp)
+            .collect();
+        let Some(last_stale) = stale_headers
+            .iter()
+            .copied()
+            .max_by(|left, right| sequence_order(left.sequence, right.sequence))
+        else {
+            return;
+        };
+        if !sequence_is_newer(incoming.header.sequence, last_stale.sequence) {
+            return;
+        }
+
+        // A complete newer access unit has arrived, but an older timestamp is
+        // still buffered. Discard every stale access unit instead of handing
+        // an incomplete predictive picture to the decoder.
+        self.packets.retain(|packet| {
+            RtpPacket::parse(packet)
+                .map(|packet| packet.header.timestamp == incoming.header.timestamp)
+                .unwrap_or(false)
+        });
+        self.last_released_sequence = Some(last_stale.sequence);
+        self.continuation = None;
+        self.marker_pending = self.packets.iter().any(|packet| {
+            RtpPacket::parse(packet)
+                .map(|packet| packet.header.marker)
+                .unwrap_or(false)
+        });
+        let mut stale_timestamps = stale_headers
+            .iter()
+            .map(|header| header.timestamp)
+            .collect::<Vec<_>>();
+        stale_timestamps.sort_unstable();
+        stale_timestamps.dedup();
+        self.dropped_access_units = self
+            .dropped_access_units
+            .saturating_add(stale_timestamps.len());
     }
 
     fn marker_ready(&mut self) -> bool {
@@ -522,6 +582,11 @@ impl H264Depacketizer {
         }
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.fragment = None;
+        self.assembler.reset();
+    }
+
     /// Feed one parsed RTP packet whose payload is a raw H.264 payload.
     /// Returns the completed access unit, if any.
     pub fn push(&mut self, packet: &RtpPacket<'_>) -> Result<Option<AccessUnit>> {
@@ -752,6 +817,11 @@ impl HevcDepacketizer {
         }
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.fragment = None;
+        self.assembler.reset();
+    }
+
     pub fn push(&mut self, packet: &RtpPacket<'_>) -> Result<Option<AccessUnit>> {
         let payload = packet.payload;
         if payload.is_empty() {
@@ -975,6 +1045,48 @@ mod tests {
             RtpPacket::parse(&ready[0]).expect("packet").header.sequence,
             11
         );
+    }
+
+    #[test]
+    fn discards_a_marker_burst_with_a_missing_packet_when_next_frame_arrives() {
+        let first = rtp(10, 5000, false, &[0x41, 1]);
+        let marker = rtp(12, 5000, true, &[0x41, 3]);
+        let next = rtp(13, 5001, true, &[0x65, 4]);
+        let mut reorder = RtpReorderBuffer::with_codec(MediaStreamCodec::H264);
+
+        assert!(reorder.push(&first).expect("first").is_empty());
+        assert!(reorder.push(&marker).expect("gapped marker").is_empty());
+        let ready = reorder.push(&next).expect("next frame");
+
+        assert_eq!(reorder.take_dropped_access_units(), 1);
+        assert_eq!(ready.len(), 1);
+        let packet = RtpPacket::parse(&ready[0]).expect("next packet");
+        assert_eq!(packet.header.timestamp, 5001);
+        assert_eq!(packet.header.sequence, 13);
+    }
+
+    #[test]
+    fn missing_marker_packet_cannot_hold_the_reorder_queue_until_capacity() {
+        let old = rtp(20, 6000, false, &[0x41, 1]);
+        let next_start = rtp(22, 6001, false, &[0x41, 2]);
+        let next_marker = rtp(23, 6001, true, &[0x41, 3]);
+        let mut reorder = RtpReorderBuffer::with_codec(MediaStreamCodec::H264);
+
+        assert!(reorder.push(&old).expect("old frame").is_empty());
+        assert!(
+            reorder
+                .push(&next_start)
+                .expect("next frame start")
+                .is_empty()
+        );
+        let ready = reorder.push(&next_marker).expect("next marker");
+
+        assert_eq!(reorder.take_dropped_access_units(), 1);
+        let sequences = ready
+            .iter()
+            .map(|packet| RtpPacket::parse(packet).expect("packet").header.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![22, 23]);
     }
 
     #[test]

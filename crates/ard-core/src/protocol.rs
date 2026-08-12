@@ -964,12 +964,22 @@ pub fn build_ard_auto_frame_update(
 /// desktop layout through DisplayInfo2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArdVirtualDisplay {
+    /// Logical width. Screen Sharing's native virtual-display path always
+    /// pairs it with a 2x physical backing mode.
     pub width: u32,
+    /// Logical height. Screen Sharing's native virtual-display path always
+    /// pairs it with a 2x physical backing mode.
     pub height: u32,
     pub name: String,
 }
 
 impl ArdVirtualDisplay {
+    /// Logical sizes exposed by Screen Sharing's `_GetScreenSizes` helper on
+    /// the protocol version implemented here. Arbitrary sizes are not
+    /// accepted by the host even though the wire fields are integers.
+    pub const SUPPORTED_LOGICAL_SIZES: [(u32, u32); 4] =
+        [(1920, 1080), (1440, 900), (1440, 810), (1312, 848)];
+
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -984,6 +994,27 @@ impl ArdVirtualDisplay {
             height,
             name: name.into(),
         }
+    }
+
+    pub fn is_supported_size(width: u32, height: u32) -> bool {
+        Self::SUPPORTED_LOGICAL_SIZES.contains(&(width, height))
+    }
+
+    /// Physical backing dimensions emitted for this fixed logical mode.
+    /// Screen Sharing's native table uses a fixed 2x backing scale for every
+    /// supported entry; the AVC/HEVC stream carries these physical pixels.
+    pub fn backing_dimensions(&self) -> Result<(u32, u32)> {
+        if !Self::is_supported_size(self.width, self.height) {
+            return Err(Error::Invalid("unsupported fixed virtual display size"));
+        }
+        Ok((
+            self.width
+                .checked_mul(2)
+                .ok_or(Error::LimitExceeded("virtual display dimensions"))?,
+            self.height
+                .checked_mul(2)
+                .ok_or(Error::LimitExceeded("virtual display dimensions"))?,
+        ))
     }
 }
 
@@ -1006,9 +1037,11 @@ impl ArdDisplayConfiguration {
 
 /// Builds the fixed-resolution display request used by current Screen Sharing.
 ///
-/// Each display contains one non-dynamic mode. Width and height are repeated
-/// in the physical and logical mode fields, with a 60 Hz refresh rate. The
-/// message supports one or two displays, matching the native framework.
+/// Each display contains the native five-entry, non-dynamic mode table. The
+/// selected logical size occupies entry zero with a 2x physical backing size;
+/// the remaining entries mirror Screen Sharing's fixed `_GetScreenSizes`
+/// table. The message supports one or two displays, matching the native
+/// framework.
 pub fn build_ard_set_display_configuration(
     configuration: &ArdDisplayConfiguration,
 ) -> Result<Vec<u8>> {
@@ -1016,7 +1049,21 @@ pub fn build_ard_set_display_configuration(
     const DISPLAY_FIXED_LEN: usize = 156;
     const MODE_LEN: usize = 28;
     const NAME_LEN: usize = 120;
-    const DISPLAY_RECORD_LEN: usize = DISPLAY_FIXED_LEN + MODE_LEN;
+    const NATIVE_MODE_COUNT: usize = 5;
+    const DISPLAY_RECORD_LEN: usize = DISPLAY_FIXED_LEN + MODE_LEN * NATIVE_MODE_COUNT;
+    // `_RFBSetDisplayConfiguration` multiplies the maximum physical pixel
+    // dimensions by this exact f64 constant, then narrows each product to
+    // f32 before putting the values on the wire. These fields describe the
+    // display's physical extent and are not optional to the host even though
+    // the native caller initially zeroes them.
+    const PHYSICAL_EXTENT_PER_PIXEL: f64 = f64::from_bits(0x3fb8_a15b_8a15_b8a1);
+    const NATIVE_LOGICAL_MODES: [(u32, u32); NATIVE_MODE_COUNT] = [
+        (1920, 1080),
+        (1440, 900),
+        (1920, 1080),
+        (1440, 810),
+        (1312, 848),
+    ];
 
     if configuration.displays.is_empty() {
         return Err(Error::Invalid("display configuration is empty"));
@@ -1045,13 +1092,8 @@ pub fn build_ard_set_display_configuration(
     out[6..8].copy_from_slice(&display_count.to_be_bytes());
 
     for (index, display) in configuration.displays.iter().enumerate() {
-        if display.width == 0 || display.height == 0 {
-            return Err(Error::Invalid(
-                "virtual display dimensions must be non-zero",
-            ));
-        }
-        if display.width > 16_384 || display.height > 16_384 {
-            return Err(Error::LimitExceeded("virtual display dimensions"));
+        if !ArdVirtualDisplay::is_supported_size(display.width, display.height) {
+            return Err(Error::Invalid("unsupported fixed virtual display size"));
         }
         let name = display.name.as_bytes();
         if name.len() >= NAME_LEN {
@@ -1063,17 +1105,37 @@ pub fn build_ard_set_display_configuration(
         out[base + 2..base + 2 + name.len()].copy_from_slice(name);
         // Keep flags zero: bit 0 enables dynamic resolution in the native
         // client, while this API deliberately requests a fixed mode.
-        out[base + 138..base + 142].copy_from_slice(&display.width.to_be_bytes());
-        out[base + 142..base + 146].copy_from_slice(&display.height.to_be_bytes());
         out[base + 150..base + 154].copy_from_slice(&7_u32.to_be_bytes());
-        out[base + 154..base + 156].copy_from_slice(&1_u16.to_be_bytes());
+        out[base + 154..base + 156].copy_from_slice(&(NATIVE_MODE_COUNT as u16).to_be_bytes());
 
-        let mode = base + DISPLAY_FIXED_LEN;
-        out[mode..mode + 4].copy_from_slice(&display.width.to_be_bytes());
-        out[mode + 4..mode + 8].copy_from_slice(&display.height.to_be_bytes());
-        out[mode + 8..mode + 12].copy_from_slice(&display.width.to_be_bytes());
-        out[mode + 12..mode + 16].copy_from_slice(&display.height.to_be_bytes());
-        out[mode + 16..mode + 24].copy_from_slice(&60.0_f64.to_bits().to_be_bytes());
+        let requested = (display.width, display.height);
+        let mut maximum_physical_width = 0_u32;
+        let mut maximum_physical_height = 0_u32;
+        for (mode_index, (logical_width, logical_height)) in std::iter::once(requested)
+            .chain(NATIVE_LOGICAL_MODES.into_iter().skip(1))
+            .enumerate()
+        {
+            let (physical_width, physical_height) =
+                ArdVirtualDisplay::new(logical_width, logical_height).backing_dimensions()?;
+            maximum_physical_width = maximum_physical_width.max(physical_width);
+            maximum_physical_height = maximum_physical_height.max(physical_height);
+            let mode = base + DISPLAY_FIXED_LEN + mode_index * MODE_LEN;
+            out[mode..mode + 4].copy_from_slice(&physical_width.to_be_bytes());
+            out[mode + 4..mode + 8].copy_from_slice(&physical_height.to_be_bytes());
+            out[mode + 8..mode + 12].copy_from_slice(&logical_width.to_be_bytes());
+            out[mode + 12..mode + 16].copy_from_slice(&logical_height.to_be_bytes());
+            out[mode + 16..mode + 24].copy_from_slice(&60.0_f64.to_bits().to_be_bytes());
+        }
+
+        let physical_extent_width =
+            (f64::from(maximum_physical_width) * PHYSICAL_EXTENT_PER_PIXEL) as f32;
+        let physical_extent_height =
+            (f64::from(maximum_physical_height) * PHYSICAL_EXTENT_PER_PIXEL) as f32;
+        out[base + 130..base + 134].copy_from_slice(&physical_extent_width.to_bits().to_be_bytes());
+        out[base + 134..base + 138]
+            .copy_from_slice(&physical_extent_height.to_bits().to_be_bytes());
+        out[base + 138..base + 142].copy_from_slice(&maximum_physical_width.to_be_bytes());
+        out[base + 142..base + 146].copy_from_slice(&maximum_physical_height.to_be_bytes());
     }
     Ok(out)
 }
@@ -1152,4 +1214,86 @@ pub(crate) fn complete_framebuffer_update_len(bytes: &[u8], decoder: &Decoder) -
         cursor.take(payload_len)?;
     }
     Ok(cursor.position())
+}
+
+#[cfg(test)]
+mod display_configuration_tests {
+    use super::*;
+
+    fn be_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32 field"))
+    }
+
+    fn be_f32(bytes: &[u8], offset: usize) -> f32 {
+        f32::from_bits(be_u32(bytes, offset))
+    }
+
+    #[test]
+    fn emits_native_five_mode_table_with_two_x_physical_size() {
+        let request =
+            build_ard_set_display_configuration(&ArdDisplayConfiguration::single(1440, 900))
+                .expect("supported fixed mode");
+        assert_eq!(request.len(), 12 + 156 + 5 * 28);
+        assert_eq!(request[0], 0x1d);
+        assert_eq!(
+            u16::from_be_bytes([request[2], request[3]]) as usize,
+            request.len() - 4
+        );
+        assert_eq!(u16::from_be_bytes([request[12], request[13]]), 296);
+        assert_eq!(be_u32(&request, 12 + 138), 3840);
+        assert_eq!(be_u32(&request, 12 + 142), 2160);
+        assert_eq!(
+            be_f32(&request, 12 + 130),
+            (3840.0_f64 * f64::from_bits(0x3fb8_a15b_8a15_b8a1)) as f32
+        );
+        assert_eq!(
+            be_f32(&request, 12 + 134),
+            (2160.0_f64 * f64::from_bits(0x3fb8_a15b_8a15_b8a1)) as f32
+        );
+        assert_eq!(
+            u16::from_be_bytes([request[12 + 154], request[12 + 155]]),
+            5
+        );
+        let expected = [
+            (2880, 1800, 1440, 900),
+            (2880, 1800, 1440, 900),
+            (3840, 2160, 1920, 1080),
+            (2880, 1620, 1440, 810),
+            (2624, 1696, 1312, 848),
+        ];
+        for (index, (physical_width, physical_height, logical_width, logical_height)) in
+            expected.into_iter().enumerate()
+        {
+            let mode = 12 + 156 + index * 28;
+            assert_eq!(be_u32(&request, mode), physical_width);
+            assert_eq!(be_u32(&request, mode + 4), physical_height);
+            assert_eq!(be_u32(&request, mode + 8), logical_width);
+            assert_eq!(be_u32(&request, mode + 12), logical_height);
+            assert_eq!(
+                u64::from_be_bytes(request[mode + 16..mode + 24].try_into().expect("refresh")),
+                60.0_f64.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dimensions_the_native_host_ignores() {
+        assert!(
+            build_ard_set_display_configuration(&ArdDisplayConfiguration::single(2560, 1440))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fixed_modes_report_the_native_two_x_backing_dimensions() {
+        assert_eq!(
+            ArdVirtualDisplay::new(1920, 1080).backing_dimensions(),
+            Ok((3840, 2160))
+        );
+        assert!(
+            ArdVirtualDisplay::new(1320, 848)
+                .backing_dimensions()
+                .is_err()
+        );
+    }
 }

@@ -806,7 +806,54 @@ RFB connection.
 binary-plist negotiation payload parser, RTP de-packetization, SRTP
 AES-128-CM and the UDP receive path in pure Rust (no unsafe, bounded parsing).
 `crates/ard-viewer/src/media/vt.rs` provides the macOS VideoToolbox decode
-backend feeding the existing RGBA display path.
+backend and preserves the decoder's bi-planar YUV output through the GPU
+display path.
+
+### Fixed display modes and native NV12 rendering (2026-08-12)
+
+Re-verified on macOS 26.6.1 build 25G76. Disassembly of
+`_GetScreenSizes` in ScreenSharing.framework shows a fixed five-entry mode
+table. Its logical sizes and 2x physical backing sizes are:
+
+| Physical | Logical | Scale |
+| --- | --- | ---: |
+| 3840x2160 | 1920x1080 | 2.0 |
+| 2880x1800 | 1440x900 | 2.0 |
+| 3840x2160 | 1920x1080 | 2.0 |
+| 2880x1620 | 1440x810 | 2.0 |
+| 2624x1696 | 1312x848 | 2.0 |
+
+The duplicate 1920x1080 entry is present in the native table. The
+`stConfigure` caller supplies a mode count of five. A fixed configuration has
+dynamic-resolution flags cleared, a 296-byte display record, and all five
+modes; the selected logical mode replaces entry zero. Before serializing,
+`_RFBSetDisplayConfiguration` takes the component-wise maximum physical size
+across the entire table and multiplies each dimension by the exact binary64
+constant with bits `0x3fb8a15b8a15b8a1`, narrowing the results to the two
+binary32 physical-extent fields. The Rust builder mirrors that calculation and
+rejects dimensions outside the four unique logical sizes instead of sending
+integer values that the host silently ignores.
+
+VideoToolbox output is requested as `420v` (NV12 video range). Decoder
+callbacks also recognize `420f` and read the CoreVideo YCbCr matrix attachment
+(BT.601, BT.709, or BT.2020). Each CVPixelBuffer plane is copied while held by
+an RAII read lock, preserving native luma and interleaved chroma bytes. The
+renderer uploads those bytes directly to persistent `R8Unorm` and `Rg8Unorm`
+textures and performs range expansion, matrix conversion, and transfer
+conversion in WGSL. The live path does not allocate or upload an RGBA desktop;
+the example probe's CPU RGBA conversion exists only for diagnostic PNG output.
+
+The server's four video SSRCs form slices of one reference chain. The receive
+path now discards an incomplete timestamp when a newer completed access unit
+arrives, resets depacketization after a sequence gap, and refuses predictive
+frames until an H.264 IDR or HEVC IRAP frame recreates a clean VCP session.
+Standard protected RTCP PSFB PLI is sent for the four media SSRCs after loss;
+AVConference's installed Objective-C metadata exposes PLI, FIR, NACK, and
+keyframe-request support. The four SSRCs are grouped by their shared RTP
+timestamp, which is the actual sampling-instant boundary for one video frame;
+each timestamp batch is submitted to VideoToolbox and published once. The
+latest-frame mailbox merges distinct dirty slices so UI coalescing cannot lose
+a region.
 
 ### Remaining work
 

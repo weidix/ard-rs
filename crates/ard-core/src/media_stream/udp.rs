@@ -19,6 +19,11 @@ use super::srtp::{SrtcpContext, SrtpContext};
 use super::wire::MediaStreamMessage1;
 
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
+const UDP_READ_TIMEOUT: Duration = Duration::from_millis(10);
+const DEFAULT_FRAME_HOLDBACK: Duration = Duration::from_millis(17);
+const MIN_FRAME_HOLDBACK: Duration = Duration::from_millis(6);
+const MAX_FRAME_HOLDBACK: Duration = Duration::from_millis(34);
 /// Native AVC partitions one desktop frame into four horizontal slices. Each
 /// slice uses an adjacent SSRC with independent SRTP/RTP state, while all four
 /// share one interleaved video decoder reference chain.
@@ -92,7 +97,7 @@ impl MediaUdpSession {
         };
         let socket = UdpSocket::bind(bind_addr).map_err(io_error)?;
         socket
-            .set_read_timeout(Some(Duration::from_millis(250)))
+            .set_read_timeout(Some(UDP_READ_TIMEOUT))
             .map_err(io_error)?;
         socket.connect(remote).map_err(io_error)?;
         Ok(Self {
@@ -131,12 +136,120 @@ pub struct AvcVideoStreamReceiver {
     base_remote_ssrc: u32,
     buffer: Vec<u8>,
     decrypted_buffer: Vec<u8>,
-    ready_frames: VecDeque<(usize, AccessUnit)>,
+    frame_batcher: AccessUnitBatcher,
+    ready_units: VecDeque<(usize, AccessUnit)>,
     packets_received: usize,
     decrypted_packets: usize,
     heartbeats_sent: usize,
     frames: usize,
+    packet_losses: usize,
     last_feedback: Instant,
+    last_keyframe_request: Option<Instant>,
+}
+
+/// Every changed horizontal band sharing one RTP sampling instant. RFC 3550
+/// defines the RTP timestamp as the sampling instant; Apple's four adjacent
+/// SSRCs reuse that timestamp for the bands belonging to one desktop frame.
+#[derive(Debug)]
+pub struct AvcFrameBatch {
+    pub timestamp: u32,
+    pub access_units: Vec<(usize, AccessUnit)>,
+}
+
+struct PendingFrameBatch {
+    timestamp: u32,
+    first_seen: Instant,
+    access_units: Vec<(usize, AccessUnit)>,
+}
+
+#[derive(Default)]
+struct AccessUnitBatcher {
+    pending: Vec<PendingFrameBatch>,
+    last_released_timestamp: Option<u32>,
+    estimated_frame_ticks: Option<u32>,
+}
+
+impl AccessUnitBatcher {
+    fn insert(&mut self, stream_index: usize, unit: AccessUnit, now: Instant) -> bool {
+        if self.last_released_timestamp.is_some_and(|released| {
+            unit.timestamp == released || !timestamp_precedes(released, unit.timestamp)
+        }) {
+            return false;
+        }
+        if let Some(batch) = self
+            .pending
+            .iter_mut()
+            .find(|batch| batch.timestamp == unit.timestamp)
+        {
+            if let Some(existing) = batch
+                .access_units
+                .iter_mut()
+                .find(|(index, _)| *index == stream_index)
+            {
+                *existing = (stream_index, unit);
+            } else {
+                batch.access_units.push((stream_index, unit));
+                batch.access_units.sort_by_key(|(index, _)| *index);
+            }
+            return true;
+        }
+
+        if let Some(latest) = self.pending.last()
+            && timestamp_precedes(latest.timestamp, unit.timestamp)
+        {
+            let delta = unit.timestamp.wrapping_sub(latest.timestamp);
+            if delta != 0 && delta < 90_000 {
+                self.estimated_frame_ticks = Some(match self.estimated_frame_ticks {
+                    Some(previous) => previous.saturating_mul(7).saturating_add(delta) / 8,
+                    None => delta,
+                });
+            }
+        }
+        let position = self
+            .pending
+            .iter()
+            .position(|batch| timestamp_precedes(unit.timestamp, batch.timestamp))
+            .unwrap_or(self.pending.len());
+        self.pending.insert(
+            position,
+            PendingFrameBatch {
+                timestamp: unit.timestamp,
+                first_seen: now,
+                access_units: vec![(stream_index, unit)],
+            },
+        );
+        true
+    }
+
+    fn take_ready(&mut self, now: Instant) -> Option<AvcFrameBatch> {
+        let ready = self.pending.first().is_some_and(|batch| {
+            batch.access_units.len() == AVC_VIDEO_SLICE_COUNT
+                || now.duration_since(batch.first_seen) >= self.holdback()
+                || self.pending.len() >= 3
+        });
+        if !ready {
+            return None;
+        }
+        let batch = self.pending.remove(0);
+        self.last_released_timestamp = Some(batch.timestamp);
+        Some(AvcFrameBatch {
+            timestamp: batch.timestamp,
+            access_units: batch.access_units,
+        })
+    }
+
+    fn holdback(&self) -> Duration {
+        let Some(ticks) = self.estimated_frame_ticks else {
+            return DEFAULT_FRAME_HOLDBACK;
+        };
+        let micros = u64::from(ticks)
+            .saturating_mul(1_000_000)
+            .checked_div(90_000)
+            .unwrap_or_default();
+        Duration::from_micros(micros)
+            .saturating_add(Duration::from_millis(2))
+            .clamp(MIN_FRAME_HOLDBACK, MAX_FRAME_HOLDBACK)
+    }
 }
 
 enum VideoDepacketizer {
@@ -158,6 +271,13 @@ impl VideoDepacketizer {
             Self::Hevc(depacketizer) => depacketizer.push(packet),
         }
     }
+
+    fn reset(&mut self) {
+        match self {
+            Self::H264(depacketizer) => depacketizer.reset(),
+            Self::Hevc(depacketizer) => depacketizer.reset(),
+        }
+    }
 }
 
 struct InboundVideoStream {
@@ -165,6 +285,8 @@ struct InboundVideoStream {
     reorder: RtpReorderBuffer,
     depacketizer: VideoDepacketizer,
     completed: VecDeque<AccessUnit>,
+    next_sequence: Option<u16>,
+    damaged_timestamp: Option<u32>,
 }
 
 impl InboundVideoStream {
@@ -174,18 +296,47 @@ impl InboundVideoStream {
             reorder: RtpReorderBuffer::with_codec(codec),
             depacketizer: VideoDepacketizer::new(codec),
             completed: VecDeque::new(),
+            next_sequence: None,
+            damaged_timestamp: None,
         })
     }
 
-    fn push_decrypted_packet(&mut self, packet: &[u8]) -> Result<()> {
+    fn push_decrypted_packet(&mut self, packet: &[u8]) -> Result<usize> {
         let ready_packets = self.reorder.push(packet)?;
+        let mut losses = self.reorder.take_dropped_access_units();
+        if losses != 0 {
+            self.depacketizer.reset();
+            self.damaged_timestamp = None;
+            // The reorder buffer discarded whole stale timestamps. Resume at
+            // the first packet of the intact newer burst instead of counting
+            // that already-accounted gap a second time and discarding the
+            // recovery frame as well.
+            self.next_sequence = ready_packets.first().and_then(|packet| {
+                RtpPacket::parse(packet)
+                    .ok()
+                    .map(|packet| packet.header.sequence)
+            });
+        }
         for packet in ready_packets {
             let packet = RtpPacket::parse(&packet)?;
+            if self
+                .next_sequence
+                .is_some_and(|expected| expected != packet.header.sequence)
+            {
+                losses = losses.saturating_add(1);
+                self.depacketizer.reset();
+                self.damaged_timestamp = Some(packet.header.timestamp);
+            }
+            self.next_sequence = Some(packet.header.sequence.wrapping_add(1));
+            if self.damaged_timestamp == Some(packet.header.timestamp) {
+                continue;
+            }
+            self.damaged_timestamp = None;
             if let Some(unit) = self.depacketizer.push(&packet)? {
                 self.completed.push_back(unit);
             }
         }
-        Ok(())
+        Ok(losses)
     }
 }
 
@@ -269,12 +420,15 @@ impl AvcVideoStreamReceiver {
             base_remote_ssrc: crypto.remote_ssrc,
             buffer: vec![0u8; MAX_RTP_PACKET],
             decrypted_buffer: Vec::with_capacity(MAX_RTP_PACKET),
-            ready_frames: VecDeque::new(),
+            frame_batcher: AccessUnitBatcher::default(),
+            ready_units: VecDeque::new(),
             packets_received: 0,
             decrypted_packets: 0,
             heartbeats_sent: 0,
             frames: 0,
+            packet_losses: 0,
             last_feedback: Instant::now(),
+            last_keyframe_request: None,
         };
         receiver.send_initial_heartbeats()?;
         Ok(receiver)
@@ -296,12 +450,32 @@ impl AvcVideoStreamReceiver {
         self.heartbeats_sent
     }
 
-    /// Block on one datagram; returns the slice index and completed encoded
-    /// access unit, or `Ok(None)` for a mid-frame packet.
+    pub fn packet_losses(&self) -> usize {
+        self.packet_losses
+    }
+
+    /// Compatibility access-unit API. Units are still released in complete
+    /// RTP-timestamp batches, so callers cannot decode a newer desktop frame
+    /// before a late band from the preceding sampling instant.
     pub fn receive(&mut self) -> Result<Option<(usize, AccessUnit)>> {
+        if let Some(unit) = self.ready_units.pop_front() {
+            return Ok(Some(unit));
+        }
+        if let Some(batch) = self.receive_frame()? {
+            self.ready_units.extend(batch.access_units);
+        }
+        Ok(self.ready_units.pop_front())
+    }
+
+    /// Receive one complete desktop sampling instant. A full four-band frame
+    /// is released immediately; sparse updates are held for one measured RTP
+    /// frame interval so a delayed band cannot be decoded after a newer frame.
+    pub fn receive_frame(&mut self) -> Result<Option<AvcFrameBatch>> {
         self.send_feedback_if_due()?;
-        if let Some(frame) = self.ready_frames.pop_front() {
-            return Ok(Some(frame));
+        let now = Instant::now();
+        if let Some(batch) = self.frame_batcher.take_ready(now) {
+            self.frames = self.frames.saturating_add(1);
+            return Ok(Some(batch));
         }
         let len = match self.session.recv(&mut self.buffer) {
             Ok(len) => len,
@@ -309,7 +483,9 @@ impl AvcVideoStreamReceiver {
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return Ok(None);
+                let batch = self.frame_batcher.take_ready(Instant::now());
+                self.frames = self.frames.saturating_add(usize::from(batch.is_some()));
+                return Ok(batch);
             }
             Err(_) => return Err(Error::Invalid("RTP receive failed")),
         };
@@ -356,11 +532,26 @@ impl AvcVideoStreamReceiver {
             payload_offset,
         )?;
         self.decrypted_packets += 1;
-        stream.push_decrypted_packet(&self.decrypted_buffer)?;
+        let losses = stream.push_decrypted_packet(&self.decrypted_buffer)?;
+        if losses != 0 {
+            self.packet_losses = self.packet_losses.saturating_add(losses);
+            self.send_picture_loss_indications()?;
+        }
         let completed = process_completed_frames(&mut self.streams);
-        self.frames += completed.len();
-        self.ready_frames.extend(completed);
-        Ok(self.ready_frames.pop_front())
+        let now = Instant::now();
+        let mut late_units = 0usize;
+        for (slice_index, unit) in completed {
+            if !self.frame_batcher.insert(slice_index, unit, now) {
+                late_units = late_units.saturating_add(1);
+            }
+        }
+        if late_units != 0 {
+            self.packet_losses = self.packet_losses.saturating_add(late_units);
+            self.send_picture_loss_indications()?;
+        }
+        let batch = self.frame_batcher.take_ready(now);
+        self.frames = self.frames.saturating_add(usize::from(batch.is_some()));
+        Ok(batch)
     }
 
     fn send_feedback_if_due(&mut self) -> Result<()> {
@@ -391,6 +582,28 @@ impl AvcVideoStreamReceiver {
         self.last_feedback = Instant::now();
         Ok(())
     }
+
+    pub fn request_keyframe(&mut self) -> Result<()> {
+        self.send_picture_loss_indications()
+    }
+
+    fn send_picture_loss_indications(&mut self) -> Result<()> {
+        if self
+            .last_keyframe_request
+            .is_some_and(|last| last.elapsed() < KEYFRAME_REQUEST_INTERVAL)
+        {
+            return Ok(());
+        }
+        for feedback in &mut self.feedback {
+            let request = feedback
+                .srtcp
+                .protect_picture_loss_indication(feedback.remote_ssrc)?;
+            self.session.send(&request).map_err(io_error)?;
+            self.heartbeats_sent += 1;
+        }
+        self.last_keyframe_request = Some(Instant::now());
+        Ok(())
+    }
 }
 
 fn is_rtcp(datagram: &[u8]) -> bool {
@@ -407,7 +620,9 @@ fn io_error(error: std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{AVC_VIDEO_SLICE_COUNT, insert_scheduled_item, is_rtcp};
+    use std::time::{Duration, Instant};
+
+    use super::{AVC_VIDEO_SLICE_COUNT, AccessUnitBatcher, insert_scheduled_item, is_rtcp};
     use crate::media_stream::AccessUnit;
 
     #[test]
@@ -473,5 +688,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, u32::MAX - 1), (1, u32::MAX), (2, 1)]
         );
+    }
+
+    #[test]
+    fn complete_four_slice_timestamp_is_released_immediately() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        for slice in 0..AVC_VIDEO_SLICE_COUNT {
+            assert!(batcher.insert(slice, unit(800, slice as u8), now));
+        }
+        let batch = batcher.take_ready(now).expect("complete timestamp");
+        assert_eq!(batch.timestamp, 800);
+        assert_eq!(batch.access_units.len(), AVC_VIDEO_SLICE_COUNT);
+        assert_eq!(
+            batch
+                .access_units
+                .iter()
+                .map(|(slice, _)| *slice)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn sparse_timestamp_waits_one_frame_interval_without_waiting_for_all_slices() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        assert!(batcher.insert(2, unit(1_600, 2), now));
+        assert!(batcher.take_ready(now).is_none());
+        let batch = batcher
+            .take_ready(now + Duration::from_millis(18))
+            .expect("sparse timestamp after bounded holdback");
+        assert_eq!(batch.timestamp, 1_600);
+        assert_eq!(batch.access_units.len(), 1);
+        assert_eq!(batch.access_units[0].0, 2);
+    }
+
+    #[test]
+    fn timestamp_batches_preserve_wrap_order_and_reject_late_old_units() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        assert!(batcher.insert(0, unit(u32::MAX - 1, 0), now));
+        assert!(batcher.insert(1, unit(u32::MAX, 1), now));
+        assert!(batcher.insert(2, unit(1, 2), now));
+        let first = batcher.take_ready(now).expect("oldest wrap batch");
+        assert_eq!(first.timestamp, u32::MAX - 1);
+        assert!(!batcher.insert(3, unit(u32::MAX - 1, 3), now));
     }
 }

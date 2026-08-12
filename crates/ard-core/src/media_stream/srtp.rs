@@ -121,6 +121,18 @@ impl SrtcpContext {
         self.protect_rtcp(packet)
     }
 
+    /// Create an RFC 4585 Picture Loss Indication for one remote video SSRC.
+    /// The common sender/media SSRC fields are protected as the SRTCP payload,
+    /// matching the encryption/authentication rules used by the native stream.
+    pub fn protect_picture_loss_indication(&mut self, remote_ssrc: u32) -> Result<Vec<u8>> {
+        let mut packet = Vec::with_capacity(12);
+        // V=2, FMT=1 (PLI), PT=206 (payload-specific feedback), length=2.
+        packet.extend_from_slice(&[0x81, 0xce, 0x00, 0x02]);
+        packet.extend_from_slice(&self.sender_ssrc.to_be_bytes());
+        packet.extend_from_slice(&remote_ssrc.to_be_bytes());
+        self.protect_rtcp(packet)
+    }
+
     fn protect_rtcp(&mut self, mut packet: Vec<u8>) -> Result<Vec<u8>> {
         let index = self
             .index
@@ -771,5 +783,30 @@ mod tests {
         assert_eq!(&packet[12..16], &0x8000_0001u32.to_be_bytes());
         let expected = hmac_sha1(&context.material.authentication_key, &packet[..16]);
         assert_eq!(&packet[16..], &expected[..AUTH_TAG_LEN]);
+    }
+
+    #[test]
+    fn protects_picture_loss_indication_for_the_remote_ssrc() {
+        let blob = [0x3cu8; MEDIA_STREAM_KEY_LEN];
+        let local_ssrc = 0x1020_3040;
+        let remote_ssrc = 0x5060_7080;
+        let mut context =
+            SrtcpContext::from_key_blob_with_sender_ssrc(&blob, local_ssrc).expect("context");
+        let packet = context
+            .protect_picture_loss_indication(remote_ssrc)
+            .expect("PLI");
+
+        assert_eq!(
+            &packet[..8],
+            &[0x81, 0xce, 0x00, 0x02, 0x10, 0x20, 0x30, 0x40]
+        );
+        let keystream = context.keystream(1, 4);
+        let decrypted: Vec<_> = packet[8..12]
+            .iter()
+            .zip(keystream)
+            .map(|(byte, key)| byte ^ key)
+            .collect();
+        assert_eq!(decrypted, remote_ssrc.to_be_bytes());
+        assert_eq!(&packet[12..16], &0x8000_0001u32.to_be_bytes());
     }
 }

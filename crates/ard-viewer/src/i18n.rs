@@ -69,6 +69,10 @@ impl Language {
             "视频质量" => "Video quality",
             "远程分辨率" => "Remote resolution",
             "仅高性能模式下生效" => "Only applies in high-performance mode",
+            "固定 2× 像素比例，仅高性能模式下生效" => {
+                "Fixed 2× pixel ratio; only applies in high-performance mode"
+            }
+            "请选择受支持的固定分辨率" => "Select a supported fixed resolution",
             "请输入有效分辨率，例如 2560x1440 或 2560x1440,1920x1080" => {
                 "Enter a valid resolution, such as 2560x1440 or 2560x1440,1920x1080"
             }

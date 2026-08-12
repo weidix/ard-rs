@@ -107,6 +107,7 @@ pub enum SessionEvent {
     Clipboard(String),
     Metrics(StreamMetrics),
     RenderFailed(String),
+    RenderRecovered,
 }
 
 pub struct FramePacket {
@@ -117,6 +118,7 @@ pub struct FramePacket {
     pub chrominance_quantization: [u16; 64],
     pub tiles: TileSet,
     pub rgba: Option<Vec<u8>>,
+    pub nv12: Option<crate::media::DecodedFrame>,
 }
 
 impl std::fmt::Debug for FramePacket {
@@ -126,7 +128,8 @@ impl std::fmt::Debug for FramePacket {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("quality", &self.quality)
-            .field("gpu_mvs", &self.rgba.is_none())
+            .field("gpu_mvs", &(self.rgba.is_none() && self.nv12.is_none()))
+            .field("native_nv12", &self.nv12.is_some())
             .finish()
     }
 }
@@ -145,6 +148,7 @@ impl FramePacket {
                 frame.tiles,
             ),
             rgba: None,
+            nv12: None,
         }
     }
 
@@ -162,6 +166,21 @@ impl FramePacket {
             chrominance_quantization: [0; 64],
             tiles: TileSet::new(width, height, 0),
             rgba: Some(rgba),
+            nv12: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_nv12(frame: crate::media::DecodedFrame, quality: ArdVideoQuality) -> Self {
+        Self {
+            width: u16::try_from(frame.width).unwrap_or(u16::MAX),
+            height: u16::try_from(frame.height).unwrap_or(u16::MAX),
+            quality,
+            luminance_quantization: [0; 64],
+            chrominance_quantization: [0; 64],
+            tiles: TileSet::new(0, 0, 0),
+            rgba: None,
+            nv12: Some(frame),
         }
     }
 
@@ -197,7 +216,10 @@ impl FrameMailbox {
                         SessionEvent::Connected { .. }
                     )
                     | (SessionEvent::Clipboard(_), SessionEvent::Clipboard(_))
-                    | (SessionEvent::RenderFailed(_), SessionEvent::RenderFailed(_))
+                    | (
+                        SessionEvent::RenderFailed(_) | SessionEvent::RenderRecovered,
+                        SessionEvent::RenderFailed(_) | SessionEvent::RenderRecovered
+                    )
             )
         });
         if self.events.len() == MAX_EVENTS {
@@ -218,13 +240,21 @@ impl FrameMailbox {
         events
     }
 
-    fn replace_latest(&mut self, packet: FramePacket) {
-        if let Some(old) = self.latest.replace(packet)
-            && let Some(buffer) = old.rgba
-            && self.rgba_pool.len() < MAX_RGBA_POOL
-        {
-            self.rgba_pool.push(buffer);
+    fn replace_latest(&mut self, mut packet: FramePacket) {
+        if let Some(mut old) = self.latest.take() {
+            if let (Some(current), Some(older)) = (packet.nv12.as_mut(), old.nv12.take()) {
+                // A redraw may be slower than the four independent AVC slice
+                // streams. Preserve the newest update for each slice so the
+                // latest-only mailbox cannot lose a GPU texture region.
+                current.merge_older_updates(older);
+            }
+            if let Some(buffer) = old.rgba.take()
+                && self.rgba_pool.len() < MAX_RGBA_POOL
+            {
+                self.rgba_pool.push(buffer);
+            }
         }
+        self.latest = Some(packet);
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -416,16 +446,24 @@ impl SessionRuntime {
         if let Some(previous) = self.avc_worker.take() {
             let _ = previous.join();
         }
-        let handle = spawn_avc_video_pipeline(media, target_dimensions, stop, move |frame| {
+        let mut render_failed = false;
+        let handle = spawn_avc_video_pipeline(media, target_dimensions, stop, move |result| {
             if let Ok(mut mailbox) = mailbox.lock() {
-                mailbox.replace_latest(FramePacket::from_rgba(
-                    u16::try_from(frame.width).unwrap_or(u16::MAX),
-                    u16::try_from(frame.height).unwrap_or(u16::MAX),
-                    frame.rgba,
-                    quality,
-                ));
-                frame_wake.notify();
+                match result {
+                    Ok(frame) => {
+                        mailbox.replace_latest(FramePacket::from_nv12(frame, quality));
+                        if render_failed {
+                            mailbox.push_event(SessionEvent::RenderRecovered);
+                            render_failed = false;
+                        }
+                    }
+                    Err(error) => {
+                        mailbox.push_event(SessionEvent::RenderFailed(error));
+                        render_failed = true;
+                    }
+                }
             }
+            frame_wake.notify();
         });
         self.avc_worker = Some(handle);
     }
@@ -561,17 +599,49 @@ fn run_receiver(
                         let pipeline_stop = Arc::clone(&stop);
                         let pipeline_mailbox = Arc::clone(&mailbox);
                         let pipeline_wake = Arc::clone(&frame_wake);
-                        let target_dimensions = (
-                            u32::from(client.framebuffer().width()),
-                            u32::from(client.framebuffer().height()),
-                        );
+                        // RFB ServerInit still describes the old physical
+                        // display while the 0x1d reconfiguration is being
+                        // applied. In fixed mode, the AVC stream switches to
+                        // the selected mode's native 2x backing immediately,
+                        // so use that protocol-defined size instead of the
+                        // stale handshake snapshot. A width mismatch remains
+                        // a hard pipeline error; this does not conceal a
+                        // rejected display request.
+                        let target_dimensions = config
+                            .display_configuration
+                            .as_ref()
+                            .and_then(|configuration| configuration.displays.first())
+                            .and_then(|display| display.backing_dimensions().ok())
+                            .unwrap_or_else(|| {
+                                (
+                                    u32::from(client.framebuffer().width()),
+                                    u32::from(client.framebuffer().height()),
+                                )
+                            });
                         let mut media_meter = RateMeter::new();
+                        let mut render_failed = false;
                         let handle = crate::media::spawn_avc_video_pipeline(
                             media,
                             target_dimensions,
                             pipeline_stop,
-                            move |frame| {
+                            move |result| {
                                 if let Ok(mut mailbox) = pipeline_mailbox.lock() {
+                                    let frame = match result {
+                                        Ok(frame) => {
+                                            if render_failed {
+                                                mailbox.push_event(SessionEvent::RenderRecovered);
+                                                render_failed = false;
+                                            }
+                                            frame
+                                        }
+                                        Err(error) => {
+                                            mailbox.push_event(SessionEvent::RenderFailed(error));
+                                            render_failed = true;
+                                            drop(mailbox);
+                                            pipeline_wake.notify();
+                                            return;
+                                        }
+                                    };
                                     let width = u16::try_from(frame.width).unwrap_or(u16::MAX);
                                     let height = u16::try_from(frame.height).unwrap_or(u16::MAX);
                                     let metrics = media_meter.record(
@@ -581,10 +651,8 @@ fn run_receiver(
                                         height,
                                         false,
                                     );
-                                    mailbox.replace_latest(FramePacket::from_rgba(
-                                        width,
-                                        height,
-                                        frame.rgba,
+                                    mailbox.replace_latest(FramePacket::from_nv12(
+                                        frame,
                                         requested_quality,
                                     ));
                                     if let Some(metrics) = metrics {
@@ -2049,6 +2117,19 @@ mod tests {
     }
 
     #[test]
+    fn frame_wake_rearms_after_the_ui_acknowledges_a_frame() {
+        let wake = FrameWake::new();
+        let subscription = FrameWakeSubscription(Arc::clone(&wake));
+        let mut stream = frame_wake_stream(&subscription);
+
+        wake.notify();
+        assert_eq!(iced::futures::executor::block_on(stream.next()), Some(()));
+        wake.acknowledge();
+        wake.notify();
+        assert_eq!(iced::futures::executor::block_on(stream.next()), Some(()));
+    }
+
+    #[test]
     fn scroll_direction_can_be_reversed_on_both_axes() {
         assert_eq!(
             reverse_scroll_delta(ScrollDelta::Lines { x: 2.0, y: -3.0 }),
@@ -2105,6 +2186,57 @@ mod tests {
             Some(SessionEvent::State(ConnectionState::Connected))
         ));
         assert!(mailbox.rgba_pool.len() <= MAX_RGBA_POOL);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn latest_only_mailbox_coalesces_distinct_nv12_slice_updates() {
+        let update = |slice_index, luma| crate::media::DecodedFrame {
+            width: 2,
+            height: 4,
+            encoded_bytes: 2,
+            range: crate::media::YuvRange::Video,
+            matrix: crate::media::YuvMatrix::Bt709,
+            updates: vec![crate::media::DecodedSliceUpdate {
+                slice_index,
+                y_origin: slice_index as u32,
+                y_rows: 1,
+                uv_origin: (slice_index / 2) as u32,
+                uv_rows: u32::from(slice_index % 2 == 0),
+                pixels: crate::media::DecodedSlice {
+                    width: 2,
+                    height: 1,
+                    y_plane: vec![luma; 2],
+                    uv_plane: vec![128; 2],
+                    range: crate::media::YuvRange::Video,
+                    matrix: crate::media::YuvMatrix::Bt709,
+                },
+            }],
+        };
+        let mut mailbox = FrameMailbox::default();
+        mailbox.replace_latest(FramePacket::from_nv12(
+            update(1, 10),
+            ArdVideoQuality::HighPerformanceAvc,
+        ));
+        mailbox.replace_latest(FramePacket::from_nv12(
+            update(3, 30),
+            ArdVideoQuality::HighPerformanceAvc,
+        ));
+
+        let frame = mailbox
+            .latest
+            .expect("latest frame")
+            .nv12
+            .expect("NV12 frame");
+        assert_eq!(
+            frame
+                .updates
+                .iter()
+                .map(|update| update.slice_index)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(frame.encoded_bytes, 4);
     }
 
     #[test]
