@@ -591,14 +591,17 @@ mod tests {
     fn sync_detection_is_codec_specific() {
         let h264_idr = AccessUnit {
             timestamp: 1,
+            decode_order_number: None,
             nal_units: vec![vec![0x65]],
         };
         let h264_predictive = AccessUnit {
             timestamp: 2,
+            decode_order_number: None,
             nal_units: vec![vec![0x41]],
         };
         let hevc_irap = AccessUnit {
             timestamp: 3,
+            decode_order_number: None,
             nal_units: vec![vec![19 << 1]],
         };
         assert!(is_sync_unit(MediaStreamCodec::H264, &h264_idr));

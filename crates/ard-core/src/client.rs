@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpStream};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::media_stream::{
     CLIENT_MEDIA_STREAM_MESSAGE_TYPE, ENCODING_AVC_MEDIA_STREAM, MEDIA_STREAM_MESSAGE_VERSION,
@@ -130,7 +130,10 @@ impl ArdVideoQuality {
             Self::Medium => &[1001, 6, 16, -223],
             Self::High => &[1002, 6, 16, -223],
             Self::HighPerformanceHevc | Self::HighPerformanceAvc => {
-                &[ENCODING_AVC_MEDIA_STREAM, 1011, 1002, 6, 16, -223]
+                // High-performance is an explicit transport contract. Do not
+                // silently negotiate MVS/zlib/raw when AVC media setup fails;
+                // callers must receive a visible negotiation failure instead.
+                &[ENCODING_AVC_MEDIA_STREAM, -223]
             }
             Self::Adaptive => &[1011, 1002, 6, 16, -223],
             Self::Full => &[6, 16, -223],
@@ -393,8 +396,336 @@ impl fmt::Debug for ArdMediaStream {
     }
 }
 
-enum OutboundMessage {
-    Payload(Vec<u8>),
+#[derive(Debug)]
+struct OutboundMessage {
+    payload: Vec<u8>,
+    enqueued_at: Instant,
+    coalescible_pointer: bool,
+    user_input: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArdInputMetrics {
+    /// Messages that have not yet been handed to the socket writer.
+    pub queue_depth: usize,
+    /// Pointer-position states superseded before they reached the network.
+    pub coalesced_pointer_moves: u64,
+    /// Encrypted records successfully flushed to the socket.
+    pub records_written: u64,
+    /// Logical RFB messages contained by those records.
+    pub messages_written: u64,
+    /// Enqueue-to-socket-flush delay of the latest logical message batch.
+    pub last_queue_delay: Duration,
+    /// Largest observed enqueue-to-socket-flush delay in this connection.
+    pub peak_queue_delay: Duration,
+    /// Smoothed enqueue-to-socket-flush delay (1/8 update weight).
+    pub average_queue_delay: Duration,
+    /// Time spent encoding, writing and flushing the latest record.
+    pub last_write_duration: Duration,
+    /// Largest encoding/write/flush duration in this connection.
+    pub peak_write_duration: Duration,
+    /// Local monotonic time at which the latest encrypted record finished
+    /// flushing to the TCP socket.
+    pub last_write_completed_at: Option<Instant>,
+    /// Encrypted records containing at least one user input message.
+    pub user_input_records_written: u64,
+    /// Local monotonic time at which the latest user input record finished
+    /// flushing to the TCP socket.
+    pub last_user_input_completed_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct InputMetricCounters {
+    queue_depth: AtomicUsize,
+    coalesced_pointer_moves: AtomicU64,
+    records_written: AtomicU64,
+    messages_written: AtomicU64,
+    last_queue_delay_ns: AtomicU64,
+    peak_queue_delay_ns: AtomicU64,
+    average_queue_delay_ns: AtomicU64,
+    last_write_duration_ns: AtomicU64,
+    peak_write_duration_ns: AtomicU64,
+    last_write_completed_at: Mutex<Option<Instant>>,
+    user_input_records_written: AtomicU64,
+    last_user_input_completed_at: Mutex<Option<Instant>>,
+}
+
+impl InputMetricCounters {
+    fn snapshot(&self) -> ArdInputMetrics {
+        ArdInputMetrics {
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            coalesced_pointer_moves: self.coalesced_pointer_moves.load(Ordering::Relaxed),
+            records_written: self.records_written.load(Ordering::Relaxed),
+            messages_written: self.messages_written.load(Ordering::Relaxed),
+            last_queue_delay: nanos_to_duration(self.last_queue_delay_ns.load(Ordering::Relaxed)),
+            peak_queue_delay: nanos_to_duration(self.peak_queue_delay_ns.load(Ordering::Relaxed)),
+            average_queue_delay: nanos_to_duration(
+                self.average_queue_delay_ns.load(Ordering::Relaxed),
+            ),
+            last_write_duration: nanos_to_duration(
+                self.last_write_duration_ns.load(Ordering::Relaxed),
+            ),
+            peak_write_duration: nanos_to_duration(
+                self.peak_write_duration_ns.load(Ordering::Relaxed),
+            ),
+            last_write_completed_at: self
+                .last_write_completed_at
+                .lock()
+                .ok()
+                .and_then(|completed| *completed),
+            user_input_records_written: self.user_input_records_written.load(Ordering::Relaxed),
+            last_user_input_completed_at: self
+                .last_user_input_completed_at
+                .lock()
+                .ok()
+                .and_then(|completed| *completed),
+        }
+    }
+
+    fn pointer_coalesced(&self) {
+        self.coalesced_pointer_moves.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_write(&self, messages: &[OutboundMessage], write_duration: Duration) {
+        let now = Instant::now();
+        let queue_delay = messages
+            .iter()
+            .map(|message| now.saturating_duration_since(message.enqueued_at))
+            .max()
+            .unwrap_or_default();
+        let queue_delay_ns = duration_to_nanos(queue_delay);
+        let write_duration_ns = duration_to_nanos(write_duration);
+        self.last_queue_delay_ns
+            .store(queue_delay_ns, Ordering::Relaxed);
+        update_atomic_max(&self.peak_queue_delay_ns, queue_delay_ns);
+        update_atomic_ema(&self.average_queue_delay_ns, queue_delay_ns);
+        self.last_write_duration_ns
+            .store(write_duration_ns, Ordering::Relaxed);
+        update_atomic_max(&self.peak_write_duration_ns, write_duration_ns);
+        if let Ok(mut completed) = self.last_write_completed_at.lock() {
+            *completed = Some(now);
+        }
+        if messages.iter().any(|message| message.user_input) {
+            self.user_input_records_written
+                .fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut completed) = self.last_user_input_completed_at.lock() {
+                *completed = Some(now);
+            }
+        }
+        self.records_written.fetch_add(1, Ordering::Relaxed);
+        self.messages_written.fetch_add(
+            u64::try_from(messages.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+fn duration_to_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn nanos_to_duration(nanos: u64) -> Duration {
+    Duration::from_nanos(nanos)
+}
+
+fn update_atomic_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn update_atomic_ema(target: &AtomicU64, sample: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    loop {
+        let updated = if current == 0 {
+            sample
+        } else {
+            current.saturating_mul(7).saturating_add(sample) / 8
+        };
+        match target.compare_exchange_weak(current, updated, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OutboundMode {
+    /// Internal RFB/media-stream control, excluded from user-action latency.
+    Control,
+    Reliable,
+    /// A complete pointer state that supersedes a queued position immediately
+    /// before it (for example, a button transition at the same coordinates).
+    PointerState,
+    /// A position-only state. Adjacent unsent states can be replaced by the
+    /// newest coordinates without changing any discrete input transition.
+    PointerMotion,
+}
+
+#[derive(Debug, Default)]
+struct OutboundQueueState {
+    messages: VecDeque<OutboundMessage>,
+    stopped: bool,
+}
+
+#[derive(Debug)]
+struct OutboundQueue {
+    state: Mutex<OutboundQueueState>,
+    available: Condvar,
+    space: Condvar,
+    producers: AtomicUsize,
+    metrics: InputMetricCounters,
+}
+
+impl OutboundQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(OutboundQueueState::default()),
+            available: Condvar::new(),
+            space: Condvar::new(),
+            producers: AtomicUsize::new(1),
+            metrics: InputMetricCounters::default(),
+        })
+    }
+
+    fn submit(
+        &self,
+        payload: Vec<u8>,
+        mode: OutboundMode,
+        blocking: bool,
+    ) -> Result<(), ArdClientError> {
+        if payload.len() > MAX_OUTBOUND_PAYLOAD_BYTES {
+            return Err(ArdClientError::Message(
+                "ARD outbound payload exceeds one encrypted record".to_owned(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.stopped {
+            return Err(ArdClientError::Message(
+                "ARD input writer has stopped".to_owned(),
+            ));
+        }
+
+        if matches!(mode, OutboundMode::PointerMotion)
+            && state
+                .messages
+                .back()
+                .is_some_and(|message| message.coalescible_pointer)
+        {
+            let message = state.messages.back_mut().expect("queue back checked");
+            message.payload = payload;
+            message.enqueued_at = Instant::now();
+            self.metrics.pointer_coalesced();
+            return Ok(());
+        }
+
+        if matches!(mode, OutboundMode::PointerState)
+            && state
+                .messages
+                .back()
+                .is_some_and(|message| message.coalescible_pointer)
+        {
+            state.messages.pop_back();
+            self.metrics.pointer_coalesced();
+            self.metrics
+                .queue_depth
+                .store(state.messages.len(), Ordering::Relaxed);
+            self.space.notify_one();
+        }
+
+        while state.messages.len() >= MAX_INPUT_QUEUE {
+            if !blocking {
+                return Err(ArdClientError::Message(
+                    "ARD input queue is full".to_owned(),
+                ));
+            }
+            state = self
+                .space
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
+            if state.stopped {
+                return Err(ArdClientError::Message(
+                    "ARD input writer has stopped".to_owned(),
+                ));
+            }
+        }
+
+        state.messages.push_back(OutboundMessage {
+            payload,
+            enqueued_at: Instant::now(),
+            coalescible_pointer: matches!(mode, OutboundMode::PointerMotion),
+            user_input: !matches!(mode, OutboundMode::Control),
+        });
+        self.metrics
+            .queue_depth
+            .store(state.messages.len(), Ordering::Relaxed);
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn receive_batch(&self) -> Option<Vec<OutboundMessage>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while state.messages.is_empty() && !state.stopped {
+            if self.producers.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        if state.messages.is_empty() {
+            return None;
+        }
+
+        let mut payload_bytes = 0usize;
+        let mut batch = Vec::new();
+        while let Some(next) = state.messages.front() {
+            let Some(next_payload_bytes) = payload_bytes.checked_add(next.payload.len()) else {
+                break;
+            };
+            if next_payload_bytes > MAX_OUTBOUND_PAYLOAD_BYTES {
+                break;
+            }
+            payload_bytes = next_payload_bytes;
+            batch.push(state.messages.pop_front().expect("queue front checked"));
+        }
+        self.metrics
+            .queue_depth
+            .store(state.messages.len(), Ordering::Relaxed);
+        drop(state);
+        self.space.notify_all();
+        Some(batch)
+    }
+
+    fn stop(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stopped = true;
+        }
+        self.available.notify_all();
+        self.space.notify_all();
+    }
+
+    fn producer_cloned(&self) {
+        self.producers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn producer_dropped(&self) {
+        if self.producers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.available.notify_all();
+        }
+    }
 }
 
 /// A cloneable, serialized sender for client-side ARD interaction messages.
@@ -402,11 +733,27 @@ enum OutboundMessage {
 /// All messages share one encrypted-record encoder in a dedicated writer
 /// thread. This keeps the CBC chain and record sequence valid even when the
 /// GUI thread emits mouse events while the receiver thread is reading frames.
-#[derive(Clone)]
 pub struct ArdClientInput {
-    sender: SyncSender<OutboundMessage>,
+    queue: Arc<OutboundQueue>,
     writer_error: Arc<Mutex<Option<String>>>,
     supports_extended_scroll: bool,
+}
+
+impl Clone for ArdClientInput {
+    fn clone(&self) -> Self {
+        self.queue.producer_cloned();
+        Self {
+            queue: Arc::clone(&self.queue),
+            writer_error: Arc::clone(&self.writer_error),
+            supports_extended_scroll: self.supports_extended_scroll,
+        }
+    }
+}
+
+impl Drop for ArdClientInput {
+    fn drop(&mut self) {
+        self.queue.producer_dropped();
+    }
 }
 
 impl fmt::Debug for ArdClientInput {
@@ -415,6 +762,7 @@ impl fmt::Debug for ArdClientInput {
             .debug_struct("ArdClientInput")
             .field("writer_error", &self.writer_error)
             .field("supports_extended_scroll", &self.supports_extended_scroll)
+            .field("metrics", &self.metrics())
             .finish()
     }
 }
@@ -425,11 +773,17 @@ impl ArdClientInput {
         self.supports_extended_scroll
     }
 
+    /// Returns a lock-free snapshot of the outbound real-time queue.
+    pub fn metrics(&self) -> ArdInputMetrics {
+        self.queue.metrics.snapshot()
+    }
+
     /// Queues one key press or release using an X11/RFB keysym.
     pub fn send_key_event(&self, pressed: bool, keysym: u32) -> Result<(), ArdClientError> {
-        self.submit(OutboundMessage::Payload(
+        self.submit(
             build_key_event(pressed, keysym).to_vec(),
-        ))
+            OutboundMode::Reliable,
+        )
     }
 
     /// Queues one pointer position/button-mask update.
@@ -439,9 +793,10 @@ impl ArdClientInput {
         x: u16,
         y: u16,
     ) -> Result<(), ArdClientError> {
-        self.submit(OutboundMessage::Payload(
+        self.submit(
             build_pointer_event(button_mask, x, y).to_vec(),
-        ))
+            OutboundMode::PointerState,
+        )
     }
 
     /// Queues several pointer updates in order as one outbound payload.
@@ -459,7 +814,7 @@ impl ArdClientInput {
             for &(button_mask, x, y) in chunk {
                 payload.extend_from_slice(&build_pointer_event(button_mask, x, y));
             }
-            self.submit(OutboundMessage::Payload(payload))?;
+            self.submit(payload, OutboundMode::PointerState)?;
         }
         Ok(())
     }
@@ -474,9 +829,10 @@ impl ArdClientInput {
                 "server does not advertise extended scroll input".to_owned(),
             ));
         }
-        self.submit(OutboundMessage::Payload(
+        self.submit(
             build_ard_scroll_wheel_event(event).to_vec(),
-        ))
+            OutboundMode::PointerState,
+        )
     }
 
     /// Queues a pointer update without blocking the GUI event loop when the
@@ -488,9 +844,25 @@ impl ArdClientInput {
         x: u16,
         y: u16,
     ) -> Result<(), ArdClientError> {
-        self.try_submit(OutboundMessage::Payload(
+        self.try_submit(
             build_pointer_event(button_mask, x, y).to_vec(),
-        ))
+            OutboundMode::PointerMotion,
+        )
+    }
+
+    /// Queues a coalescible pointer position while allowing a non-GUI
+    /// dispatcher thread to wait for bounded queue space. This preserves the
+    /// final cursor state without ever building a trail of stale positions.
+    pub fn send_pointer_motion(
+        &self,
+        button_mask: u8,
+        x: u16,
+        y: u16,
+    ) -> Result<(), ArdClientError> {
+        self.submit(
+            build_pointer_event(button_mask, x, y).to_vec(),
+            OutboundMode::PointerMotion,
+        )
     }
 
     /// Queues a UTF-8 clipboard update for the remote desktop.
@@ -505,29 +877,19 @@ impl ArdClientInput {
         // record boundaries so large but bounded clipboard contents do not
         // make the CBC writer reject the whole session.
         for chunk in message.chunks(MAX_OUTBOUND_PAYLOAD_BYTES) {
-            self.submit(OutboundMessage::Payload(chunk.to_vec()))?;
+            self.submit(chunk.to_vec(), OutboundMode::Reliable)?;
         }
         Ok(())
     }
 
-    fn submit(&self, message: OutboundMessage) -> Result<(), ArdClientError> {
+    fn submit(&self, payload: Vec<u8>, mode: OutboundMode) -> Result<(), ArdClientError> {
         self.check_writer_error()?;
-        self.sender
-            .send(message)
-            .map_err(|_| ArdClientError::Message("ARD input writer has stopped".to_owned()))
+        self.queue.submit(payload, mode, true)
     }
 
-    fn try_submit(&self, message: OutboundMessage) -> Result<(), ArdClientError> {
+    fn try_submit(&self, payload: Vec<u8>, mode: OutboundMode) -> Result<(), ArdClientError> {
         self.check_writer_error()?;
-        match self.sender.try_send(message) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(ArdClientError::Message(
-                "ARD input queue is full".to_owned(),
-            )),
-            Err(TrySendError::Disconnected(_)) => Err(ArdClientError::Message(
-                "ARD input writer has stopped".to_owned(),
-            )),
-        }
+        self.queue.submit(payload, mode, false)
     }
 
     fn check_writer_error(&self) -> Result<(), ArdClientError> {
@@ -544,7 +906,7 @@ impl ArdClientInput {
     }
 
     fn send_payload(&self, payload: Vec<u8>) -> Result<(), ArdClientError> {
-        self.submit(OutboundMessage::Payload(payload))
+        self.submit(payload, OutboundMode::Control)
     }
 }
 
@@ -565,6 +927,7 @@ pub struct ArdClient {
     automatic_updates: bool,
     automatic_frame_interval_ms: u32,
     automatic_updates_started: bool,
+    requested_framebuffer_dimensions: Option<(u16, u16)>,
     pending_events: VecDeque<ArdClientEvent>,
     reconnect_config: ArdClientConfig,
     media_host: IpAddr,
@@ -801,8 +1164,21 @@ impl ArdClient {
         // Apple's view startup always requests one non-incremental frame.
         // That frame establishes MVS copy/cache state before type 9 enables
         // the server-driven incremental stream.
-        let request =
-            build_framebuffer_update_request(false, 0, 0, server_init.width, server_init.height);
+        let requested_framebuffer_dimensions = config
+            .display_configuration
+            .as_ref()
+            .map(ArdDisplayConfiguration::single_backing_dimensions)
+            .transpose()?
+            .flatten();
+        let requested_framebuffer =
+            requested_framebuffer_dimensions.unwrap_or((server_init.width, server_init.height));
+        let request = build_framebuffer_update_request(
+            false,
+            0,
+            0,
+            requested_framebuffer.0,
+            requested_framebuffer.1,
+        );
         stream.write_all(&encoder.encode_wire(&request)?)?;
         stream.flush()?;
         // Incremental RFB requests are allowed to remain pending while the
@@ -812,14 +1188,14 @@ impl ArdClient {
         stream.set_read_timeout(None)?;
 
         let writer_stream = stream.try_clone()?;
-        let (sender, receiver) = mpsc::sync_channel(MAX_INPUT_QUEUE);
+        let queue = OutboundQueue::new();
         let writer_error = Arc::new(Mutex::new(None));
         let input = ArdClientInput {
-            sender,
+            queue: Arc::clone(&queue),
             writer_error: writer_error.clone(),
             supports_extended_scroll,
         };
-        spawn_input_writer(writer_stream, encoder, receiver, writer_error);
+        spawn_input_writer(writer_stream, encoder, queue, writer_error);
 
         Ok(Self {
             stream,
@@ -834,6 +1210,7 @@ impl ArdClient {
             automatic_updates: config.automatic_updates,
             automatic_frame_interval_ms,
             automatic_updates_started: false,
+            requested_framebuffer_dimensions,
             pending_events: VecDeque::new(),
             reconnect_config: config.clone(),
             media_host,
@@ -848,6 +1225,19 @@ impl ArdClient {
 
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    fn frame_request_dimensions(&self) -> (u16, u16) {
+        self.requested_framebuffer_dimensions
+            .unwrap_or((self.framebuffer.width(), self.framebuffer.height()))
+    }
+
+    /// Bounds how long [`Self::next_event`] may wait for another encrypted
+    /// server record. The viewer uses this only while strict AVC media
+    /// negotiation is pending, then restores an unbounded idle wait.
+    pub fn set_event_read_timeout(&self, timeout: Option<Duration>) -> Result<(), ArdClientError> {
+        self.stream.set_read_timeout(timeout)?;
+        Ok(())
     }
 
     /// Returns a cloneable handle for GUI or application input dispatch.
@@ -986,23 +1376,19 @@ impl ArdClient {
                     video1_local_ssrc: video1_derived_ssrc,
                 });
                 if self.automatic_updates && !self.automatic_updates_started {
+                    let (width, height) = self.frame_request_dimensions();
                     let request = build_ard_auto_frame_update(
                         self.automatic_frame_interval_ms,
                         0,
                         0,
-                        self.framebuffer.width(),
-                        self.framebuffer.height(),
+                        width,
+                        height,
                     );
                     self.input.send_payload(request.to_vec())?;
                     self.automatic_updates_started = true;
                 } else if !self.automatic_updates {
-                    let request = build_framebuffer_update_request(
-                        true,
-                        0,
-                        0,
-                        self.framebuffer.width(),
-                        self.framebuffer.height(),
-                    );
+                    let (width, height) = self.frame_request_dimensions();
+                    let request = build_framebuffer_update_request(true, 0, 0, width, height);
                     self.input.send_payload(request.to_vec())?;
                 }
                 // Message1 only supplies the endpoint and key. Wait for the
@@ -1175,23 +1561,19 @@ impl ArdClient {
             if let Some(frame_event_position) = frame_event_position {
                 self.frame_index = self.frame_index.wrapping_add(framebuffer_updates as u64);
                 if self.automatic_updates && !self.automatic_updates_started {
+                    let (width, height) = self.frame_request_dimensions();
                     let request = build_ard_auto_frame_update(
                         self.automatic_frame_interval_ms,
                         0,
                         0,
-                        self.framebuffer.width(),
-                        self.framebuffer.height(),
+                        width,
+                        height,
                     );
                     self.input.send_payload(request.to_vec())?;
                     self.automatic_updates_started = true;
                 } else if !self.automatic_updates {
-                    let request = build_framebuffer_update_request(
-                        true,
-                        0,
-                        0,
-                        self.framebuffer.width(),
-                        self.framebuffer.height(),
-                    );
+                    let (width, height) = self.frame_request_dimensions();
+                    let request = build_framebuffer_update_request(true, 0, 0, width, height);
                     self.input.send_payload(request.to_vec())?;
                 }
                 batch_events.insert(
@@ -1226,11 +1608,17 @@ impl ArdClient {
 fn spawn_input_writer(
     mut stream: TcpStream,
     mut encoder: crate::ArdSessionRecordEncoder,
-    receiver: Receiver<OutboundMessage>,
+    queue: Arc<OutboundQueue>,
     writer_error: Arc<Mutex<Option<String>>>,
 ) {
     thread::spawn(move || {
-        while let Ok(OutboundMessage::Payload(payload)) = receiver.recv() {
+        while let Some(messages) = queue.receive_batch() {
+            let payload_bytes = messages.iter().map(|message| message.payload.len()).sum();
+            let mut payload = Vec::with_capacity(payload_bytes);
+            for message in &messages {
+                payload.extend_from_slice(&message.payload);
+            }
+            let write_started = Instant::now();
             let result = encoder
                 .encode_wire(&payload)
                 .map_err(ArdClientError::from)
@@ -1239,13 +1627,20 @@ fn spawn_input_writer(
                     stream.flush()?;
                     Ok(())
                 });
-            if let Err(error) = result {
-                if let Ok(mut current) = writer_error.lock() {
-                    *current = Some(format!("ARD input writer failed: {error}"));
+            match result {
+                Ok(()) => queue
+                    .metrics
+                    .record_write(&messages, write_started.elapsed()),
+                Err(error) => {
+                    if let Ok(mut current) = writer_error.lock() {
+                        *current = Some(format!("ARD input writer failed: {error}"));
+                    }
+                    queue.stop();
+                    break;
                 }
-                break;
             }
         }
+        queue.stop();
     });
 }
 
@@ -1376,4 +1771,123 @@ fn viewer_information() -> [u8; ArdViewerInformation::WIRE_LEN] {
     message[38] = 0x90;
     message[44] = 0x40;
     message
+}
+
+#[cfg(test)]
+mod outbound_queue_tests {
+    use super::*;
+
+    #[test]
+    fn high_performance_profiles_do_not_advertise_a_visual_fallback() {
+        assert_eq!(
+            ArdVideoQuality::HighPerformanceHevc.encodings(),
+            [ENCODING_AVC_MEDIA_STREAM, -223]
+        );
+        assert_eq!(
+            ArdVideoQuality::HighPerformanceAvc.encodings(),
+            [ENCODING_AVC_MEDIA_STREAM, -223]
+        );
+    }
+
+    #[test]
+    fn adjacent_pointer_motion_keeps_only_the_latest_unsent_state() {
+        let queue = OutboundQueue::new();
+        for coordinate in 0_u16..1_000 {
+            queue
+                .submit(
+                    coordinate.to_be_bytes().to_vec(),
+                    OutboundMode::PointerMotion,
+                    false,
+                )
+                .expect("position state should coalesce");
+        }
+
+        let metrics = queue.metrics.snapshot();
+        assert_eq!(metrics.queue_depth, 1);
+        assert_eq!(metrics.coalesced_pointer_moves, 999);
+        let batch = queue.receive_batch().expect("latest pointer state");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].payload, 999_u16.to_be_bytes());
+    }
+
+    #[test]
+    fn pointer_transition_replaces_only_the_immediately_preceding_motion() {
+        let queue = OutboundQueue::new();
+        queue
+            .submit(vec![0x10], OutboundMode::Reliable, true)
+            .expect("reliable command");
+        queue
+            .submit(vec![0x20], OutboundMode::PointerMotion, false)
+            .expect("pointer motion");
+        queue
+            .submit(vec![0x21], OutboundMode::PointerMotion, false)
+            .expect("newer pointer motion");
+        queue
+            .submit(vec![0x30], OutboundMode::PointerState, true)
+            .expect("button transition");
+
+        let batch = queue.receive_batch().expect("outbound batch");
+        let payloads: Vec<_> = batch.into_iter().map(|message| message.payload).collect();
+        assert_eq!(payloads, [vec![0x10], vec![0x30]]);
+        assert_eq!(queue.metrics.snapshot().coalesced_pointer_moves, 2);
+    }
+
+    #[test]
+    fn pointer_coalescing_never_crosses_a_reliable_ordering_barrier() {
+        let queue = OutboundQueue::new();
+        queue
+            .submit(vec![0x10], OutboundMode::PointerMotion, false)
+            .expect("first pointer state");
+        queue
+            .submit(vec![0x20], OutboundMode::Reliable, true)
+            .expect("ordering barrier");
+        queue
+            .submit(vec![0x30], OutboundMode::PointerMotion, false)
+            .expect("second pointer state");
+        queue
+            .submit(vec![0x31], OutboundMode::PointerMotion, false)
+            .expect("newest pointer state");
+
+        let batch = queue.receive_batch().expect("outbound batch");
+        let payloads: Vec<_> = batch.into_iter().map(|message| message.payload).collect();
+        assert_eq!(payloads, [vec![0x10], vec![0x20], vec![0x31]]);
+    }
+
+    #[test]
+    fn batching_respects_the_encrypted_record_payload_limit() {
+        let queue = OutboundQueue::new();
+        queue
+            .submit(
+                vec![0xaa; MAX_OUTBOUND_PAYLOAD_BYTES - 1],
+                OutboundMode::Reliable,
+                true,
+            )
+            .expect("first payload");
+        queue
+            .submit(vec![0xbb; 2], OutboundMode::Reliable, true)
+            .expect("second payload");
+
+        assert_eq!(queue.receive_batch().expect("first record").len(), 1);
+        assert_eq!(queue.receive_batch().expect("second record").len(), 1);
+    }
+
+    #[test]
+    fn internal_control_records_do_not_count_as_user_actions() {
+        let queue = OutboundQueue::new();
+        queue
+            .submit(vec![0x10], OutboundMode::Control, true)
+            .expect("control payload");
+        let control = queue.receive_batch().expect("control record");
+        queue.metrics.record_write(&control, Duration::ZERO);
+        assert_eq!(queue.metrics.snapshot().user_input_records_written, 0);
+
+        queue
+            .submit(vec![0x20], OutboundMode::Reliable, true)
+            .expect("user input payload");
+        let input = queue.receive_batch().expect("input record");
+        queue.metrics.record_write(&input, Duration::ZERO);
+        let metrics = queue.metrics.snapshot();
+        assert_eq!(metrics.user_input_records_written, 1);
+        assert!(metrics.last_user_input_completed_at.is_some());
+    }
 }

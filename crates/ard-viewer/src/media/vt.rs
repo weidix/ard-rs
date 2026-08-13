@@ -281,6 +281,7 @@ struct SourceFrameContext {
     timestamp: u32,
     submission: u64,
     encoded_bytes: usize,
+    visible_rect: PixelRect,
     output_state: Arc<CallbackState>,
 }
 
@@ -312,7 +313,7 @@ pub unsafe extern "C" fn decompression_output_callback(
             Some("VCP returned an object that is not a CVPixelBuffer".to_owned()),
         )
     } else {
-        match pixel_buffer_to_nv12(image_buffer) {
+        match pixel_buffer_to_nv12(image_buffer, context.visible_rect) {
             Ok(frame) => (Some(frame), None),
             Err(error) => (None, Some(error)),
         }
@@ -361,7 +362,8 @@ struct NativeDecoder {
     session: VTDecompressionSessionRef,
     api: &'static VcpApi,
     output_state: Arc<CallbackState>,
-    dimensions: (u32, u32),
+    encoded_dimensions: (u32, u32),
+    visible_rect: PixelRect,
 }
 
 impl NativeDecoder {
@@ -423,7 +425,12 @@ impl VideoToolboxDecoder {
     /// server applies an explicitly requested display mode and sends updated
     /// parameter sets, the decoder recreates the immutable native session.
     pub fn configured_dimensions(&self) -> Option<(u32, u32)> {
-        self.native.as_ref().map(|native| native.dimensions)
+        self.native.as_ref().map(|native| {
+            (
+                native.visible_rect.width as u32,
+                native.visible_rect.height as u32,
+            )
+        })
     }
 
     /// Stop decoding predictive access units after RTP loss. The next sync
@@ -486,6 +493,7 @@ impl VideoToolboxDecoder {
             timestamp: unit.timestamp,
             submission,
             encoded_bytes: unit.avcc_len(),
+            visible_rect: native.visible_rect,
             output_state: Arc::clone(&native.output_state),
         };
         match unsafe { decode_access_unit(native, &avcc, unit.timestamp, is_sync, context) } {
@@ -677,6 +685,17 @@ impl VideoToolboxDecoder {
             unsafe { CFRelease(format_description as *const c_void) };
             return Err("codec parameter sets contain invalid frame dimensions".into());
         }
+        let visible_rect = match pixel_rect_from_clean_aperture(
+            dimensions.width as usize,
+            dimensions.height as usize,
+            clean_aperture,
+        ) {
+            Ok(rect) => rect,
+            Err(error) => {
+                unsafe { CFRelease(format_description as *const c_void) };
+                return Err(error);
+            }
+        };
 
         let api = vcp_api().ok_or_else(|| {
             "VideoProcessing decompression API is unavailable on this macOS build".to_owned()
@@ -722,7 +741,8 @@ impl VideoToolboxDecoder {
             session,
             api,
             output_state,
-            dimensions: (dimensions.width as u32, dimensions.height as u32),
+            encoded_dimensions: (dimensions.width as u32, dimensions.height as u32),
+            visible_rect,
         })
     }
 }
@@ -922,12 +942,84 @@ unsafe fn decode_access_unit(
     Ok(())
 }
 
-unsafe fn pixel_buffer_to_nv12(buffer: CVPixelBufferRef) -> Result<DecodedSlice, String> {
-    let width = CVPixelBufferGetWidth(buffer);
-    let height = CVPixelBufferGetHeight(buffer);
-    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelRect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+fn pixel_rect_from_clean_aperture(
+    encoded_width: usize,
+    encoded_height: usize,
+    aperture: CGRect,
+) -> Result<PixelRect, String> {
+    fn exact_pixel(value: f64, field: &str) -> Result<usize, String> {
+        if !value.is_finite() || value < 0.0 || value.fract().abs() > 1.0e-6 {
+            return Err(format!(
+                "codec clean aperture has unsupported {field}={value}"
+            ));
+        }
+        usize::try_from(value as u64)
+            .map_err(|_| format!("codec clean aperture {field} is too large"))
+    }
+
+    let rect = PixelRect {
+        x: exact_pixel(aperture.origin.x, "x")?,
+        y: exact_pixel(aperture.origin.y, "y")?,
+        width: exact_pixel(aperture.size.width, "width")?,
+        height: exact_pixel(aperture.size.height, "height")?,
+    };
+    if rect.width == 0 || rect.height == 0 {
+        return Err("codec clean aperture is empty".to_owned());
+    }
+    if !rect.x.is_multiple_of(2) || !rect.y.is_multiple_of(2) {
         return Err(format!(
-            "VCP returned invalid CVPixelBuffer dimensions {width}x{height}"
+            "NV12 clean aperture origin must be chroma-aligned: ({}, {})",
+            rect.x, rect.y
+        ));
+    }
+    let right = rect
+        .x
+        .checked_add(rect.width)
+        .ok_or_else(|| "codec clean aperture width overflow".to_owned())?;
+    let bottom = rect
+        .y
+        .checked_add(rect.height)
+        .ok_or_else(|| "codec clean aperture height overflow".to_owned())?;
+    if right > encoded_width || bottom > encoded_height {
+        return Err(format!(
+            "codec clean aperture exceeds encoded frame: aperture={}x{}+{},{} encoded={}x{}",
+            rect.width, rect.height, rect.x, rect.y, encoded_width, encoded_height
+        ));
+    }
+    Ok(rect)
+}
+
+unsafe fn pixel_buffer_to_nv12(
+    buffer: CVPixelBufferRef,
+    visible_rect: PixelRect,
+) -> Result<DecodedSlice, String> {
+    let buffer_width = CVPixelBufferGetWidth(buffer);
+    let buffer_height = CVPixelBufferGetHeight(buffer);
+    if buffer_width == 0 || buffer_height == 0 || buffer_width > 16_384 || buffer_height > 16_384 {
+        return Err(format!(
+            "VCP returned invalid CVPixelBuffer dimensions {buffer_width}x{buffer_height}"
+        ));
+    }
+    let visible_right = visible_rect
+        .x
+        .checked_add(visible_rect.width)
+        .ok_or_else(|| "VCP visible width overflow".to_owned())?;
+    let visible_bottom = visible_rect
+        .y
+        .checked_add(visible_rect.height)
+        .ok_or_else(|| "VCP visible height overflow".to_owned())?;
+    if visible_right > buffer_width || visible_bottom > buffer_height {
+        return Err(format!(
+            "VCP output is smaller than the codec clean aperture: buffer={buffer_width}x{buffer_height} aperture={}x{}+{},{}",
+            visible_rect.width, visible_rect.height, visible_rect.x, visible_rect.y
         ));
     }
     let pixel_format = CVPixelBufferGetPixelFormatType(buffer);
@@ -950,23 +1042,26 @@ unsafe fn pixel_buffer_to_nv12(buffer: CVPixelBufferRef) -> Result<DecodedSlice,
     let y_height = CVPixelBufferGetHeightOfPlane(buffer, 0);
     let uv_width = CVPixelBufferGetWidthOfPlane(buffer, 1);
     let uv_height = CVPixelBufferGetHeightOfPlane(buffer, 1);
-    if y_width != width
-        || y_height != height
-        || uv_width != width.div_ceil(2)
-        || uv_height != height.div_ceil(2)
+    if y_width != buffer_width
+        || y_height != buffer_height
+        || uv_width != buffer_width.div_ceil(2)
+        || uv_height != buffer_height.div_ceil(2)
     {
         return Err(format!(
-            "VCP returned inconsistent NV12 plane geometry: buffer={width}x{height}, y={y_width}x{y_height}, uv={uv_width}x{uv_height}"
+            "VCP returned inconsistent NV12 plane geometry: buffer={buffer_width}x{buffer_height}, y={y_width}x{y_height}, uv={uv_width}x{uv_height}"
         ));
     }
-    let uv_row_bytes = uv_width
+    let visible_uv_width = visible_rect.width.div_ceil(2);
+    let visible_uv_height = visible_rect.height.div_ceil(2);
+    let visible_uv_row_bytes = visible_uv_width
         .checked_mul(2)
         .ok_or_else(|| "VCP NV12 chroma row length overflow".to_owned())?;
-    let y_len = y_width
-        .checked_mul(y_height)
+    let y_len = visible_rect
+        .width
+        .checked_mul(visible_rect.height)
         .ok_or_else(|| "VCP NV12 luma plane length overflow".to_owned())?;
-    let uv_len = uv_row_bytes
-        .checked_mul(uv_height)
+    let uv_len = visible_uv_row_bytes
+        .checked_mul(visible_uv_height)
         .ok_or_else(|| "VCP NV12 chroma plane length overflow".to_owned())?;
     let _lock = PixelBufferReadLock::new(buffer)?;
     let y_base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0);
@@ -975,14 +1070,20 @@ unsafe fn pixel_buffer_to_nv12(buffer: CVPixelBufferRef) -> Result<DecodedSlice,
     let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1);
     let mut y_plane = Vec::with_capacity(y_len);
     let mut uv_plane = Vec::with_capacity(uv_len);
-    if !y_base.is_null() && !uv_base.is_null() && y_stride >= y_width && uv_stride >= uv_row_bytes {
-        for row in 0..y_height {
-            let source = (y_base as *const u8).add(row * y_stride);
-            y_plane.extend_from_slice(std::slice::from_raw_parts(source, y_width));
+    if !y_base.is_null()
+        && !uv_base.is_null()
+        && y_stride >= buffer_width
+        && uv_stride >= uv_width.saturating_mul(2)
+    {
+        for row in 0..visible_rect.height {
+            let source =
+                (y_base as *const u8).add((visible_rect.y + row) * y_stride + visible_rect.x);
+            y_plane.extend_from_slice(std::slice::from_raw_parts(source, visible_rect.width));
         }
-        for row in 0..uv_height {
-            let source = (uv_base as *const u8).add(row * uv_stride);
-            uv_plane.extend_from_slice(std::slice::from_raw_parts(source, uv_row_bytes));
+        for row in 0..visible_uv_height {
+            let source =
+                (uv_base as *const u8).add((visible_rect.y / 2 + row) * uv_stride + visible_rect.x);
+            uv_plane.extend_from_slice(std::slice::from_raw_parts(source, visible_uv_row_bytes));
         }
     }
     if y_plane.len() != y_len || uv_plane.len() != uv_len {
@@ -992,10 +1093,10 @@ unsafe fn pixel_buffer_to_nv12(buffer: CVPixelBufferRef) -> Result<DecodedSlice,
             uv_plane.len()
         ));
     }
-    let matrix = ycbcr_matrix(buffer, width, height);
+    let matrix = ycbcr_matrix(buffer, visible_rect.width, visible_rect.height);
     Ok(DecodedSlice {
-        width: width as u32,
-        height: height as u32,
+        width: visible_rect.width as u32,
+        height: visible_rect.height as u32,
         y_plane,
         uv_plane,
         range,
@@ -1062,6 +1163,52 @@ mod tests {
     use super::*;
     use ard_rs::media_stream::AccessUnit;
 
+    #[test]
+    fn clean_aperture_provides_the_only_authorized_codec_crop() {
+        let rect = pixel_rect_from_clean_aperture(
+            2_880,
+            464,
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 2_880.0,
+                    height: 450.0,
+                },
+            },
+        )
+        .expect("integer clean aperture");
+        assert_eq!(
+            rect,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 2_880,
+                height: 450,
+            }
+        );
+    }
+
+    #[test]
+    fn clean_aperture_rejects_unrepresentable_or_out_of_bounds_crops() {
+        let odd_origin = CGRect {
+            origin: CGPoint { x: 0.0, y: 1.0 },
+            size: CGSize {
+                width: 100.0,
+                height: 100.0,
+            },
+        };
+        assert!(pixel_rect_from_clean_aperture(100, 102, odd_origin).is_err());
+
+        let outside = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 101.0,
+                height: 100.0,
+            },
+        };
+        assert!(pixel_rect_from_clean_aperture(100, 100, outside).is_err());
+    }
+
     /// Split an Annex-B byte stream into access units, keeping parameter sets
     /// with the following VCL NAL units.
     fn annex_b_to_access_units(data: &[u8], codec: MediaStreamCodec) -> Vec<AccessUnit> {
@@ -1094,6 +1241,7 @@ mod tests {
             if is_vcl && current_has_vcl {
                 units.push(AccessUnit {
                     timestamp,
+                    decode_order_number: None,
                     nal_units: std::mem::take(&mut current),
                 });
                 timestamp = timestamp.wrapping_add(1);
@@ -1105,6 +1253,7 @@ mod tests {
         if !current.is_empty() {
             units.push(AccessUnit {
                 timestamp,
+                decode_order_number: None,
                 nal_units: current,
             });
         }
@@ -1134,6 +1283,12 @@ mod tests {
                 timestamp,
                 submission,
                 encoded_bytes: submission as usize + 10,
+                visible_rect: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
                 output_state: Arc::clone(&state),
             })) as *mut c_void
         };
@@ -1292,5 +1447,69 @@ mod tests {
         assert_eq!((first.width, first.height), (320, 240));
         assert_eq!(first.y_plane.len(), 320 * 240);
         assert_eq!(first.uv_plane.len(), 320 * 120);
+    }
+
+    #[test]
+    #[ignore = "requires ARD_VCP_BENCH_SAMPLE and prints a local hardware latency baseline"]
+    fn benchmarks_realtime_four_slice_frame_boundaries() {
+        use std::time::Instant;
+
+        let path = std::env::var("ARD_VCP_BENCH_SAMPLE")
+            .expect("ARD_VCP_BENCH_SAMPLE must name an Annex-B HEVC stream");
+        let bytes = std::fs::read(path).expect("benchmark sample must be readable");
+        let mut units = annex_b_to_access_units(&bytes, MediaStreamCodec::Hevc);
+        assert!(
+            units.len() >= 8 && units.len().is_multiple_of(4),
+            "benchmark needs complete four-slice frame groups"
+        );
+        for (frame_index, group) in units.chunks_mut(4).enumerate() {
+            let timestamp = u32::try_from(frame_index)
+                .expect("benchmark frame count fits u32")
+                .saturating_mul(1_500);
+            for unit in group {
+                unit.timestamp = timestamp;
+            }
+        }
+
+        let mut decoder = VideoToolboxDecoder::new(MediaStreamCodec::Hevc);
+        let started = Instant::now();
+        let mut frame_latencies = Vec::with_capacity(units.len() / 4);
+        let mut decoded_images = 0usize;
+        for group in units.chunks(4) {
+            let frame_started = Instant::now();
+            let mut outputs = Vec::with_capacity(4);
+            for (slice_index, unit) in group.iter().enumerate() {
+                outputs.extend(decoder.decode(slice_index, unit));
+            }
+            outputs.extend(decoder.finish_frame());
+            decoded_images += outputs
+                .iter()
+                .filter(|output| output.frame.is_some())
+                .count();
+            assert!(
+                decoder.take_errors().is_empty(),
+                "VCP benchmark decode failed"
+            );
+            frame_latencies.push(frame_started.elapsed());
+        }
+        let elapsed = started.elapsed();
+        frame_latencies.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| {
+            let index = (frame_latencies.len() - 1)
+                .saturating_mul(numerator)
+                .div_ceil(denominator);
+            frame_latencies[index]
+        };
+        eprintln!(
+            "VCP four-slice synchronous baseline: frames={} images={} total_ms={:.3} fps={:.2} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3}",
+            frame_latencies.len(),
+            decoded_images,
+            elapsed.as_secs_f64() * 1_000.0,
+            frame_latencies.len() as f64 / elapsed.as_secs_f64(),
+            percentile(50, 100).as_secs_f64() * 1_000.0,
+            percentile(95, 100).as_secs_f64() * 1_000.0,
+            percentile(99, 100).as_secs_f64() * 1_000.0,
+        );
+        assert_eq!(decoded_images, units.len());
     }
 }

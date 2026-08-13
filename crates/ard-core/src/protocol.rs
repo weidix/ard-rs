@@ -1033,6 +1033,20 @@ impl ArdDisplayConfiguration {
             displays: vec![ArdVirtualDisplay::new(width, height)],
         }
     }
+
+    /// Physical framebuffer dimensions that can be known before the server
+    /// reports its accepted desktop layout. Multiple displays are arranged
+    /// by the server and therefore deliberately return `None` here.
+    pub fn single_backing_dimensions(&self) -> Result<Option<(u16, u16)>> {
+        let [display] = self.displays.as_slice() else {
+            return Ok(None);
+        };
+        let (width, height) = display.backing_dimensions()?;
+        Ok(Some((
+            u16::try_from(width).map_err(|_| Error::LimitExceeded("virtual display width"))?,
+            u16::try_from(height).map_err(|_| Error::LimitExceeded("virtual display height"))?,
+        )))
+    }
 }
 
 /// Builds the fixed-resolution display request used by current Screen Sharing.

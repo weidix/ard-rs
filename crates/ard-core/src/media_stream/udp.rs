@@ -21,9 +21,11 @@ use super::wire::MediaStreamMessage1;
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(10);
-const DEFAULT_FRAME_HOLDBACK: Duration = Duration::from_millis(17);
-const MIN_FRAME_HOLDBACK: Duration = Duration::from_millis(6);
-const MAX_FRAME_HOLDBACK: Duration = Duration::from_millis(34);
+/// Bound cross-SSRC decoding-order reassembly. This is a loss detector, not a
+/// presentation timer: a sparse timestamp is released only when the following
+/// DON/DONL proves its exact boundary.
+const MAX_PENDING_FRAME_BATCHES: usize = 8;
+const MAX_TRACKED_RTP_TIMESTAMPS: usize = 64;
 /// Native AVC partitions one desktop frame into four horizontal slices. Each
 /// slice uses an adjacent SSRC with independent SRTP/RTP state, while all four
 /// share one interleaved video decoder reference chain.
@@ -198,6 +200,9 @@ pub struct AvcVideoStreamReceiver {
     session: MediaUdpSession,
     streams: Vec<InboundVideoStream>,
     feedback: Vec<FeedbackStream>,
+    codec: MediaStreamCodec,
+    awaiting_sync: bool,
+    pending_sync_followers: Vec<(usize, TimedAccessUnit)>,
     expected_payload_type: u8,
     base_remote_ssrc: u32,
     buffer: Vec<u8>,
@@ -213,63 +218,133 @@ pub struct AvcVideoStreamReceiver {
     last_keyframe_request: Option<Instant>,
 }
 
-/// Every changed horizontal band sharing one RTP sampling instant. RFC 3550
-/// defines the RTP timestamp as the sampling instant; Apple's four adjacent
-/// SSRCs reuse that timestamp for the bands belonging to one desktop frame.
+/// The horizontal bands sharing one RTP sampling instant. RFC 3550 defines
+/// the RTP timestamp as the sampling instant; Apple's four adjacent SSRCs
+/// reuse it for one serial prediction chain. Unchanged bands can be omitted,
+/// so DON/DONL—not elapsed time or SSRC scan order—defines the batch boundary
+/// and decoder submission order.
 #[derive(Debug)]
 pub struct AvcFrameBatch {
     pub timestamp: u32,
     pub access_units: Vec<(usize, AccessUnit)>,
+    /// Local monotonic time immediately after the first UDP datagram for any
+    /// access unit in this sampling instant was received.
+    pub first_packet_received_at: Instant,
+    /// Local monotonic time at which the first complete access unit in this
+    /// sampling instant finished RTP reassembly.
+    pub first_access_unit_completed_at: Instant,
+    /// Local monotonic time at which the complete/bounded batch was released
+    /// to the platform decoder.
+    pub released_at: Instant,
 }
 
 struct PendingFrameBatch {
     timestamp: u32,
-    first_seen: Instant,
+    first_packet_received_at: Instant,
+    first_access_unit_completed_at: Instant,
     access_units: Vec<(usize, AccessUnit)>,
+}
+
+#[derive(Debug)]
+struct TimedAccessUnit {
+    unit: AccessUnit,
+    first_packet_received_at: Instant,
+    completed_at: Instant,
 }
 
 #[derive(Default)]
 struct AccessUnitBatcher {
     pending: Vec<PendingFrameBatch>,
-    last_released_timestamp: Option<u32>,
-    estimated_frame_ticks: Option<u32>,
+    initial_decode_order: Option<u16>,
+    last_released_decode_order: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchInsertResult {
+    Accepted,
+    IgnoredLate,
+    MissingDecodeOrder,
+    InvalidPredictionChain,
+    PredictionChainOverflow,
 }
 
 impl AccessUnitBatcher {
-    fn insert(&mut self, stream_index: usize, unit: AccessUnit, now: Instant) -> bool {
-        if self.last_released_timestamp.is_some_and(|released| {
-            unit.timestamp == released || !timestamp_precedes(released, unit.timestamp)
-        }) {
-            return false;
+    fn begin_prediction_chain(&mut self, decode_order: u16) {
+        self.pending.clear();
+        self.initial_decode_order = Some(decode_order);
+        self.last_released_decode_order = None;
+    }
+
+    fn insert(&mut self, stream_index: usize, timed: TimedAccessUnit) -> BatchInsertResult {
+        let TimedAccessUnit {
+            unit,
+            first_packet_received_at,
+            completed_at,
+        } = timed;
+        let Some(decode_order) = unit.decode_order_number else {
+            return BatchInsertResult::MissingDecodeOrder;
+        };
+        if self
+            .last_released_decode_order
+            .is_some_and(|released| !decode_order_is_newer(decode_order, released))
+            || self.pending.iter().any(|batch| {
+                batch
+                    .access_units
+                    .iter()
+                    .any(|(_, pending)| pending.decode_order_number == Some(decode_order))
+            })
+        {
+            return BatchInsertResult::IgnoredLate;
         }
         if let Some(batch) = self
             .pending
             .iter_mut()
             .find(|batch| batch.timestamp == unit.timestamp)
         {
-            if let Some(existing) = batch
+            if batch
                 .access_units
-                .iter_mut()
-                .find(|(index, _)| *index == stream_index)
+                .iter()
+                .any(|(index, _)| *index == stream_index)
+                || batch.access_units.len() >= AVC_VIDEO_SLICE_COUNT
             {
-                *existing = (stream_index, unit);
-            } else {
-                batch.access_units.push((stream_index, unit));
-                batch.access_units.sort_by_key(|(index, _)| *index);
+                return BatchInsertResult::InvalidPredictionChain;
             }
-            return true;
+            batch.first_packet_received_at =
+                batch.first_packet_received_at.min(first_packet_received_at);
+            batch.first_access_unit_completed_at =
+                batch.first_access_unit_completed_at.min(completed_at);
+            batch.access_units.push((stream_index, unit));
+            return BatchInsertResult::Accepted;
         }
 
-        if let Some(latest) = self.pending.last()
-            && timestamp_precedes(latest.timestamp, unit.timestamp)
-        {
-            let delta = unit.timestamp.wrapping_sub(latest.timestamp);
-            if delta != 0 && delta < 90_000 {
-                self.estimated_frame_ticks = Some(match self.estimated_frame_ticks {
-                    Some(previous) => previous.saturating_mul(7).saturating_add(delta) / 8,
-                    None => delta,
-                });
+        if self.pending.len() >= MAX_PENDING_FRAME_BATCHES {
+            // A missing DON has held more than the bounded number of sampling
+            // instants. Drop the dependent chain and wait for an explicit
+            // codec sync frame after requesting PLI.
+            if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+                let layout = self
+                    .pending
+                    .iter()
+                    .map(|batch| {
+                        (
+                            batch.timestamp,
+                            batch
+                                .access_units
+                                .iter()
+                                .map(|(index, unit)| (*index, unit.decode_order_number))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "RTP pending prediction chain overflow before stream={stream_index} timestamp={}: {layout:?}",
+                    unit.timestamp,
+                );
             }
+            self.pending.clear();
+            self.initial_decode_order = None;
+            self.last_released_decode_order = None;
+            return BatchInsertResult::PredictionChainOverflow;
         }
         let position = self
             .pending
@@ -280,42 +355,110 @@ impl AccessUnitBatcher {
             position,
             PendingFrameBatch {
                 timestamp: unit.timestamp,
-                first_seen: now,
+                first_packet_received_at,
+                first_access_unit_completed_at: completed_at,
                 access_units: vec![(stream_index, unit)],
             },
         );
-        true
+        BatchInsertResult::Accepted
     }
 
     fn take_ready(&mut self, now: Instant) -> Option<AvcFrameBatch> {
-        let ready = self.pending.first().is_some_and(|batch| {
-            batch.access_units.len() == AVC_VIDEO_SLICE_COUNT
-                || now.duration_since(batch.first_seen) >= self.holdback()
-                || self.pending.len() >= 3
+        let (batch_index, first_decode_order) =
+            if let Some(last_decode_order) = self.last_released_decode_order {
+                let expected = last_decode_order.wrapping_add(1);
+                let batch_index = self.pending.iter().position(|batch| {
+                    batch
+                        .access_units
+                        .iter()
+                        .any(|(_, unit)| unit.decode_order_number == Some(expected))
+                })?;
+                let batch = &self.pending[batch_index];
+                let mut offsets = batch
+                    .access_units
+                    .iter()
+                    .map(|(_, unit)| {
+                        unit.decode_order_number
+                            .expect("batcher accepts only access units carrying DON/DONL")
+                            .wrapping_sub(expected)
+                    })
+                    .collect::<Vec<_>>();
+                offsets.sort_unstable();
+                if !offsets
+                    .iter()
+                    .enumerate()
+                    .all(|(index, offset)| usize::from(*offset) == index)
+                {
+                    return None;
+                }
+                let following_decode_order = expected.wrapping_add(batch.access_units.len() as u16);
+                let boundary_proven = batch.access_units.len() == AVC_VIDEO_SLICE_COUNT
+                    || self.pending.iter().enumerate().any(|(index, following)| {
+                        index != batch_index
+                            && following.access_units.iter().any(|(_, unit)| {
+                                unit.decode_order_number == Some(following_decode_order)
+                            })
+                    });
+                if !boundary_proven {
+                    return None;
+                }
+                (batch_index, expected)
+            } else {
+                // A clean native AVC chain begins with one full four-band sync
+                // timestamp. Do not infer an initial sparse boundary without
+                // a preceding decoding-order number.
+                let expected = self.initial_decode_order?;
+                let batch_index = self.pending.iter().position(|batch| {
+                    batch
+                        .access_units
+                        .iter()
+                        .any(|(_, unit)| unit.decode_order_number == Some(expected))
+                })?;
+                let batch = &self.pending[batch_index];
+                if batch.access_units.len() != AVC_VIDEO_SLICE_COUNT
+                    || !decode_orders_are_contiguous(&batch.access_units, expected)
+                {
+                    return None;
+                }
+                (batch_index, expected)
+            };
+
+        let mut batch = self.pending.remove(batch_index);
+        batch.access_units.sort_by_key(|(_, unit)| {
+            unit.decode_order_number
+                .expect("batcher accepts only access units carrying DON/DONL")
+                .wrapping_sub(first_decode_order)
         });
-        if !ready {
-            return None;
-        }
-        let batch = self.pending.remove(0);
-        self.last_released_timestamp = Some(batch.timestamp);
+        self.last_released_decode_order = batch
+            .access_units
+            .last()
+            .and_then(|(_, unit)| unit.decode_order_number);
         Some(AvcFrameBatch {
             timestamp: batch.timestamp,
             access_units: batch.access_units,
+            first_packet_received_at: batch.first_packet_received_at,
+            first_access_unit_completed_at: batch.first_access_unit_completed_at,
+            released_at: now,
         })
     }
 
-    fn holdback(&self) -> Duration {
-        let Some(ticks) = self.estimated_frame_ticks else {
-            return DEFAULT_FRAME_HOLDBACK;
-        };
-        let micros = u64::from(ticks)
-            .saturating_mul(1_000_000)
-            .checked_div(90_000)
-            .unwrap_or_default();
-        Duration::from_micros(micros)
-            .saturating_add(Duration::from_millis(2))
-            .clamp(MIN_FRAME_HOLDBACK, MAX_FRAME_HOLDBACK)
+    fn reset(&mut self) {
+        self.pending.clear();
+        self.initial_decode_order = None;
+        self.last_released_decode_order = None;
     }
+}
+
+fn decode_orders_are_contiguous(access_units: &[(usize, AccessUnit)], start: u16) -> bool {
+    (0..access_units.len()).all(|offset| {
+        access_units
+            .iter()
+            .any(|(_, unit)| unit.decode_order_number == Some(start.wrapping_add(offset as u16)))
+    })
+}
+
+fn decode_order_is_newer(candidate: u16, reference: u16) -> bool {
+    candidate != reference && candidate.wrapping_sub(reference) < 0x8000
 }
 
 enum VideoDepacketizer {
@@ -350,7 +493,8 @@ struct InboundVideoStream {
     srtp: SrtpContext,
     reorder: RtpReorderBuffer,
     depacketizer: VideoDepacketizer,
-    completed: VecDeque<AccessUnit>,
+    completed: VecDeque<TimedAccessUnit>,
+    first_packet_arrivals: VecDeque<(u32, Instant)>,
     next_sequence: Option<u16>,
     damaged_timestamp: Option<u32>,
 }
@@ -362,12 +506,25 @@ impl InboundVideoStream {
             reorder: RtpReorderBuffer::with_codec(codec),
             depacketizer: VideoDepacketizer::new(codec),
             completed: VecDeque::new(),
+            first_packet_arrivals: VecDeque::new(),
             next_sequence: None,
             damaged_timestamp: None,
         })
     }
 
-    fn push_decrypted_packet(&mut self, packet: &[u8]) -> Result<usize> {
+    fn push_decrypted_packet(&mut self, packet: &[u8], received_at: Instant) -> Result<usize> {
+        let packet_timestamp = RtpPacket::parse(packet)?.header.timestamp;
+        if !self
+            .first_packet_arrivals
+            .iter()
+            .any(|(timestamp, _)| *timestamp == packet_timestamp)
+        {
+            if self.first_packet_arrivals.len() >= MAX_TRACKED_RTP_TIMESTAMPS {
+                return Err(Error::LimitExceeded("RTP timestamp timing tracker"));
+            }
+            self.first_packet_arrivals
+                .push_back((packet_timestamp, received_at));
+        }
         let ready_packets = self.reorder.push(packet)?;
         let mut losses = self.reorder.take_dropped_access_units();
         if losses != 0 {
@@ -399,7 +556,24 @@ impl InboundVideoStream {
             }
             self.damaged_timestamp = None;
             if let Some(unit) = self.depacketizer.push(&packet)? {
-                self.completed.push_back(unit);
+                let Some(position) = self
+                    .first_packet_arrivals
+                    .iter()
+                    .position(|(timestamp, _)| *timestamp == unit.timestamp)
+                else {
+                    return Err(Error::Invalid(
+                        "completed RTP access unit has no first-packet timestamp",
+                    ));
+                };
+                let (_, first_packet_received_at) = self
+                    .first_packet_arrivals
+                    .remove(position)
+                    .expect("timing tracker position was found");
+                self.completed.push_back(TimedAccessUnit {
+                    unit,
+                    first_packet_received_at,
+                    completed_at: Instant::now(),
+                });
             }
         }
         Ok(losses)
@@ -412,10 +586,10 @@ struct FeedbackStream {
 }
 
 /// Scan interleaved streams in index order, collect every completed AU, then
-/// sort the scheduled items before decode. This is the native receiver's
-/// process/schedule/insert sequence and intentionally has no four-slice
-/// timestamp barrier: unchanged desktop bands may be absent.
-fn process_completed_frames(streams: &mut [InboundVideoStream]) -> VecDeque<(usize, AccessUnit)> {
+/// sort the scheduled items before the four-subframe timestamp barrier.
+fn process_completed_frames(
+    streams: &mut [InboundVideoStream],
+) -> VecDeque<(usize, TimedAccessUnit)> {
     let mut scheduled = Vec::new();
     for (stream_index, stream) in streams.iter_mut().enumerate() {
         while let Some(unit) = stream.completed.pop_front() {
@@ -426,13 +600,13 @@ fn process_completed_frames(streams: &mut [InboundVideoStream]) -> VecDeque<(usi
 }
 
 fn insert_scheduled_item(
-    scheduled: &mut Vec<(usize, AccessUnit)>,
+    scheduled: &mut Vec<(usize, TimedAccessUnit)>,
     stream_index: usize,
-    unit: AccessUnit,
+    unit: TimedAccessUnit,
 ) {
     let position = scheduled
         .iter()
-        .position(|(_, current)| timestamp_precedes(unit.timestamp, current.timestamp))
+        .position(|(_, current)| timestamp_precedes(unit.unit.timestamp, current.unit.timestamp))
         .unwrap_or(scheduled.len());
     // Equal timestamps insert after existing items, preserving the stream
     // scan order above.
@@ -482,6 +656,9 @@ impl AvcVideoStreamReceiver {
             session,
             streams,
             feedback,
+            codec,
+            awaiting_sync: true,
+            pending_sync_followers: Vec::with_capacity(AVC_VIDEO_SLICE_COUNT - 1),
             expected_payload_type: payload_type,
             base_remote_ssrc: crypto.remote_ssrc,
             buffer: vec![0u8; MAX_RTP_PACKET],
@@ -533,9 +710,12 @@ impl AvcVideoStreamReceiver {
         Ok(self.ready_units.pop_front())
     }
 
-    /// Receive one complete desktop sampling instant. A full four-band frame
-    /// is released immediately; sparse updates are held for one measured RTP
-    /// frame interval so a delayed band cannot be decoded after a newer frame.
+    /// Receive one complete desktop sampling instant. Native AVC can omit
+    /// unchanged bands, but every submitted access unit must remain in the
+    /// global DON/DONL sequence. A later DON proves a sparse timestamp's end;
+    /// wall-clock expiry never does. Missing sequence state is bounded by
+    /// `MAX_PENDING_FRAME_BATCHES`, then recovered with an explicit PLI and
+    /// fresh codec sync frame.
     pub fn receive_frame(&mut self) -> Result<Option<AvcFrameBatch>> {
         self.send_feedback_if_due()?;
         let now = Instant::now();
@@ -555,6 +735,7 @@ impl AvcVideoStreamReceiver {
             }
             Err(_) => return Err(Error::Invalid("RTP receive failed")),
         };
+        let packet_received_at = Instant::now();
         if len > MAX_RTP_PACKET {
             return Err(Error::LimitExceeded("RTP datagram"));
         }
@@ -567,10 +748,11 @@ impl AvcVideoStreamReceiver {
         let body_len = len - super::srtp::AUTH_TAG_LEN;
         let mut authentication_tag = [0u8; super::srtp::AUTH_TAG_LEN];
         authentication_tag.copy_from_slice(&self.buffer[body_len..len]);
-        let (sequence, payload_offset, payload_type, ssrc) = {
+        let (sequence, timestamp, payload_offset, payload_type, ssrc) = {
             let encrypted_packet = RtpPacket::parse_encrypted(&self.buffer[..body_len])?;
             (
                 encrypted_packet.header.sequence,
+                encrypted_packet.header.timestamp,
                 encrypted_packet.payload_offset,
                 encrypted_packet.header.payload_type,
                 encrypted_packet.header.ssrc,
@@ -598,21 +780,99 @@ impl AvcVideoStreamReceiver {
             payload_offset,
         )?;
         self.decrypted_packets += 1;
-        let losses = stream.push_decrypted_packet(&self.decrypted_buffer)?;
+        let losses = stream.push_decrypted_packet(&self.decrypted_buffer, packet_received_at)?;
         if losses != 0 {
             self.packet_losses = self.packet_losses.saturating_add(losses);
+            self.enter_sync_recovery();
+            if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+                eprintln!(
+                    "RTP loss: stream={stream_index} timestamp={timestamp} sequence={sequence} dropped_access_units={losses} total={}",
+                    self.packet_losses,
+                );
+            }
             self.send_picture_loss_indications()?;
         }
         let completed = process_completed_frames(&mut self.streams);
         let now = Instant::now();
         let mut late_units = 0usize;
-        for (slice_index, unit) in completed {
-            if !self.frame_batcher.insert(slice_index, unit, now) {
-                late_units = late_units.saturating_add(1);
+        let mut prediction_chain_failure = None;
+        'completed: for (slice_index, timed) in completed {
+            if timed.unit.decode_order_number.is_none() {
+                self.enter_sync_recovery();
+                self.send_picture_loss_indications()?;
+                return Err(Error::Invalid(
+                    "native AVC access unit is missing its DON/DONL decode order",
+                ));
+            }
+            let mut candidates = Vec::with_capacity(AVC_VIDEO_SLICE_COUNT);
+            if self.awaiting_sync {
+                if !timed.unit.is_sync(self.codec) {
+                    self.hold_possible_sync_follower(slice_index, timed);
+                    continue;
+                }
+                // The first IRAP/IDR after startup or PLI is an authoritative
+                // new decoding-order origin. UDP may complete a following
+                // predictive band first, so retain only same-timestamp DONs
+                // immediately following this sync unit.
+                let decode_order = timed
+                    .unit
+                    .decode_order_number
+                    .expect("missing DON/DONL was rejected above");
+                let timestamp = timed.unit.timestamp;
+                self.frame_batcher.begin_prediction_chain(decode_order);
+                self.ready_units.clear();
+                self.awaiting_sync = false;
+                if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+                    eprintln!(
+                        "RTP codec sync acquired: stream={slice_index} timestamp={} DON={:?}",
+                        timed.unit.timestamp, timed.unit.decode_order_number,
+                    );
+                }
+                candidates.push((slice_index, timed));
+                candidates.extend(self.take_sync_followers(slice_index, timestamp, decode_order));
+                candidates.sort_by_key(|(_, candidate)| {
+                    candidate
+                        .unit
+                        .decode_order_number
+                        .expect("sync followers carry DON/DONL")
+                        .wrapping_sub(decode_order)
+                });
+            } else {
+                candidates.push((slice_index, timed));
+            }
+
+            for (candidate_index, candidate) in candidates {
+                match self.frame_batcher.insert(candidate_index, candidate) {
+                    BatchInsertResult::Accepted => {}
+                    BatchInsertResult::IgnoredLate => {
+                        late_units = late_units.saturating_add(1);
+                    }
+                    BatchInsertResult::MissingDecodeOrder => {
+                        unreachable!("receiver validates DON/DONL before inserting access units")
+                    }
+                    BatchInsertResult::InvalidPredictionChain => {
+                        prediction_chain_failure = Some("duplicate stream in one RTP timestamp");
+                        break 'completed;
+                    }
+                    BatchInsertResult::PredictionChainOverflow => {
+                        prediction_chain_failure = Some("pending DON/DONL sequence overflow");
+                        break 'completed;
+                    }
+                }
             }
         }
-        if late_units != 0 {
-            self.packet_losses = self.packet_losses.saturating_add(late_units);
+        if late_units != 0 && std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+            eprintln!("RTP ignored completed late/duplicate access units: count={late_units}");
+        }
+        if let Some(reason) = prediction_chain_failure {
+            self.packet_losses = self.packet_losses.saturating_add(1);
+            self.enter_sync_recovery();
+            if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+                eprintln!(
+                    "RTP cross-stream prediction chain reset ({reason}); max_pending_timestamps={MAX_PENDING_FRAME_BATCHES} total_losses={}",
+                    self.packet_losses,
+                );
+            }
             self.send_picture_loss_indications()?;
         }
         let batch = self.frame_batcher.take_ready(now);
@@ -650,7 +910,74 @@ impl AvcVideoStreamReceiver {
     }
 
     pub fn request_keyframe(&mut self) -> Result<()> {
+        self.enter_sync_recovery();
         self.send_picture_loss_indications()
+    }
+
+    fn hold_possible_sync_follower(&mut self, stream_index: usize, timed: TimedAccessUnit) {
+        let timestamp = timed.unit.timestamp;
+        if let Some(current_timestamp) = self
+            .pending_sync_followers
+            .first()
+            .map(|(_, candidate)| candidate.unit.timestamp)
+            && current_timestamp != timestamp
+        {
+            if timestamp_precedes(current_timestamp, timestamp) {
+                self.pending_sync_followers.clear();
+            } else {
+                return;
+            }
+        }
+        if self
+            .pending_sync_followers
+            .iter()
+            .any(|(index, candidate)| {
+                *index == stream_index
+                    || candidate.unit.decode_order_number == timed.unit.decode_order_number
+            })
+        {
+            return;
+        }
+        if self.pending_sync_followers.len() < AVC_VIDEO_SLICE_COUNT {
+            self.pending_sync_followers.push((stream_index, timed));
+        }
+    }
+
+    fn take_sync_followers(
+        &mut self,
+        sync_stream_index: usize,
+        timestamp: u32,
+        decode_order: u16,
+    ) -> Vec<(usize, TimedAccessUnit)> {
+        std::mem::take(&mut self.pending_sync_followers)
+            .into_iter()
+            .filter(|(stream_index, candidate)| {
+                if *stream_index == sync_stream_index || candidate.unit.timestamp != timestamp {
+                    return false;
+                }
+                candidate
+                    .unit
+                    .decode_order_number
+                    .is_some_and(|candidate_order| {
+                        let offset = candidate_order.wrapping_sub(decode_order);
+                        (1..AVC_VIDEO_SLICE_COUNT as u16).contains(&offset)
+                    })
+            })
+            .collect()
+    }
+
+    fn enter_sync_recovery(&mut self) {
+        self.frame_batcher.reset();
+        self.ready_units.clear();
+        self.awaiting_sync = true;
+        self.pending_sync_followers.clear();
+        for stream in &mut self.streams {
+            stream.depacketizer.reset();
+            stream.reorder.reset_pending();
+            stream.completed.clear();
+            stream.first_packet_arrivals.clear();
+            stream.damaged_timestamp = None;
+        }
     }
 
     fn send_picture_loss_indications(&mut self) -> Result<()> {
@@ -690,8 +1017,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        AVC_VIDEO_SLICE_COUNT, AccessUnitBatcher, MediaUdpEndpoints, MediaUdpPortOverrides,
-        MediaUdpSession, UdpStreamKind, insert_scheduled_item, is_rtcp,
+        AVC_VIDEO_SLICE_COUNT, AccessUnitBatcher, BatchInsertResult, MAX_PENDING_FRAME_BATCHES,
+        MediaUdpEndpoints, MediaUdpPortOverrides, MediaUdpSession, TimedAccessUnit, UdpStreamKind,
+        insert_scheduled_item, is_rtcp,
     };
     use crate::media_stream::{AccessUnit, ENCODING_AVC_MEDIA_STREAM, MediaStreamMessage1};
 
@@ -769,23 +1097,33 @@ mod tests {
         );
     }
 
-    fn unit(timestamp: u32, value: u8) -> AccessUnit {
+    fn unit(timestamp: u32, decode_order: u16) -> AccessUnit {
         AccessUnit {
             timestamp,
-            nal_units: vec![vec![value]],
+            decode_order_number: Some(decode_order),
+            nal_units: vec![vec![decode_order as u8]],
+        }
+    }
+
+    fn timed_unit(timestamp: u32, decode_order: u16, at: Instant) -> TimedAccessUnit {
+        TimedAccessUnit {
+            unit: unit(timestamp, decode_order),
+            first_packet_received_at: at,
+            completed_at: at,
         }
     }
 
     #[test]
     fn completed_slices_are_stably_sorted_in_stream_scan_order() {
+        let now = Instant::now();
         let mut ready = Vec::new();
         for index in 0..AVC_VIDEO_SLICE_COUNT {
-            insert_scheduled_item(&mut ready, index, unit(100, index as u8));
+            insert_scheduled_item(&mut ready, index, timed_unit(100, index as u16, now));
         }
         assert_eq!(
             ready
                 .iter()
-                .map(|(index, unit)| (*index, unit.nal_units[0][0]))
+                .map(|(index, timed)| (*index, timed.unit.nal_units[0][0]))
                 .collect::<Vec<_>>(),
             vec![(0, 0), (1, 1), (2, 2), (3, 3)]
         );
@@ -793,14 +1131,15 @@ mod tests {
 
     #[test]
     fn sparse_updates_are_sorted_without_waiting_for_four_slices() {
+        let now = Instant::now();
         let mut ready = Vec::new();
-        insert_scheduled_item(&mut ready, 1, unit(200, 1));
-        insert_scheduled_item(&mut ready, 0, unit(100, 0));
-        insert_scheduled_item(&mut ready, 2, unit(100, 2));
+        insert_scheduled_item(&mut ready, 1, timed_unit(200, 1, now));
+        insert_scheduled_item(&mut ready, 0, timed_unit(100, 0, now));
+        insert_scheduled_item(&mut ready, 2, timed_unit(100, 2, now));
         assert_eq!(
             ready
                 .iter()
-                .map(|(index, unit)| (*index, unit.timestamp))
+                .map(|(index, timed)| (*index, timed.unit.timestamp))
                 .collect::<Vec<_>>(),
             vec![(0, 100), (2, 100), (1, 200)]
         );
@@ -808,14 +1147,15 @@ mod tests {
 
     #[test]
     fn timestamp_sort_is_wrap_aware() {
+        let now = Instant::now();
         let mut ready = Vec::new();
-        insert_scheduled_item(&mut ready, 2, unit(1, 2));
-        insert_scheduled_item(&mut ready, 0, unit(u32::MAX - 1, 0));
-        insert_scheduled_item(&mut ready, 1, unit(u32::MAX, 1));
+        insert_scheduled_item(&mut ready, 2, timed_unit(1, 2, now));
+        insert_scheduled_item(&mut ready, 0, timed_unit(u32::MAX - 1, 0, now));
+        insert_scheduled_item(&mut ready, 1, timed_unit(u32::MAX, 1, now));
         assert_eq!(
             ready
                 .iter()
-                .map(|(index, unit)| (*index, unit.timestamp))
+                .map(|(index, timed)| (*index, timed.unit.timestamp))
                 .collect::<Vec<_>>(),
             vec![(0, u32::MAX - 1), (1, u32::MAX), (2, 1)]
         );
@@ -825,8 +1165,12 @@ mod tests {
     fn complete_four_slice_timestamp_is_released_immediately() {
         let now = Instant::now();
         let mut batcher = AccessUnitBatcher::default();
-        for slice in 0..AVC_VIDEO_SLICE_COUNT {
-            assert!(batcher.insert(slice, unit(800, slice as u8), now));
+        batcher.begin_prediction_chain(100);
+        for (slice, decode_order) in [(0, 102), (1, 100), (2, 103), (3, 101)] {
+            assert_eq!(
+                batcher.insert(slice, timed_unit(800, decode_order, now)),
+                BatchInsertResult::Accepted
+            );
         }
         let batch = batcher.take_ready(now).expect("complete timestamp");
         assert_eq!(batch.timestamp, 800);
@@ -835,35 +1179,237 @@ mod tests {
             batch
                 .access_units
                 .iter()
-                .map(|(slice, _)| *slice)
+                .map(|(slice, unit)| (*slice, unit.decode_order_number.unwrap()))
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3]
+            vec![(1, 100), (3, 101), (0, 102), (2, 103)]
         );
     }
 
     #[test]
-    fn sparse_timestamp_waits_one_frame_interval_without_waiting_for_all_slices() {
+    fn batch_timing_separates_first_packet_from_first_completed_access_unit() {
         let now = Instant::now();
         let mut batcher = AccessUnitBatcher::default();
-        assert!(batcher.insert(2, unit(1_600, 2), now));
-        assert!(batcher.take_ready(now).is_none());
+        batcher.begin_prediction_chain(20);
+        for (slice, packet_ms, completed_ms) in [(0, 3, 7), (1, 1, 5), (2, 2, 4), (3, 4, 8)] {
+            assert_eq!(
+                batcher.insert(
+                    slice,
+                    TimedAccessUnit {
+                        unit: unit(900, 20 + slice as u16),
+                        first_packet_received_at: now + Duration::from_millis(packet_ms),
+                        completed_at: now + Duration::from_millis(completed_ms),
+                    },
+                ),
+                BatchInsertResult::Accepted
+            );
+        }
         let batch = batcher
-            .take_ready(now + Duration::from_millis(18))
-            .expect("sparse timestamp after bounded holdback");
-        assert_eq!(batch.timestamp, 1_600);
-        assert_eq!(batch.access_units.len(), 1);
-        assert_eq!(batch.access_units[0].0, 2);
+            .take_ready(now + Duration::from_millis(9))
+            .expect("complete timestamp");
+        assert_eq!(
+            batch.first_packet_received_at,
+            now + Duration::from_millis(1)
+        );
+        assert_eq!(
+            batch.first_access_unit_completed_at,
+            now + Duration::from_millis(4)
+        );
+        assert_eq!(batch.released_at, now + Duration::from_millis(9));
     }
 
     #[test]
-    fn timestamp_batches_preserve_wrap_order_and_reject_late_old_units() {
+    fn incomplete_timestamp_is_never_released_by_a_wall_clock_guess() {
         let now = Instant::now();
         let mut batcher = AccessUnitBatcher::default();
-        assert!(batcher.insert(0, unit(u32::MAX - 1, 0), now));
-        assert!(batcher.insert(1, unit(u32::MAX, 1), now));
-        assert!(batcher.insert(2, unit(1, 2), now));
-        let first = batcher.take_ready(now).expect("oldest wrap batch");
-        assert_eq!(first.timestamp, u32::MAX - 1);
-        assert!(!batcher.insert(3, unit(u32::MAX - 1, 3), now));
+        batcher.begin_prediction_chain(40);
+        assert_eq!(
+            batcher.insert(2, timed_unit(1_600, 42, now)),
+            BatchInsertResult::Accepted
+        );
+        assert!(batcher.take_ready(now).is_none());
+        assert!(
+            batcher.take_ready(now + Duration::from_secs(1)).is_none(),
+            "elapsed time cannot prove a prediction subframe was omitted"
+        );
+        for (slice, decode_order) in [(0, 40), (1, 41), (3, 43)] {
+            assert_eq!(
+                batcher.insert(slice, timed_unit(1_600, decode_order, now)),
+                BatchInsertResult::Accepted
+            );
+        }
+        let batch = batcher.take_ready(now).expect("complete timestamp");
+        assert_eq!(batch.timestamp, 1_600);
+        assert_eq!(batch.access_units.len(), AVC_VIDEO_SLICE_COUNT);
+    }
+
+    #[test]
+    fn a_newer_full_timestamp_cannot_replace_an_incomplete_sync_origin() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        batcher.begin_prediction_chain(10);
+        assert_eq!(
+            batcher.insert(0, timed_unit(100, 10, now)),
+            BatchInsertResult::Accepted
+        );
+        for (slice, decode_order) in [(0, 14), (1, 15), (2, 16), (3, 17)] {
+            assert_eq!(
+                batcher.insert(slice, timed_unit(200, decode_order, now)),
+                BatchInsertResult::Accepted
+            );
+        }
+        assert!(
+            batcher.take_ready(now).is_none(),
+            "decoder must not skip the sync timestamp's missing DONs"
+        );
+    }
+
+    #[test]
+    fn sparse_timestamp_releases_only_when_next_don_proves_its_boundary() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        batcher.begin_prediction_chain(0);
+        for slice in 0..AVC_VIDEO_SLICE_COUNT {
+            assert_eq!(
+                batcher.insert(slice, timed_unit(100, slice as u16, now)),
+                BatchInsertResult::Accepted
+            );
+        }
+        batcher.take_ready(now).expect("initial sync batch");
+
+        assert_eq!(
+            batcher.insert(3, timed_unit(200, 5, now)),
+            BatchInsertResult::Accepted
+        );
+        assert_eq!(
+            batcher.insert(0, timed_unit(200, 4, now)),
+            BatchInsertResult::Accepted
+        );
+        assert!(batcher.take_ready(now + Duration::from_secs(1)).is_none());
+
+        assert_eq!(
+            batcher.insert(1, timed_unit(300, 6, now)),
+            BatchInsertResult::Accepted
+        );
+        let sparse = batcher
+            .take_ready(now)
+            .expect("DON boundary proves sparse batch");
+        assert_eq!(sparse.timestamp, 200);
+        assert_eq!(
+            sparse
+                .access_units
+                .iter()
+                .map(|(slice, unit)| (*slice, unit.decode_order_number.unwrap()))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (3, 5)]
+        );
+    }
+
+    #[test]
+    fn a_decode_order_gap_blocks_newer_timestamps_until_the_missing_unit_arrives() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        batcher.begin_prediction_chain(0);
+        for slice in 0..AVC_VIDEO_SLICE_COUNT {
+            batcher.insert(slice, timed_unit(100, slice as u16, now));
+        }
+        batcher.take_ready(now).expect("initial sync batch");
+
+        assert_eq!(
+            batcher.insert(3, timed_unit(200, 5, now)),
+            BatchInsertResult::Accepted
+        );
+        assert_eq!(
+            batcher.insert(0, timed_unit(300, 6, now)),
+            BatchInsertResult::Accepted
+        );
+        assert!(batcher.take_ready(now).is_none(), "DON 4 is still missing");
+        assert_eq!(
+            batcher.insert(1, timed_unit(200, 4, now)),
+            BatchInsertResult::Accepted
+        );
+        let recovered = batcher.take_ready(now).expect("contiguous DON chain");
+        assert_eq!(recovered.timestamp, 200);
+        assert_eq!(
+            recovered
+                .access_units
+                .iter()
+                .map(|(_, unit)| unit.decode_order_number.unwrap())
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+    }
+
+    #[test]
+    fn decode_order_wrap_is_contiguous_and_late_units_are_rejected() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        batcher.begin_prediction_chain(u16::MAX - 1);
+        for (slice, decode_order) in [(0, u16::MAX), (1, 1), (2, u16::MAX - 1), (3, 0)] {
+            assert_eq!(
+                batcher.insert(slice, timed_unit(u32::MAX, decode_order, now)),
+                BatchInsertResult::Accepted
+            );
+        }
+        let first = batcher.take_ready(now).expect("wrapped initial batch");
+        assert_eq!(
+            first
+                .access_units
+                .iter()
+                .map(|(_, unit)| unit.decode_order_number.unwrap())
+                .collect::<Vec<_>>(),
+            vec![u16::MAX - 1, u16::MAX, 0, 1]
+        );
+        assert_eq!(
+            batcher.insert(3, timed_unit(1, u16::MAX, now)),
+            BatchInsertResult::IgnoredLate
+        );
+        assert_eq!(
+            batcher.insert(0, timed_unit(1, 2, now)),
+            BatchInsertResult::Accepted
+        );
+        assert_eq!(
+            batcher.insert(1, timed_unit(2, 3, now)),
+            BatchInsertResult::Accepted
+        );
+        let sparse = batcher.take_ready(now).expect("post-wrap sparse batch");
+        assert_eq!(sparse.access_units[0].1.decode_order_number, Some(2));
+    }
+
+    #[test]
+    fn missing_decode_order_and_duplicate_stream_are_explicit_errors() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        let mut missing = timed_unit(100, 0, now);
+        missing.unit.decode_order_number = None;
+        assert_eq!(
+            batcher.insert(0, missing),
+            BatchInsertResult::MissingDecodeOrder
+        );
+        assert_eq!(
+            batcher.insert(0, timed_unit(100, 0, now)),
+            BatchInsertResult::Accepted
+        );
+        assert_eq!(
+            batcher.insert(0, timed_unit(100, 1, now)),
+            BatchInsertResult::InvalidPredictionChain
+        );
+    }
+
+    #[test]
+    fn incomplete_prediction_chain_is_bounded_and_reset() {
+        let now = Instant::now();
+        let mut batcher = AccessUnitBatcher::default();
+        for frame in 0..MAX_PENDING_FRAME_BATCHES {
+            assert_eq!(
+                batcher.insert(0, timed_unit(100 + frame as u32, 10 + frame as u16, now),),
+                BatchInsertResult::Accepted
+            );
+        }
+        assert_eq!(
+            batcher.insert(0, timed_unit(200, 30, now)),
+            BatchInsertResult::PredictionChainOverflow
+        );
+        assert!(batcher.pending.is_empty());
+        assert_eq!(batcher.last_released_decode_order, None);
     }
 }

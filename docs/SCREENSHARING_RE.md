@@ -777,11 +777,15 @@ both the raw 68-byte struct and the 16-byte-wrapped form.
 
 After `Message1`, the client binds one UDP socket per stream and talks to
 consecutive server ports: audio = base, video1 = base+1, video2 = base+2.
-Packets are RFC 3550 RTP. Payload encryption is SRTP AES-128-CM (RFC 3711):
-each 46-byte negotiated key is 16-byte master key + 14-byte master salt; the
-remaining 16 bytes are unused by AES-128-CM (reserved for the integrity layer).
-Confirmed from `SSUDPSender`/`AVCVideoStream` in ScreensharingAgent and the
-`AuthGetRandomBytes(0x2e)` key generation in the viewer.
+Packets are RFC 3550 RTP. The negotiated cipher-suite-5 SRTP material is a
+32-byte AES-256 master key followed by a 14-byte master salt. RTP uses
+AES-256-CTR and a truncated 10-byte HMAC-SHA1 tag; authentication is verified
+before any payload is decrypted or released. SRTCP uses the distinct standard
+labels and protects receiver reports, heartbeats, and PSFB PLI messages with
+its explicit packet index. This was confirmed against live packets and the
+installed `SSUDPSender`/`AVCVideoStream` implementation; the 46-byte
+`AuthGetRandomBytes(0x2e)` output is all key-plus-salt material, not a
+16-byte AES key with unused tail bytes.
 
 When the remote Mac is behind an explicit UDP port forward, the external
 destination can differ from the port carried by `Message1`. The viewer keeps
@@ -795,8 +799,11 @@ the negotiated endpoint exactly.
 
 AVConference negotiates `rtpmap:123 H264/90000`, `rtpmap:126 X-H264/90000`
 and `rtpmap:100 HEVC/90000`, with `fmtp` carrying `profile-level-id` and
-`packetization-mode`. The RTP payloads are standard H.264 (RFC 6184 FU-A /
-STAP-A) and HEVC (RFC 7798 FU / AP) access units; the server encodes with
+`packetization-mode`. H.264 uses the RFC 6184 interleaved-mode DON carried by
+FU-B/STAP-B; HEVC uses the RFC 7798 DONL carried by FU/AP packets. On the
+observed Apple stream, every fragment repeats the same two-byte DON/DONL, and
+the value increments globally across all four adjacent SSRCs, including
+timestamps where unchanged bands are omitted. The server encodes with
 VideoToolbox (`VTCompressionSessionCreate`, HEVC Main444 allowed) and pushes
 IOSurface-backed frames through `AVCVideoStream`. The viewer decodes with
 VideoToolbox in the same framework.
@@ -812,7 +819,8 @@ RFB connection.
 
 `crates/ard-core/src/media_stream/` implements the negotiation wire format, the
 binary-plist negotiation payload parser, RTP de-packetization, SRTP
-AES-128-CM and the UDP receive path in pure Rust (no unsafe, bounded parsing).
+AES-256-CTR/HMAC-SHA1 authentication and the UDP receive path in pure Rust (no
+unsafe, bounded parsing).
 `crates/ard-viewer/src/media/vt.rs` provides the macOS VideoToolbox decode
 backend and preserves the decoder's bi-planar YUV output through the GPU
 display path.
@@ -851,23 +859,77 @@ textures and performs range expansion, matrix conversion, and transfer
 conversion in WGSL. The live path does not allocate or upload an RGBA desktop;
 the example probe's CPU RGBA conversion exists only for diagnostic PNG output.
 
-The server's four video SSRCs form slices of one reference chain. The receive
-path now discards an incomplete timestamp when a newer completed access unit
-arrives, resets depacketization after a sequence gap, and refuses predictive
-frames until an H.264 IDR or HEVC IRAP frame recreates a clean VCP session.
-Standard protected RTCP PSFB PLI is sent for the four media SSRCs after loss;
-AVConference's installed Objective-C metadata exposes PLI, FIR, NACK, and
-keyframe-request support. The four SSRCs are grouped by their shared RTP
-timestamp, which is the actual sampling-instant boundary for one video frame;
-each timestamp batch is submitted to VideoToolbox and published once. The
-latest-frame mailbox merges distinct dirty slices so UI coalescing cannot lose
-a region.
+The server's four video SSRCs form horizontal slices of one serial reference
+chain. RTP timestamp alone is a presentation boundary, not sufficient decode
+order: legitimate sparse timestamps may contain one, two, three, or four
+access units. A previous elapsed-time holdback released a partial timestamp,
+rejected its late reference, and deterministically produced VideoToolbox
+`kVTVideoDecoderReferenceMissingErr` (`-17694`). Requiring all four slices was
+also wrong because the server legitimately omits unchanged bands.
+
+The corrected scheduler uses the shared 16-bit DON/DONL as the authoritative
+cross-SSRC decode sequence. A sparse timestamp is released only when the next
+contiguous DON at a different timestamp proves its end; wall-clock time never
+manufactures that boundary. The initial chain is anchored to the actual
+H.264 IDR or HEVC IRAP DON, and later full timestamps cannot replace a missing
+part of that sync batch. A bounded pre-sync window also retains same-timestamp
+followers that UDP completes before the sync access unit. Sequence loss or a
+bounded DON gap clears every dependent batch, sends authenticated PSFB PLI for
+all four SSRCs, and refuses predictive access units until a real sync frame.
+
+Network receive/SRTP/RTP reassembly runs on a dedicated thread, independent of
+VideoToolbox/MFT and rendering. The compressed-batch queue is prediction-chain
+aware: ordinary bursts are drained while hardware decoding runs; true consumer
+overrun clears dependent batches and requests a sync frame instead of dropping
+or coalescing a predictive frame. The latest decoded-frame mailbox still
+merges distinct dirty NV12 slices so UI wakeup coalescing cannot lose a region.
+
+The encoded band height is codec-aligned, not necessarily one quarter of the
+requested framebuffer. Live 2880x1800 frames decode as four 2880x464 bands:
+the first three contribute all 464 rows and the fourth contributes the exact
+408-row remainder. Likewise 3420x2224 uses 560,560,560,544 visible rows. The
+compositor accepts only a decoder-provided exact clean aperture or this proven
+`align_up(ceil(target_height / 4), 16)` layout; any other width/height mismatch
+is a hard error rather than an arbitrary crop or scale.
+
+The fixed logical display request is 2x-backed before the server updates its
+stale `ServerInit` dimensions. Therefore the initial type-3 request and later
+type-9 subscription both use the requested physical size (for example
+1440x900 -> 2880x1800), and the decoded source must exactly match it.
+
+### Live latency and resolution validation (2026-08-13)
+
+Release-mode probes against `192.168.0.24` on macOS 26.6.1 requested logical
+1440x900 and verified persistent full-frame NV12 output at exactly 2880x1800.
+The diagnostic PNGs were independently identified as 2880x1800 RGBA and
+visually inspected for sharp content, four-band seams, and bottom padding.
+
+* HEVC: 4,901 authenticated/decrypted RTP packets, zero access-unit loss and
+  zero prediction reset. RTP reassembly p50/p95 was 0.142/2.097 ms, DON reorder
+  7.329/19.253 ms, and release-to-decode 3.315/53.573 ms. One ordered pointer
+  action flushed in 0.085 ms; flush to the first confirmed changed-frame packet
+  was 14.010 ms and flush to its decoded frame was 31.070 ms.
+* H.264: 4,860 authenticated/decrypted RTP packets, zero access-unit loss and
+  zero prediction reset. RTP reassembly p50/p95 was 1.107/1.918 ms, DON reorder
+  8.977/10.055 ms, and release-to-decode 4.718/115.019 ms. One ordered pointer
+  action flushed in 0.073 ms; flush to the first confirmed changed-frame packet
+  was 1.547 ms and flush to its decoded frame was 14.458 ms.
+
+The release GUI was also connected through its normal saved-device path. Its
+HUD reported source/requested dimensions of 2880x1800/2880x1800, 48.3 fps,
+0.08 ms peak input queue-to-write delay, and 37.12 ms from input write to the
+next received changed frame (explicitly a non-causal visual-response proxy).
+
+The high release-to-decode p95 includes one-time hardware-session creation and
+the bounded startup queue; the steady-state p50 and measured action path remain
+far below one second. The viewer HUD reports first-packet RTP reassembly, DON
+reorder, receive/release-to-decode, decode-to-render-command encoding, the
+explicitly labelled non-causal next-frame proxy, and input queue/write timing.
 
 ### Remaining work
 
 * One live session capture to confirm the exact server-reply TCP envelope and
   the real offer plist byte layout (milestone ④).
-* SRTP authentication (HMAC-SHA1) if the negotiated suite requires it.
 
 ## Live capture follow-up (2026-08-08)
 

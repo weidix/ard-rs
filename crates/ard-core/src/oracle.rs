@@ -102,10 +102,15 @@ pub struct OracleReport {
     pub activation_received: bool,
     pub server_to_client_records: usize,
     pub client_to_server_records: usize,
-    /// First byte (message type) of each decrypted client record.
+    /// First byte (message type) of each decrypted client message. Multiple
+    /// messages may share a record and one message may span records.
     pub client_message_types: Vec<u8>,
     /// Incremental flag from every decrypted type-3 framebuffer request.
     pub client_framebuffer_update_incremental: Vec<bool>,
+    /// Rectangle `(x, y, width, height)` from each decrypted type-3 request.
+    pub client_framebuffer_update_rectangles: Vec<(u16, u16, u16, u16)>,
+    /// Rectangle `(x, y, width, height)` from each decrypted type-9 request.
+    pub client_auto_frame_update_rectangles: Vec<(u16, u16, u16, u16)>,
     pub frames_sent: usize,
 }
 
@@ -123,6 +128,8 @@ impl EncryptedTransportOracle {
             client_to_server_records: 0,
             client_message_types: Vec::new(),
             client_framebuffer_update_incremental: Vec::new(),
+            client_framebuffer_update_rectangles: Vec::new(),
+            client_auto_frame_update_rectangles: Vec::new(),
             frames_sent: 0,
         };
 
@@ -263,8 +270,10 @@ impl EncryptedTransportOracle {
             report.server_to_client_records += 1;
         }
 
-        // Read encrypted client records until EOF, responding to update
-        // requests with the remaining frames.
+        // Read encrypted records as one continuous RFB client byte stream.
+        // Real clients legally batch small input messages into a record and
+        // split large clipboard messages across record boundaries.
+        let mut client_plaintext = Vec::new();
         while report.client_message_types.len() < self.max_client_messages {
             let mut length = [0_u8; 2];
             match stream.read_exact(&mut length) {
@@ -287,21 +296,27 @@ impl EncryptedTransportOracle {
             stream.read_exact(&mut ciphertext)?;
             let payload = decoder.decode(&ciphertext).map_err(io::Error::other)?;
             report.client_to_server_records += 1;
-            if let Some(&message_type) = payload.first() {
+            client_plaintext.extend_from_slice(&payload);
+            while let Some(message_len) = encrypted_client_message_len(&client_plaintext)? {
+                let message: Vec<_> = client_plaintext.drain(..message_len).collect();
+                let message_type = message[0];
                 report.client_message_types.push(message_type);
                 if message_type == 3 {
-                    if payload.len() != 10 {
-                        return Err(io::Error::other(
-                            "invalid framebuffer-update request message",
-                        ));
-                    }
                     report
                         .client_framebuffer_update_incremental
-                        .push(payload[1] != 0);
-                }
-                if message_type == 9 && payload.len() != 16 {
-                    return Err(io::Error::other(
-                        "invalid automatic framebuffer-update message",
+                        .push(message[1] != 0);
+                    report.client_framebuffer_update_rectangles.push((
+                        u16::from_be_bytes([message[2], message[3]]),
+                        u16::from_be_bytes([message[4], message[5]]),
+                        u16::from_be_bytes([message[6], message[7]]),
+                        u16::from_be_bytes([message[8], message[9]]),
+                    ));
+                } else if message_type == 9 {
+                    report.client_auto_frame_update_rectangles.push((
+                        u16::from_be_bytes([message[8], message[9]]),
+                        u16::from_be_bytes([message[10], message[11]]),
+                        u16::from_be_bytes([message[12], message[13]]),
+                        u16::from_be_bytes([message[14], message[15]]),
                     ));
                 }
                 if matches!(message_type, 3 | 9)
@@ -444,6 +459,47 @@ impl EncryptedTransportOracle {
         while stream.read(&mut sink)? != 0 {}
         Ok(report)
     }
+}
+
+fn encrypted_client_message_len(bytes: &[u8]) -> io::Result<Option<usize>> {
+    let Some(&message_type) = bytes.first() else {
+        return Ok(None);
+    };
+    let fixed = match message_type {
+        3 => Some(10),
+        4 => Some(8),
+        5 => Some(6),
+        9 => Some(16),
+        0x17 => Some(58),
+        _ => None,
+    };
+    let length = if let Some(length) = fixed {
+        length
+    } else if message_type == 6 {
+        if bytes.len() < 8 {
+            return Ok(None);
+        }
+        8_usize
+            .checked_add(
+                u32::from_be_bytes(bytes[4..8].try_into().expect("cut text length")) as usize,
+            )
+            .ok_or_else(|| io::Error::other("client cut-text length overflow"))?
+    } else if matches!(message_type, 0x1c | 0x1d) {
+        if bytes.len() < 4 {
+            return Ok(None);
+        }
+        4_usize
+            .checked_add(usize::from(u16::from_be_bytes([bytes[2], bytes[3]])))
+            .ok_or_else(|| io::Error::other("ARD client message length overflow"))?
+    } else {
+        return Err(io::Error::other(format!(
+            "unsupported encrypted client message type {message_type:#04x}"
+        )));
+    };
+    if length > 16 * 1024 * 1024 {
+        return Err(io::Error::other("encrypted client message is too large"));
+    }
+    Ok((bytes.len() >= length).then_some(length))
 }
 
 fn send_control_rectangle(

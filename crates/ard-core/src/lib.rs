@@ -23,7 +23,7 @@ mod wire;
 pub use auth::{ArdType30ClientExchange, build_ard_type30_client_exchange};
 pub use client::{
     ArdClient, ArdClientConfig, ArdClientError, ArdClientEvent, ArdClientInput, ArdFrameInfo,
-    ArdFrameOutput, ArdMediaStream, ArdReconnectPolicy, ArdVideoQuality,
+    ArdFrameOutput, ArdInputMetrics, ArdMediaStream, ArdReconnectPolicy, ArdVideoQuality,
 };
 pub use decoder::{DecodeLimits, Decoder};
 pub use dispatcher::{ArdMessageDispatcher, ArdServerMessage};

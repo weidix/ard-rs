@@ -29,10 +29,19 @@ fn client_sends_fixed_display_configuration_inside_encrypted_transport() {
     config.display_configuration = Some(ArdDisplayConfiguration::single(1920, 1080));
     let mut client = ArdClient::connect(config).unwrap();
     client.next_frame().unwrap();
+    client.next_frame().unwrap();
     drop(client);
 
     let report = server.join().unwrap();
     assert_eq!(report.client_message_types[..2], [0x1d, 3]);
+    assert_eq!(
+        report.client_framebuffer_update_rectangles[0],
+        (0, 0, 3840, 2160)
+    );
+    assert_eq!(
+        report.client_auto_frame_update_rectangles[0],
+        (0, 0, 3840, 2160)
+    );
 }
 
 #[test]

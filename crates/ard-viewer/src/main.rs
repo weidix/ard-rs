@@ -2588,8 +2588,9 @@ mod tests {
 
     #[test]
     fn rendering_filters_use_automatic_defaults() {
-        assert!(config::DEFAULT_SHOULD_INTERPOLATE);
-        assert!(!config::DEFAULT_SHARP_SAMPLING);
+        let defaults = config::AppConfig::default();
+        assert!(defaults.should_interpolate);
+        assert!(!defaults.sharp_sampling);
     }
 
     #[test]

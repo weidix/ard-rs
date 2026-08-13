@@ -239,6 +239,16 @@ impl RtpReorderBuffer {
         std::mem::take(&mut self.dropped_access_units)
     }
 
+    /// Discard authenticated packets that belong to the prediction chain
+    /// being reset. Preserve the released sequence watermark so late UDP
+    /// fragments from that chain cannot seed the next codec sync frame.
+    pub(crate) fn reset_pending(&mut self) {
+        self.packets.clear();
+        self.continuation = None;
+        self.marker_pending = false;
+        self.dropped_access_units = 0;
+    }
+
     fn drop_stale_access_units_before(&mut self, incoming: &RtpPacket<'_>) {
         // Wait until the marker of a newer frame. This gives a late packet an
         // entire frame interval to close the older burst while keeping loss
@@ -400,6 +410,10 @@ pub type NalUnit = Vec<u8>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessUnit {
     pub timestamp: u32,
+    /// Low 16 bits of the codec decoding-order number carried by Apple's
+    /// HEVC DONL or H.264 DON field. The four SSRCs share this sequence, so it
+    /// is the authoritative cross-stream decode order.
+    pub decode_order_number: Option<u16>,
     pub nal_units: Vec<NalUnit>,
 }
 
@@ -432,9 +446,20 @@ impl AccessUnit {
     }
 
     pub fn is_idr(&self) -> bool {
-        self.nal_units
-            .iter()
-            .any(|nal| nal.first().is_some_and(|&b| (b & 0x1f) == 5))
+        self.is_sync(MediaStreamCodec::H264)
+    }
+
+    /// Whether this access unit can start a fresh codec prediction chain.
+    /// H.264 IDR pictures and HEVC IRAP pictures are the only native AVC
+    /// recovery boundaries accepted here; predictive pictures must never be
+    /// submitted after packet loss or a decoder reset.
+    pub fn is_sync(&self, codec: MediaStreamCodec) -> bool {
+        self.nal_units.iter().any(|nal| {
+            nal.first().is_some_and(|&first| match codec {
+                MediaStreamCodec::H264 => first & 0x1f == 5,
+                MediaStreamCodec::Hevc => (16..=23).contains(&((first >> 1) & 0x3f)),
+            })
+        })
     }
 }
 
@@ -442,17 +467,25 @@ impl AccessUnit {
 struct FragmentBuffer {
     bytes: Vec<u8>,
     nal_header: Vec<u8>,
+    decode_order_number: Option<u16>,
     timestamp: u32,
     expected_next: u16,
 }
 
 impl FragmentBuffer {
-    fn new(sequence: u16, timestamp: u32, nal_header: Vec<u8>, first_fragment: &[u8]) -> Self {
+    fn new(
+        sequence: u16,
+        timestamp: u32,
+        decode_order_number: Option<u16>,
+        nal_header: Vec<u8>,
+        first_fragment: &[u8],
+    ) -> Self {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(first_fragment);
         Self {
             bytes,
             nal_header,
+            decode_order_number,
             timestamp,
             expected_next: sequence.wrapping_add(1),
         }
@@ -484,6 +517,7 @@ impl FragmentBuffer {
 /// a new timestamp begins.
 struct FrameAssembler {
     current_timestamp: Option<u32>,
+    current_decode_order_number: Option<u16>,
     nal_units: Vec<NalUnit>,
     bytes: usize,
 }
@@ -498,6 +532,7 @@ impl FrameAssembler {
     fn new() -> Self {
         Self {
             current_timestamp: None,
+            current_decode_order_number: None,
             nal_units: Vec::new(),
             bytes: 0,
         }
@@ -506,6 +541,7 @@ impl FrameAssembler {
     fn push(
         &mut self,
         timestamp: u32,
+        decode_order_number: Option<u16>,
         units: Vec<NalUnit>,
         marker: bool,
     ) -> Result<Option<AccessUnit>> {
@@ -524,16 +560,22 @@ impl FrameAssembler {
         if let Some(previous_ts) = self.current_timestamp {
             if previous_ts != timestamp {
                 let previous = std::mem::take(&mut self.nal_units);
+                let previous_decode_order_number = self.current_decode_order_number.take();
                 self.bytes = incoming_bytes;
                 self.current_timestamp = Some(timestamp);
+                self.current_decode_order_number = decode_order_number;
                 self.nal_units = units;
                 return Ok(Some(AccessUnit {
                     timestamp: previous_ts,
+                    decode_order_number: previous_decode_order_number,
                     nal_units: previous,
                 }));
             }
         } else {
             self.current_timestamp = Some(timestamp);
+        }
+        if decode_order_number.is_some() {
+            self.current_decode_order_number = decode_order_number;
         }
         self.bytes = self
             .bytes
@@ -543,10 +585,12 @@ impl FrameAssembler {
         self.nal_units.extend(units);
         if marker {
             let nal_units = std::mem::take(&mut self.nal_units);
+            let decode_order_number = self.current_decode_order_number.take();
             self.current_timestamp = None;
             self.bytes = 0;
             Ok(Some(AccessUnit {
                 timestamp,
+                decode_order_number,
                 nal_units,
             }))
         } else {
@@ -557,6 +601,7 @@ impl FrameAssembler {
     /// Flush any buffered NAL units (used when a fragment is lost).
     fn reset(&mut self) {
         self.current_timestamp = None;
+        self.current_decode_order_number = None;
         self.nal_units.clear();
         self.bytes = 0;
     }
@@ -597,6 +642,13 @@ impl H264Depacketizer {
         let nal_type = payload[0] & 0x1f;
         let marker = packet.header.marker;
         let ts = packet.header.timestamp;
+        if std::env::var_os("ARD_RTP_WIRE_TRACE").is_some() {
+            let prefix = &payload[..payload.len().min(9)];
+            eprintln!(
+                "H264 wire: seq={} ts={ts} marker={marker} type={nal_type} bytes={prefix:02x?}",
+                packet.header.sequence,
+            );
+        }
         let completed = match nal_type {
             1..=23 => {
                 // Single NAL unit.
@@ -609,7 +661,7 @@ impl H264Depacketizer {
                 // first byte is not a usable NAL header, so extract SPS/PPS
                 // here just as we do for the first STAP-B aggregate item.
                 let units = avcc_parameter_sets(payload).unwrap_or_else(|| vec![payload.to_vec()]);
-                self.assembler.push(ts, units, marker)?
+                self.assembler.push(ts, None, units, marker)?
             }
             28 | 29 => {
                 // FU-A / FU-B.
@@ -626,6 +678,8 @@ impl H264Depacketizer {
                 } else {
                     2
                 };
+                let decode_order_number =
+                    (nal_type == 29).then(|| u16::from_be_bytes([payload[2], payload[3]]));
                 let nal_header = [payload[0] & 0xe0 | (payload[1] & 0x1f)];
                 if start {
                     if self.fragment.is_some() {
@@ -634,6 +688,7 @@ impl H264Depacketizer {
                     self.fragment = Some(FragmentBuffer::new(
                         packet.header.sequence,
                         ts,
+                        decode_order_number,
                         nal_header.to_vec(),
                         &payload[data_offset..],
                     ));
@@ -645,7 +700,13 @@ impl H264Depacketizer {
                 }
                 let mut completed = None;
                 if end && let Some(fragment) = self.fragment.take() {
-                    completed = self.assembler.push(ts, vec![fragment.finish()], marker)?;
+                    let decode_order_number = decode_order_number.or(fragment.decode_order_number);
+                    completed = self.assembler.push(
+                        ts,
+                        decode_order_number,
+                        vec![fragment.finish()],
+                        marker,
+                    )?;
                 }
                 completed
             }
@@ -673,7 +734,7 @@ impl H264Depacketizer {
                     units.push(payload[offset..offset + nal_len].to_vec());
                     offset += nal_len;
                 }
-                self.assembler.push(ts, units, marker)?
+                self.assembler.push(ts, None, units, marker)?
             }
             25 => {
                 // STAP-B starts with a two-byte decoding-order number. Apple
@@ -713,12 +774,15 @@ impl H264Depacketizer {
                 if units.is_empty() {
                     return Err(Error::Invalid("H.264 STAP-B has no decodable NAL units"));
                 }
-                self.assembler.push(ts, units, marker)?
+                let decode_order_number = Some(u16::from_be_bytes([payload[1], payload[2]]));
+                self.assembler
+                    .push(ts, decode_order_number, units, marker)?
             }
             _ => {
                 // Unknown type: treat as a complete single unit and move on.
                 self.fragment = None;
-                self.assembler.push(ts, vec![payload.to_vec()], marker)?
+                self.assembler
+                    .push(ts, None, vec![payload.to_vec()], marker)?
             }
         };
         Ok(completed)
@@ -830,6 +894,15 @@ impl HevcDepacketizer {
         let nal_type = (payload[0] >> 1) & 0x3f;
         let marker = packet.header.marker;
         let ts = packet.header.timestamp;
+        if std::env::var_os("ARD_RTP_WIRE_TRACE").is_some() && nal_type == 49 {
+            let prefix = &payload[..payload.len().min(9)];
+            eprintln!(
+                "HEVC FU wire: seq={} ts={ts} marker={marker} start={} end={} bytes={prefix:02x?}",
+                packet.header.sequence,
+                payload.get(2).is_some_and(|byte| byte & 0x80 != 0),
+                payload.get(2).is_some_and(|byte| byte & 0x40 != 0),
+            );
+        }
         let completed = match nal_type {
             0..=31 => {
                 // Single NAL unit (type <= 31 excludes aggregation/fragmentation).
@@ -837,10 +910,15 @@ impl HevcDepacketizer {
                     self.assembler.reset();
                 }
                 self.fragment = None;
-                let unit = if self.donl_present {
+                let decode_order_number = if self.donl_present {
                     if payload.len() < 4 {
                         return Err(Error::Invalid("HEVC single NAL missing DONL"));
                     }
+                    Some(u16::from_be_bytes([payload[2], payload[3]]))
+                } else {
+                    None
+                };
+                let unit = if self.donl_present {
                     let mut unit = Vec::with_capacity(payload.len() - 2);
                     unit.extend_from_slice(&payload[..2]);
                     unit.extend_from_slice(&payload[4..]);
@@ -848,7 +926,8 @@ impl HevcDepacketizer {
                 } else {
                     payload.to_vec()
                 };
-                self.assembler.push(ts, vec![unit], marker)?
+                self.assembler
+                    .push(ts, decode_order_number, vec![unit], marker)?
             }
             48 => {
                 // Aggregation packet (AP).
@@ -860,6 +939,14 @@ impl HevcDepacketizer {
                 }
                 self.fragment = None;
                 let mut units = Vec::new();
+                let decode_order_number = if self.donl_present {
+                    if payload.len() < 4 {
+                        return Err(Error::Invalid("HEVC AP missing DONL"));
+                    }
+                    Some(u16::from_be_bytes([payload[2], payload[3]]))
+                } else {
+                    None
+                };
                 let mut offset = if self.donl_present {
                     if payload.len() < 4 {
                         return Err(Error::Invalid("HEVC AP missing DONL"));
@@ -881,7 +968,8 @@ impl HevcDepacketizer {
                     units.push(payload[offset..offset + nal_len].to_vec());
                     offset += nal_len;
                 }
-                self.assembler.push(ts, units, marker)?
+                self.assembler
+                    .push(ts, decode_order_number, units, marker)?
             }
             49 => {
                 // Fragmentation unit (FU).
@@ -891,6 +979,9 @@ impl HevcDepacketizer {
                 }
                 let start = payload[2] & 0x80 != 0;
                 let end = payload[2] & 0x40 != 0;
+                let decode_order_number = self
+                    .donl_present
+                    .then(|| u16::from_be_bytes([payload[3], payload[4]]));
                 let mut header = [0u8; 2];
                 header[0] = payload[0] & 0x81 | ((payload[2] & 0x3f) << 1);
                 header[1] = payload[1];
@@ -901,6 +992,7 @@ impl HevcDepacketizer {
                     self.fragment = Some(FragmentBuffer::new(
                         packet.header.sequence,
                         ts,
+                        decode_order_number,
                         header.to_vec(),
                         &payload[data_offset..],
                     ));
@@ -912,14 +1004,21 @@ impl HevcDepacketizer {
                 }
                 let mut completed = None;
                 if end && let Some(fragment) = self.fragment.take() {
-                    completed = self.assembler.push(ts, vec![fragment.finish()], marker)?;
+                    let decode_order_number = decode_order_number.or(fragment.decode_order_number);
+                    completed = self.assembler.push(
+                        ts,
+                        decode_order_number,
+                        vec![fragment.finish()],
+                        marker,
+                    )?;
                 }
                 completed
             }
             50 => return Err(Error::Invalid("unsupported HEVC PACI packet")),
             _ => {
                 self.fragment = None;
-                self.assembler.push(ts, vec![payload.to_vec()], marker)?
+                self.assembler
+                    .push(ts, None, vec![payload.to_vec()], marker)?
             }
         };
         Ok(completed)
@@ -1155,6 +1254,7 @@ mod tests {
             .push(&second)
             .expect("push")
             .expect("frame completes");
+        assert_eq!(frame.decode_order_number, Some(0x1234));
         assert_eq!(frame.nal_units, vec![nal.to_vec()]);
     }
 
@@ -1207,6 +1307,7 @@ mod tests {
             .push(&RtpPacket::parse(&fragment_end).expect("FU end"))
             .expect("push FU end")
             .expect("frame");
+        assert_eq!(frame.decode_order_number, Some(0x1234));
         assert_eq!(
             frame.nal_units,
             vec![
@@ -1255,6 +1356,7 @@ mod tests {
         let datagram = rtp(10, 4000, true, &payload);
         let packet = RtpPacket::parse(&datagram).expect("parses");
         let frame = depacketizer.push(&packet).expect("push").expect("frame");
+        assert_eq!(frame.decode_order_number, Some(0x1234));
         assert_eq!(
             frame.nal_units,
             vec![sps.to_vec(), pps.to_vec(), idr.to_vec()]

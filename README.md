@@ -53,8 +53,19 @@ High-performance mode advertises AVC (`1010`) as the preferred encoding, sends
 the media-stream offer, and decodes the negotiated video with macOS
 VideoToolbox or Windows Media Foundation Transforms. Keyboard, pointer,
 clipboard, and session control stay on the encrypted TCP RFB channel while
-video uses the negotiated UDP/RTP stream. Other platforms silently fall back
-to adaptive MVS until a native AVC decoder backend is available.
+video uses the negotiated UDP/RTP stream. This mode is strict: it does not
+advertise MVS/zlib as a visual fallback, ignores RFB visual rectangles while
+AVC negotiation is pending, and reports an explicit error on unsupported
+platforms or negotiation failure.
+
+The four native media SSRCs are decoded in their shared DON/DONL order, with
+legitimate sparse bands preserved. UDP receive runs independently of hardware
+decode so bitrate bursts cannot starve the socket. Fixed logical modes request
+their exact 2x physical framebuffer from the initial update request onward;
+decoded dimensions and codec padding are validated rather than scaled or
+arbitrarily cropped. The optional performance HUD exposes RTP reassembly, DON
+reorder, receive/decode/render-command timing, input queue/write latency, and
+requested-versus-decoded resolution.
 
 For a remote Mac behind explicit port forwarding, the connection form accepts
 independent external UDP overrides for audio, primary video, and secondary
@@ -163,8 +174,10 @@ on a VNC library or a native operating-system library.
   clipboard synchronization, live FPS/traffic metrics, and
   Metal/D3D12/Vulkan presentation
 - high-performance AVC media mode (`1010`) with binary-plist negotiation,
-  SRTP/AES-CTR, RTP H.264/HEVC depacketization, macOS VideoToolbox or Windows
-  Media Foundation NV12 decode, and GPU presentation
+  authenticated cipher-suite-5 SRTP/AES-256-CTR, cross-SSRC DON/DONL-ordered
+  H.264/HEVC depacketization, dedicated UDP receive, macOS VideoToolbox or
+  Windows Media Foundation NV12 decode, strict 2x fixed-resolution validation,
+  and GPU presentation
 
 Apple MVS (`1011`) is identified as a distinct codec and is never fed to a VNC
 or zlib decoder. Its two bitstreams, Rice/DCT state, per-tile differential

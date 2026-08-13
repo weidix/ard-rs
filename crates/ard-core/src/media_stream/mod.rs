@@ -11,7 +11,8 @@
 //!    that carries the AVC encoding marker (`1010`) and the UDP base port, and
 //!    later with the negotiator answer (RFBMediaStreamMessage2).
 //! 3. Encoded H.264/HEVC RTP packets arrive on consecutive UDP ports and are
-//!    decrypted (SRTP AES-128-CM) before platform decoding.
+//!    authenticated and decrypted (cipher-suite-5 SRTP AES-256-CTR) before
+//!    platform decoding.
 //!
 //! The module is deliberately isolated from the rectangle pipeline in
 //! [`crate::client`], [`crate::decoder`] and [`crate::mvs`]: it never writes

@@ -1,16 +1,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::i18n::Language;
 use ard_rs::{
-    ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdDisplayConfiguration, ArdKey,
-    ArdNamedKey, ArdScrollWheelEvent, ArdVideoQuality, Framebuffer, MediaUdpPortOverrides,
-    MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
+    ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdDisplayConfiguration,
+    ArdInputMetrics, ArdKey, ArdNamedKey, ArdScrollWheelEvent, ArdVideoQuality, Framebuffer,
+    MediaUdpPortOverrides, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
 };
 use iced::futures::StreamExt;
 use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -25,6 +24,7 @@ const MAX_INPUT_COMMANDS: usize = 128;
 const MAX_RGBA_POOL: usize = 2;
 const MAX_RECONNECT_ATTEMPTS: usize = 5;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MEDIA_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PRECISE_SCROLL_PIXELS_PER_LINE: f64 = 20.0;
 const MAX_SCROLL_CLICKS_PER_EVENT: f64 = 64.0;
 const EMPTY_TILE_SLOT: u32 = u32::MAX;
@@ -95,7 +95,56 @@ pub struct StreamMetrics {
     pub megabits_per_second: f64,
     pub width: u16,
     pub height: u16,
+    pub requested_width: u16,
+    pub requested_height: u16,
+    pub negotiated_width: u32,
+    pub negotiated_height: u32,
     pub gpu_mvs: bool,
+    pub native_nv12: bool,
+    pub avc_timing_valid: bool,
+    pub render_timing_valid: bool,
+    pub packet_reassembly_ms: f64,
+    pub don_reorder_ms: f64,
+    pub release_to_decode_ms: f64,
+    pub receive_to_decode_ms: f64,
+    pub decode_to_render_ms: f64,
+    pub receive_to_render_ms: f64,
+    pub input_to_next_frame_valid: bool,
+    pub input_to_next_frame_ms: f64,
+    pub presentation_scale: f64,
+    pub input_queue_depth: usize,
+    pub input_queue_average_ms: f64,
+    pub input_queue_peak_ms: f64,
+    pub input_write_ms: f64,
+    pub input_write_peak_ms: f64,
+    pub input_coalesced_pointer_moves: u64,
+}
+
+impl StreamMetrics {
+    fn update_input(&mut self, input: ArdInputMetrics) {
+        self.input_queue_depth = input.queue_depth;
+        self.input_queue_average_ms = duration_ms(input.average_queue_delay);
+        self.input_queue_peak_ms = duration_ms(input.peak_queue_delay);
+        self.input_write_ms = duration_ms(input.last_write_duration);
+        self.input_write_peak_ms = duration_ms(input.peak_write_duration);
+        self.input_coalesced_pointer_moves = input.coalesced_pointer_moves;
+    }
+
+    fn update_avc_decode(&mut self, timing: crate::media::AvcFrameTiming) {
+        self.avc_timing_valid = true;
+        self.packet_reassembly_ms = duration_ms(timing.packet_reassembly_duration());
+        self.don_reorder_ms = duration_ms(timing.batch_holdback());
+        self.release_to_decode_ms = duration_ms(timing.decode_duration());
+        self.receive_to_decode_ms = duration_ms(timing.receive_to_decode());
+        if let Some((width, height)) = timing.negotiated_dimensions {
+            self.negotiated_width = width;
+            self.negotiated_height = height;
+        }
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +312,22 @@ impl FrameMailbox {
         if self.rgba_pool.len() < MAX_RGBA_POOL {
             self.rgba_pool.push(buffer);
         }
+    }
+
+    pub(crate) fn record_avc_render_encoding(
+        &mut self,
+        timing: crate::media::AvcFrameTiming,
+        presentation_scale: f64,
+    ) {
+        let submitted_at = Instant::now();
+        self.metrics.update_avc_decode(timing);
+        self.metrics.render_timing_valid = true;
+        self.metrics.decode_to_render_ms =
+            duration_ms(submitted_at.saturating_duration_since(timing.decoded_at));
+        self.metrics.receive_to_render_ms =
+            duration_ms(submitted_at.saturating_duration_since(timing.first_packet_received_at));
+        self.metrics.presentation_scale = presentation_scale;
+        self.metrics_dirty = true;
     }
 }
 
@@ -452,7 +517,18 @@ impl SessionRuntime {
             if let Ok(mut mailbox) = mailbox.lock() {
                 match result {
                     Ok(frame) => {
+                        let width = u16::try_from(frame.width).unwrap_or(u16::MAX);
+                        let height = u16::try_from(frame.height).unwrap_or(u16::MAX);
+                        let timing = frame.timing;
                         mailbox.replace_latest(FramePacket::from_nv12(frame, quality));
+                        mailbox.metrics.width = width;
+                        mailbox.metrics.height = height;
+                        mailbox.metrics.native_nv12 = true;
+                        mailbox.metrics.gpu_mvs = false;
+                        if let Some(timing) = timing {
+                            mailbox.metrics.update_avc_decode(timing);
+                        }
+                        mailbox.metrics_dirty = true;
                         if render_failed {
                             mailbox.push_event(SessionEvent::RenderRecovered);
                             render_failed = false;
@@ -487,13 +563,22 @@ fn run_receiver(
 ) {
     let mut reconnecting = false;
     let mut attempts = 0;
-    let requested_quality = if !cfg!(any(target_os = "macos", target_os = "windows"))
-        && config.quality.is_high_performance()
-    {
-        ArdVideoQuality::Adaptive
-    } else {
-        config.quality
-    };
+    let requested_quality = config.quality;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    if requested_quality.is_high_performance() {
+        push_event(
+            &mailbox,
+            &frame_wake,
+            SessionEvent::State(ConnectionState::Failed(
+                "当前平台没有 AVC/HEVC 硬件解码器；已拒绝改用其他画质模式".into(),
+            )),
+        );
+        return;
+    }
+    let requested_dimensions = config
+        .display_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.single_backing_dimensions().ok().flatten());
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut avc_stop: Option<Arc<AtomicBool>> = None;
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -541,12 +626,26 @@ fn run_receiver(
         };
         attempts = 0;
         reconnecting = true;
+        let media_negotiation_started = Instant::now();
+        if requested_quality.is_high_performance()
+            && let Err(error) = client.set_event_read_timeout(Some(MEDIA_NEGOTIATION_TIMEOUT))
+        {
+            push_event(
+                &mailbox,
+                &frame_wake,
+                SessionEvent::State(ConnectionState::Failed(format!(
+                    "无法设置高性能媒体协商超时：{error}"
+                ))),
+            );
+            return;
+        }
+        let session_input = client.input();
         push_event(
             &mailbox,
             &frame_wake,
             SessionEvent::Connected {
                 server_name: client.server_name().to_owned(),
-                input: client.input(),
+                input: session_input.clone(),
             },
         );
         push_event(
@@ -569,23 +668,50 @@ fn run_receiver(
             }
             match client.next_event() {
                 Ok(ArdClientEvent::Frame(info)) => {
+                    if requested_quality.is_high_performance() {
+                        if media_negotiation_started.elapsed() >= MEDIA_NEGOTIATION_TIMEOUT && {
+                            #[cfg(any(target_os = "macos", target_os = "windows"))]
+                            {
+                                avc_worker.is_none()
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                            {
+                                true
+                            }
+                        } {
+                            push_event(
+                                &mailbox,
+                                &frame_wake,
+                                SessionEvent::State(ConnectionState::Failed(
+                                    "高性能 AVC/HEVC 媒体流协商在 5 秒内未完成；已拒绝回退到 MVS/RFB 画面"
+                                        .into(),
+                                )),
+                            );
+                            return;
+                        }
+                        // Encoding 1010 control and DesktopSize rectangles
+                        // may arrive as RFB frame events. Never present their
+                        // MVS/zlib contents as the selected AVC mode.
+                        continue;
+                    }
                     let gpu_mvs =
                         queue_frame(&mailbox, &frame_wake, &mut client, requested_quality);
-                    let metrics = meter.record(
-                        info.framebuffer_updates,
-                        info.wire_bytes,
-                        client.framebuffer().width(),
-                        client.framebuffer().height(),
-                        gpu_mvs,
-                    );
+                    let rate = meter.record(info.framebuffer_updates, info.wire_bytes);
+                    let input_metrics = session_input.metrics();
                     if let Ok(mut mailbox) = mailbox.lock() {
-                        if let Some(metrics) = metrics {
-                            mailbox.metrics = metrics;
-                        } else {
-                            mailbox.metrics.width = client.framebuffer().width();
-                            mailbox.metrics.height = client.framebuffer().height();
-                            mailbox.metrics.gpu_mvs = gpu_mvs;
+                        if let Some(rate) = rate {
+                            mailbox.metrics.frames_per_second = rate.frames_per_second;
+                            mailbox.metrics.megabits_per_second = rate.megabits_per_second;
                         }
+                        mailbox.metrics.width = client.framebuffer().width();
+                        mailbox.metrics.height = client.framebuffer().height();
+                        mailbox.metrics.gpu_mvs = gpu_mvs;
+                        mailbox.metrics.native_nv12 = false;
+                        if let Some((width, height)) = requested_dimensions {
+                            mailbox.metrics.requested_width = width;
+                            mailbox.metrics.requested_height = height;
+                        }
+                        mailbox.metrics.update_input(input_metrics);
                         mailbox.metrics_dirty = true;
                     }
                 }
@@ -595,6 +721,16 @@ fn run_receiver(
                 Ok(ArdClientEvent::MediaStream(media)) => {
                     #[cfg(any(target_os = "macos", target_os = "windows"))]
                     {
+                        if let Err(error) = client.set_event_read_timeout(None) {
+                            push_event(
+                                &mailbox,
+                                &frame_wake,
+                                SessionEvent::State(ConnectionState::Failed(format!(
+                                    "无法恢复媒体会话读取超时：{error}"
+                                ))),
+                            );
+                            return;
+                        }
                         if let Some(stop) = avc_stop.take() {
                             stop.store(true, Ordering::Release);
                         }
@@ -605,19 +741,14 @@ fn run_receiver(
                         let pipeline_stop = Arc::clone(&stop);
                         let pipeline_mailbox = Arc::clone(&mailbox);
                         let pipeline_wake = Arc::clone(&frame_wake);
-                        // RFB ServerInit still describes the old physical
-                        // display while the 0x1d reconfiguration is being
-                        // applied. In fixed mode, the AVC stream switches to
-                        // the selected mode's native 2x backing immediately,
-                        // so use that protocol-defined size instead of the
-                        // stale handshake snapshot. A width mismatch remains
-                        // a hard pipeline error; this does not conceal a
-                        // rejected display request.
-                        let target_dimensions = config
-                            .display_configuration
-                            .as_ref()
-                            .and_then(|configuration| configuration.displays.first())
-                            .and_then(|display| display.backing_dimensions().ok())
+                        let pipeline_input = session_input.clone();
+                        // A single fixed display has an exact protocol-defined
+                        // 2x backing size. Auto and server-arranged multi-
+                        // display layouts use the latest authoritative RFB
+                        // framebuffer dimensions. The compositor still
+                        // rejects any decoded mismatch instead of cropping.
+                        let target_dimensions = requested_dimensions
+                            .map(|(width, height)| (u32::from(width), u32::from(height)))
                             .unwrap_or_else(|| {
                                 (
                                     u32::from(client.framebuffer().width()),
@@ -626,6 +757,8 @@ fn run_receiver(
                             });
                         let mut media_meter = RateMeter::new();
                         let mut render_failed = false;
+                        let mut measured_user_input_record =
+                            pipeline_input.metrics().user_input_records_written;
                         let handle = crate::media::spawn_avc_video_pipeline(
                             *media,
                             target_dimensions,
@@ -650,24 +783,47 @@ fn run_receiver(
                                     };
                                     let width = u16::try_from(frame.width).unwrap_or(u16::MAX);
                                     let height = u16::try_from(frame.height).unwrap_or(u16::MAX);
-                                    let metrics = media_meter.record(
-                                        1,
-                                        frame.encoded_bytes,
-                                        width,
-                                        height,
-                                        false,
-                                    );
+                                    let timing = frame.timing;
+                                    let rate = media_meter.record(1, frame.encoded_bytes);
+                                    let input_metrics = pipeline_input.metrics();
                                     mailbox.replace_latest(FramePacket::from_nv12(
                                         frame,
                                         requested_quality,
                                     ));
-                                    if let Some(metrics) = metrics {
-                                        mailbox.metrics = metrics;
-                                    } else {
-                                        mailbox.metrics.width = width;
-                                        mailbox.metrics.height = height;
-                                        mailbox.metrics.gpu_mvs = false;
+                                    if let Some(rate) = rate {
+                                        mailbox.metrics.frames_per_second = rate.frames_per_second;
+                                        mailbox.metrics.megabits_per_second =
+                                            rate.megabits_per_second;
                                     }
+                                    mailbox.metrics.width = width;
+                                    mailbox.metrics.height = height;
+                                    mailbox.metrics.gpu_mvs = false;
+                                    mailbox.metrics.native_nv12 = true;
+                                    if let Some((requested_width, requested_height)) =
+                                        requested_dimensions
+                                    {
+                                        mailbox.metrics.requested_width = requested_width;
+                                        mailbox.metrics.requested_height = requested_height;
+                                    }
+                                    if let Some(timing) = timing {
+                                        mailbox.metrics.update_avc_decode(timing);
+                                        if input_metrics.user_input_records_written
+                                            > measured_user_input_record
+                                            && let Some(written_at) =
+                                                input_metrics.last_user_input_completed_at
+                                            && timing.first_packet_received_at >= written_at
+                                        {
+                                            mailbox.metrics.input_to_next_frame_valid = true;
+                                            mailbox.metrics.input_to_next_frame_ms = duration_ms(
+                                                timing
+                                                    .first_packet_received_at
+                                                    .saturating_duration_since(written_at),
+                                            );
+                                            measured_user_input_record =
+                                                input_metrics.user_input_records_written;
+                                        }
+                                    }
+                                    mailbox.metrics.update_input(input_metrics);
                                     mailbox.metrics_dirty = true;
                                 }
                                 pipeline_wake.notify();
@@ -685,13 +841,30 @@ fn run_receiver(
                         push_event(
                             &mailbox,
                             &frame_wake,
-                            SessionEvent::RenderFailed("当前平台没有可用的 AVC 硬件解码器".into()),
+                            SessionEvent::State(ConnectionState::Failed(
+                                "当前平台没有 AVC/HEVC 硬件解码器；已拒绝改用其他画质模式".into(),
+                            )),
                         );
+                        return;
                     }
                 }
                 Ok(ArdClientEvent::Bell | ArdClientEvent::StateChange) => {}
                 Ok(ArdClientEvent::Reconnected) => unreachable!("automatic reconnect is disabled"),
                 Err(error) => {
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    if requested_quality.is_high_performance()
+                        && avc_worker.is_none()
+                        && media_negotiation_started.elapsed() >= MEDIA_NEGOTIATION_TIMEOUT
+                    {
+                        push_event(
+                            &mailbox,
+                            &frame_wake,
+                            SessionEvent::State(ConnectionState::Failed(
+                                "高性能 AVC/HEVC 媒体流协商超时；已拒绝回退到 MVS/RFB 画面".into(),
+                            )),
+                        );
+                        return;
+                    }
                     #[cfg(any(target_os = "macos", target_os = "windows"))]
                     if let Some(stop) = avc_stop.take() {
                         stop.store(true, Ordering::Release);
@@ -804,6 +977,12 @@ struct RateMeter {
     wire_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RateSample {
+    frames_per_second: f64,
+    megabits_per_second: f64,
+}
+
 impl RateMeter {
     fn new() -> Self {
         Self {
@@ -813,14 +992,7 @@ impl RateMeter {
         }
     }
 
-    fn record(
-        &mut self,
-        updates: usize,
-        wire_bytes: usize,
-        width: u16,
-        height: u16,
-        gpu_mvs: bool,
-    ) -> Option<StreamMetrics> {
+    fn record(&mut self, updates: usize, wire_bytes: usize) -> Option<RateSample> {
         self.updates = self.updates.saturating_add(updates);
         self.wire_bytes = self.wire_bytes.saturating_add(wire_bytes);
         let elapsed = self.started.elapsed();
@@ -828,17 +1000,14 @@ impl RateMeter {
             return None;
         }
         let seconds = elapsed.as_secs_f64();
-        let metrics = StreamMetrics {
+        let sample = RateSample {
             frames_per_second: self.updates as f64 / seconds,
             megabits_per_second: self.wire_bytes as f64 * 8.0 / seconds / 1_000_000.0,
-            width,
-            height,
-            gpu_mvs,
         };
         self.started = Instant::now();
         self.updates = 0;
         self.wire_bytes = 0;
-        Some(metrics)
+        Some(sample)
     }
 }
 
@@ -1326,6 +1495,7 @@ impl Default for InputState {
 #[derive(Debug)]
 pub(crate) enum InputCommand {
     Key { pressed: bool, keysym: u32 },
+    PointerMotion { mask: u8, x: u16, y: u16 },
     Pointer { mask: u8, x: u16, y: u16 },
     PointerBatch(Vec<(u8, u16, u16)>),
     Scroll(ArdScrollWheelEvent),
@@ -1334,14 +1504,95 @@ pub(crate) enum InputCommand {
 
 #[derive(Debug)]
 struct InputDispatcher {
-    sender: SyncSender<InputCommand>,
+    queue: Arc<InputCommandQueue>,
     input: Arc<Mutex<Option<ArdClientInput>>>,
     error: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Debug, Default)]
+struct InputCommandQueueState {
+    commands: VecDeque<InputCommand>,
+    stopped: bool,
+}
+
+#[derive(Debug, Default)]
+struct InputCommandQueue {
+    state: Mutex<InputCommandQueueState>,
+    available: Condvar,
+}
+
+impl InputCommandQueue {
+    fn submit(&self, command: InputCommand) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.stopped {
+            return Err("远程输入调度器已停止".to_owned());
+        }
+        if matches!(&command, InputCommand::PointerMotion { .. })
+            && state
+                .commands
+                .back()
+                .is_some_and(|queued| matches!(queued, InputCommand::PointerMotion { .. }))
+        {
+            *state.commands.back_mut().expect("queue back checked") = command;
+            return Ok(());
+        }
+        let supersedes_pointer_motion = matches!(
+            &command,
+            InputCommand::Pointer { .. } | InputCommand::PointerBatch(_) | InputCommand::Scroll(_)
+        );
+        if supersedes_pointer_motion
+            && state
+                .commands
+                .back()
+                .is_some_and(|queued| matches!(queued, InputCommand::PointerMotion { .. }))
+        {
+            state.commands.pop_back();
+        }
+        if state.commands.len() >= MAX_INPUT_COMMANDS {
+            return Err("远程输入缓存已满".to_owned());
+        }
+        state.commands.push_back(command);
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn receive(&self) -> Option<InputCommand> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while state.commands.is_empty() && !state.stopped {
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        state.commands.pop_front()
+    }
+
+    fn clear(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.commands.clear();
+        }
+    }
+
+    fn stop(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stopped = true;
+            state.commands.clear();
+        }
+        self.available.notify_all();
+    }
+}
+
 impl InputDispatcher {
     fn new() -> Self {
-        let (sender, receiver) = sync_channel(MAX_INPUT_COMMANDS);
+        let queue = Arc::new(InputCommandQueue::default());
+        let worker_queue = Arc::clone(&queue);
         let input: Arc<Mutex<Option<ArdClientInput>>> = Arc::new(Mutex::new(None));
         let worker_input = Arc::clone(&input);
         let error = Arc::new(Mutex::new(None));
@@ -1349,12 +1600,19 @@ impl InputDispatcher {
         thread::Builder::new()
             .name("ard-input-dispatch".into())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
+                while let Some(command) = worker_queue.receive() {
                     let input = worker_input.lock().ok().and_then(|input| input.clone());
                     let result = match command {
                         InputCommand::Key { pressed, keysym } => {
                             if let Some(input) = &input {
                                 input.send_key_event(pressed, keysym)
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        InputCommand::PointerMotion { mask, x, y } => {
+                            if let Some(input) = &input {
+                                input.send_pointer_motion(mask, x, y)
                             } else {
                                 Ok(())
                             }
@@ -1397,13 +1655,14 @@ impl InputDispatcher {
             })
             .expect("ARD input dispatcher should start");
         Self {
-            sender,
+            queue,
             input,
             error,
         }
     }
 
     fn set_input(&self, input: Option<ArdClientInput>) {
+        self.queue.clear();
         if let Ok(mut current) = self.input.lock() {
             *current = input;
         }
@@ -1416,10 +1675,13 @@ impl InputDispatcher {
         if let Some(error) = self.error.lock().ok().and_then(|mut error| error.take()) {
             return Err(error);
         }
-        self.sender.try_send(command).map_err(|error| match error {
-            TrySendError::Full(_) => "远程输入缓存已满".to_owned(),
-            TrySendError::Disconnected(_) => "远程输入调度器已停止".to_owned(),
-        })
+        self.queue.submit(command)
+    }
+}
+
+impl Drop for InputDispatcher {
+    fn drop(&mut self) {
+        self.queue.stop();
     }
 }
 
@@ -1465,8 +1727,14 @@ impl InputState {
         match event {
             InputEvent::CursorMoved(position) => {
                 self.cursor = position;
-                if let (Some(input), Some((x, y))) = (&self.input, position) {
-                    let _ = input.try_send_pointer_event(self.button_mask, x, y);
+                if self.input.is_some()
+                    && let Some((x, y)) = position
+                {
+                    self.dispatcher.submit(InputCommand::PointerMotion {
+                        mask: self.button_mask,
+                        x,
+                        y,
+                    })?;
                 }
             }
             InputEvent::ButtonPressed(button) => self.handle_button(button, true)?,
@@ -2218,6 +2486,7 @@ mod tests {
                     matrix: crate::media::YuvMatrix::Bt709,
                 },
             }],
+            timing: None,
         };
         let mut mailbox = FrameMailbox::default();
         mailbox.replace_latest(FramePacket::from_nv12(
@@ -2503,5 +2772,79 @@ mod tests {
             )
             .unwrap();
         assert!(input.paste_suppressed.is_empty());
+    }
+
+    #[test]
+    fn viewer_input_queue_coalesces_only_adjacent_pointer_motion() {
+        let queue = InputCommandQueue::default();
+        for x in 0_u16..1_000 {
+            queue
+                .submit(InputCommand::PointerMotion { mask: 0, x, y: 7 })
+                .expect("motion state should coalesce");
+        }
+        assert_eq!(queue.state.lock().expect("queue").commands.len(), 1);
+        assert!(matches!(
+            queue.receive(),
+            Some(InputCommand::PointerMotion { x: 999, y: 7, .. })
+        ));
+    }
+
+    #[test]
+    fn viewer_input_queue_preserves_reliable_barriers_and_button_order() {
+        let queue = InputCommandQueue::default();
+        queue
+            .submit(InputCommand::PointerMotion {
+                mask: 0,
+                x: 10,
+                y: 20,
+            })
+            .expect("initial motion");
+        queue
+            .submit(InputCommand::Key {
+                pressed: true,
+                keysym: 0x61,
+            })
+            .expect("key barrier");
+        queue
+            .submit(InputCommand::PointerMotion {
+                mask: 0,
+                x: 30,
+                y: 40,
+            })
+            .expect("new motion");
+        queue
+            .submit(InputCommand::Pointer {
+                mask: 1,
+                x: 30,
+                y: 40,
+            })
+            .expect("button press");
+        queue
+            .submit(InputCommand::Pointer {
+                mask: 0,
+                x: 30,
+                y: 40,
+            })
+            .expect("button release");
+
+        assert!(matches!(
+            queue.receive(),
+            Some(InputCommand::PointerMotion { x: 10, y: 20, .. })
+        ));
+        assert!(matches!(
+            queue.receive(),
+            Some(InputCommand::Key {
+                pressed: true,
+                keysym: 0x61
+            })
+        ));
+        assert!(matches!(
+            queue.receive(),
+            Some(InputCommand::Pointer { mask: 1, .. })
+        ));
+        assert!(matches!(
+            queue.receive(),
+            Some(InputCommand::Pointer { mask: 0, .. })
+        ));
     }
 }

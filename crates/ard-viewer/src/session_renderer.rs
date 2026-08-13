@@ -116,7 +116,11 @@ impl shader::Primitive for RemotePrimitive {
             .and_then(|mut mailbox| mailbox.latest.take());
         let Some(mut frame) = frame else { return };
         let native_upload = frame.nv12.is_some();
+        let avc_timing = frame.nv12.as_ref().and_then(|frame| frame.timing);
         let uploaded = pipeline.upload(&mut frame);
+        if let Ok(mut pending) = pipeline.pending_avc_timing.lock() {
+            *pending = uploaded.then_some(avc_timing).flatten();
+        }
         if native_upload
             && !uploaded
             && let Ok(mut mailbox) = self.mailbox.lock()
@@ -193,6 +197,7 @@ pub struct RemotePipeline {
     uploaded_mvs_tiles: Option<TileSet>,
     mvs_bind_group: Option<wgpu::BindGroup>,
     pending_mvs_decode: Mutex<Option<u32>>,
+    pending_avc_timing: Mutex<Option<crate::media::AvcFrameTiming>>,
     mailbox: Option<SharedMailbox>,
     bounds: Rectangle,
     zoom: f32,
@@ -444,6 +449,7 @@ impl shader::Pipeline for RemotePipeline {
             uploaded_mvs_tiles: None,
             mvs_bind_group: None,
             pending_mvs_decode: Mutex::new(None),
+            pending_avc_timing: Mutex::new(None),
             mailbox: None,
             bounds: Rectangle::default(),
             zoom: 1.0,
@@ -467,6 +473,9 @@ impl RemotePipeline {
         self.uploaded_mvs_tiles = None;
         self.mvs_bind_group = None;
         if let Ok(mut pending) = self.pending_mvs_decode.lock() {
+            *pending = None;
+        }
+        if let Ok(mut pending) = self.pending_avc_timing.lock() {
             *pending = None;
         }
     }
@@ -993,6 +1002,19 @@ impl RemotePipeline {
             );
         }
         pass.draw(0..3, 0..1);
+        drop(pass);
+        let timing = self
+            .pending_avc_timing
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take());
+        if let Some(timing) = timing
+            && let Some(mailbox) = &self.mailbox
+            && let Ok(mut mailbox) = mailbox.lock()
+        {
+            let scale = f64::from(viewport.width) / f64::from(frame_width);
+            mailbox.record_avc_render_encoding(timing, scale);
+        }
     }
 }
 
@@ -1220,6 +1242,7 @@ mod tests {
                         },
                     })
                     .collect(),
+                timing: None,
             },
             ArdVideoQuality::HighPerformanceAvc,
         ));

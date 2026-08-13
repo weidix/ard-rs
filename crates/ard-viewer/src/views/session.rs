@@ -101,6 +101,7 @@ fn remote_canvas(
         ));
 
     let progress = connection_progress(app);
+    let performance_hud = performance_hud(app, is_dark);
 
     let ime_sink = container(
         text_input("", &app.ime_sink)
@@ -119,6 +120,7 @@ fn remote_canvas(
             base,
             fullscreen_session_toolbar(app, is_dark),
             progress,
+            performance_hud,
             ime_sink
         ]
         .width(Fill)
@@ -126,12 +128,154 @@ fn remote_canvas(
         .clip(true)
         .into()
     } else {
-        stack![base, progress, ime_sink]
+        stack![base, progress, performance_hud, ime_sink]
             .width(Fill)
             .height(Fill)
             .clip(true)
             .into()
     }
+}
+
+fn performance_hud(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {
+    if !app.show_performance_hud {
+        return space().into();
+    }
+    let metrics = app.session_metrics;
+    let requested = if metrics.requested_width == 0 || metrics.requested_height == 0 {
+        if app.language == crate::i18n::Language::English {
+            "auto/server".to_owned()
+        } else {
+            "自动/服务器".to_owned()
+        }
+    } else {
+        format!("{}×{}", metrics.requested_width, metrics.requested_height)
+    };
+    let actual = if metrics.width == 0 || metrics.height == 0 {
+        "—".to_owned()
+    } else {
+        format!("{}×{}", metrics.width, metrics.height)
+    };
+    let resolution_state = if metrics.requested_width == 0
+        || metrics.requested_height == 0
+        || metrics.width == 0
+        || metrics.height == 0
+    {
+        ""
+    } else if metrics.width == metrics.requested_width && metrics.height == metrics.requested_height
+    {
+        " ✓"
+    } else {
+        " ✗"
+    };
+    let negotiated = if metrics.negotiated_width == 0 || metrics.negotiated_height == 0 {
+        "—".to_owned()
+    } else {
+        format!("{}×{}", metrics.negotiated_width, metrics.negotiated_height)
+    };
+    let scale = if metrics.presentation_scale > 0.0 {
+        format!("{:.3}×", metrics.presentation_scale)
+    } else {
+        "—".to_owned()
+    };
+    let path = if metrics.native_nv12 {
+        "NV12"
+    } else if metrics.gpu_mvs {
+        "MVS/GPU"
+    } else {
+        "RGBA"
+    };
+    let video_latency = if metrics.avc_timing_valid {
+        if app.language == crate::i18n::Language::English {
+            format!(
+                "RTP reassembly {:.2} ms  DON reorder {:.2} ms\nrelease→decode {:.2} ms  receive→decode {:.2} ms",
+                metrics.packet_reassembly_ms,
+                metrics.don_reorder_ms,
+                metrics.release_to_decode_ms,
+                metrics.receive_to_decode_ms,
+            )
+        } else {
+            format!(
+                "RTP 重组 {:.2} ms  DON 排序 {:.2} ms\n释放→解码 {:.2} ms  收包→解码 {:.2} ms",
+                metrics.packet_reassembly_ms,
+                metrics.don_reorder_ms,
+                metrics.release_to_decode_ms,
+                metrics.receive_to_decode_ms,
+            )
+        }
+    } else if app.language == crate::i18n::Language::English {
+        "AVC stage timing —".to_owned()
+    } else {
+        "AVC 阶段耗时 —".to_owned()
+    };
+    let render_latency = if metrics.render_timing_valid {
+        if app.language == crate::i18n::Language::English {
+            format!(
+                "decode→render encode {:.2} ms  receive→render encode {:.2} ms",
+                metrics.decode_to_render_ms, metrics.receive_to_render_ms,
+            )
+        } else {
+            format!(
+                "解码→渲染编码 {:.2} ms  收包→渲染编码 {:.2} ms",
+                metrics.decode_to_render_ms, metrics.receive_to_render_ms,
+            )
+        }
+    } else if app.language == crate::i18n::Language::English {
+        "render encode timing —".to_owned()
+    } else {
+        "渲染编码耗时 —".to_owned()
+    };
+    let input_frame_proxy = if metrics.input_to_next_frame_valid {
+        if app.language == crate::i18n::Language::English {
+            format!(
+                "input flush→next received frame {:.2} ms (non-causal proxy)",
+                metrics.input_to_next_frame_ms
+            )
+        } else {
+            format!(
+                "输入写出→下一收到帧 {:.2} ms（非因果代理值）",
+                metrics.input_to_next_frame_ms
+            )
+        }
+    } else if app.language == crate::i18n::Language::English {
+        "input flush→next received frame —".to_owned()
+    } else {
+        "输入写出→下一收到帧 —".to_owned()
+    };
+    let label = if app.language == crate::i18n::Language::English {
+        format!(
+            "source {actual}  requested {requested}{resolution_state}  negotiated {negotiated}\ndisplay {scale}  {path}  {:.1} fps  {:.2} Mb/s\n{video_latency}\n{render_latency}\n{input_frame_proxy}\ninput queue avg {:.2} / peak {:.2} ms  depth {}\nTCP encode/write latest {:.2} / peak {:.2} ms  coalesced {}",
+            metrics.frames_per_second,
+            metrics.megabits_per_second,
+            metrics.input_queue_average_ms,
+            metrics.input_queue_peak_ms,
+            metrics.input_queue_depth,
+            metrics.input_write_ms,
+            metrics.input_write_peak_ms,
+            metrics.input_coalesced_pointer_moves,
+        )
+    } else {
+        format!(
+            "源图像 {actual}  请求 {requested}{resolution_state}  协商声明 {negotiated}\n显示比例 {scale}  {path}  {:.1} fps  {:.2} Mb/s\n{video_latency}\n{render_latency}\n{input_frame_proxy}\n输入队列 平均 {:.2} / 峰值 {:.2} ms  深度 {}\nTCP 编码/写入 最近 {:.2} / 峰值 {:.2} ms  位置合并 {}",
+            metrics.frames_per_second,
+            metrics.megabits_per_second,
+            metrics.input_queue_average_ms,
+            metrics.input_queue_peak_ms,
+            metrics.input_queue_depth,
+            metrics.input_write_ms,
+            metrics.input_write_peak_ms,
+            metrics.input_coalesced_pointer_moves,
+        )
+    };
+    let panel = container(text(label).size(10).color(theme::palette().text))
+        .padding(10)
+        .style(theme::toolbar_glass(is_dark, 8.0.into()));
+    container(panel)
+        .width(Fill)
+        .height(Fill)
+        .padding(12)
+        .align_x(Alignment::End)
+        .align_y(Alignment::End)
+        .into()
 }
 
 fn fullscreen_session_toolbar(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> {

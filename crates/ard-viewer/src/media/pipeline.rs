@@ -3,20 +3,289 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ard_rs::ArdMediaStream;
 use ard_rs::media_stream::UdpStreamKind;
-use ard_rs::media_stream::udp::{AVC_VIDEO_SLICE_COUNT, AvcStreamCrypto, AvcVideoStreamReceiver};
+use ard_rs::media_stream::udp::{
+    AVC_VIDEO_SLICE_COUNT, AvcFrameBatch, AvcStreamCrypto, AvcVideoStreamReceiver,
+};
 
 #[cfg(target_os = "windows")]
 use super::mft::MftDecoder as PlatformVideoDecoder;
 #[cfg(target_os = "macos")]
 use super::vt::VideoToolboxDecoder as PlatformVideoDecoder;
-use super::{DecodedFrame, DecodedOutput, DecodedSlice, DecodedSliceUpdate, YuvMatrix, YuvRange};
+use super::{
+    AvcFrameTiming, DecodedFrame, DecodedOutput, DecodedSlice, DecodedSliceUpdate, YuvMatrix,
+    YuvRange,
+};
+
+/// Allows VideoToolbox/MFT one bounded startup window to create its hardware
+/// session while UDP continues draining. At 60 Hz this is at most 267 ms;
+/// steady-state queue delay is measured separately and any further growth
+/// resets the prediction chain instead of accumulating seconds of latency.
+const AVC_RECEIVE_QUEUE_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AvcReceiveResetReason {
+    PacketLoss,
+    ConsumerOverrun,
+    DecoderRequested,
+    ReceiverError,
+}
+
+#[derive(Debug)]
+pub(crate) enum AvcReceiveEvent {
+    Frame(AvcFrameBatch),
+    Reset(AvcReceiveResetReason),
+    Error(String),
+}
+
+#[derive(Debug, Default)]
+struct AvcReceiveQueueState {
+    events: VecDeque<AvcReceiveEvent>,
+    closed: bool,
+}
+
+#[derive(Debug, Default)]
+struct AvcReceiveQueue {
+    state: Mutex<AvcReceiveQueueState>,
+    available: Condvar,
+}
+
+impl AvcReceiveQueue {
+    fn push_frame(&self, batch: AvcFrameBatch) -> bool {
+        let mut state = self.state.lock().expect("AVC receive queue poisoned");
+        if state.events.len() >= AVC_RECEIVE_QUEUE_CAPACITY {
+            state.events.clear();
+            state.events.push_back(AvcReceiveEvent::Reset(
+                AvcReceiveResetReason::ConsumerOverrun,
+            ));
+            self.available.notify_one();
+            return false;
+        }
+        state.events.push_back(AvcReceiveEvent::Frame(batch));
+        self.available.notify_one();
+        true
+    }
+
+    fn reset(&self, reason: AvcReceiveResetReason) {
+        let mut state = self.state.lock().expect("AVC receive queue poisoned");
+        state.events.clear();
+        state.events.push_back(AvcReceiveEvent::Reset(reason));
+        self.available.notify_one();
+    }
+
+    fn push_error(&self, error: String) {
+        let mut state = self.state.lock().expect("AVC receive queue poisoned");
+        if state.events.len() >= AVC_RECEIVE_QUEUE_CAPACITY {
+            state.events.pop_front();
+        }
+        state.events.push_back(AvcReceiveEvent::Error(error));
+        self.available.notify_one();
+    }
+
+    fn pop_timeout(&self, timeout: Duration) -> Option<AvcReceiveEvent> {
+        let mut state = self.state.lock().expect("AVC receive queue poisoned");
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(event) = state.events.pop_front() {
+                return Some(event);
+            }
+            if state.closed {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, wait) = self
+                .available
+                .wait_timeout(state, remaining)
+                .expect("AVC receive queue poisoned while waiting");
+            state = next;
+            if wait.timed_out() && state.events.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().expect("AVC receive queue poisoned");
+        state.closed = true;
+        self.available.notify_all();
+    }
+}
+
+#[derive(Debug, Default)]
+struct AvcReceiveAtomicStats {
+    packets_received: AtomicUsize,
+    decrypted_packets: AtomicUsize,
+    heartbeats_sent: AtomicUsize,
+    packet_losses: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AvcReceiveStats {
+    pub packets_received: usize,
+    pub decrypted_packets: usize,
+    pub heartbeats_sent: usize,
+    pub packet_losses: usize,
+}
+
+impl AvcReceiveAtomicStats {
+    fn update(&self, receiver: &AvcVideoStreamReceiver) {
+        self.packets_received
+            .store(receiver.packets_received(), Ordering::Relaxed);
+        self.decrypted_packets
+            .store(receiver.decrypted_packets(), Ordering::Relaxed);
+        self.heartbeats_sent
+            .store(receiver.heartbeats_sent(), Ordering::Relaxed);
+        self.packet_losses
+            .store(receiver.packet_losses(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> AvcReceiveStats {
+        AvcReceiveStats {
+            packets_received: self.packets_received.load(Ordering::Relaxed),
+            decrypted_packets: self.decrypted_packets.load(Ordering::Relaxed),
+            heartbeats_sent: self.heartbeats_sent.load(Ordering::Relaxed),
+            packet_losses: self.packet_losses.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Dedicated UDP/SRTP receive pump. The platform decoder never owns the UDP
+/// read loop, so a compressed-frame burst continues to drain while
+/// VideoToolbox/MFT and the renderer consume the preceding frame. Overflow is
+/// prediction-chain loss: queued dependent frames are cleared and the server
+/// is asked for a real sync frame instead of silently dropping/coalescing one.
+pub(crate) struct AvcReceivePump {
+    queue: Arc<AvcReceiveQueue>,
+    commands: mpsc::Sender<()>,
+    internal_stop: Arc<AtomicBool>,
+    stats: Arc<AvcReceiveAtomicStats>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl AvcReceivePump {
+    pub(crate) fn spawn(
+        mut receiver: AvcVideoStreamReceiver,
+        external_stop: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let queue = Arc::new(AvcReceiveQueue::default());
+        let internal_stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(AvcReceiveAtomicStats::default());
+        let (commands, command_receiver) = mpsc::channel();
+        let thread_queue = Arc::clone(&queue);
+        let thread_stop = Arc::clone(&internal_stop);
+        let thread_stats = Arc::clone(&stats);
+        let join = thread::Builder::new()
+            .name("ard-media-receive".into())
+            .spawn(move || {
+                let mut observed_packet_losses = receiver.packet_losses();
+                while !external_stop.load(Ordering::Relaxed)
+                    && !thread_stop.load(Ordering::Relaxed)
+                {
+                    let mut decoder_requested = command_receiver.try_recv().is_ok();
+                    while command_receiver.try_recv().is_ok() {
+                        decoder_requested = true;
+                    }
+                    if decoder_requested {
+                        thread_queue.reset(AvcReceiveResetReason::DecoderRequested);
+                        if let Err(error) = receiver.request_keyframe() {
+                            thread_queue.push_error(format!("关键帧请求失败：{error}"));
+                        }
+                    }
+
+                    let received = receiver.receive_frame();
+                    thread_stats.update(&receiver);
+                    if receiver.packet_losses() != observed_packet_losses {
+                        observed_packet_losses = receiver.packet_losses();
+                        thread_queue.reset(AvcReceiveResetReason::PacketLoss);
+                    }
+
+                    // A decoder reset may have raced with the blocking UDP
+                    // read. Process it before publishing that read's batch so
+                    // no old dependent frame crosses the reset boundary.
+                    let mut decoder_requested = command_receiver.try_recv().is_ok();
+                    while command_receiver.try_recv().is_ok() {
+                        decoder_requested = true;
+                    }
+                    if decoder_requested {
+                        thread_queue.reset(AvcReceiveResetReason::DecoderRequested);
+                        if let Err(error) = receiver.request_keyframe() {
+                            thread_queue.push_error(format!("关键帧请求失败：{error}"));
+                        }
+                        continue;
+                    }
+
+                    match received {
+                        Ok(Some(batch)) => {
+                            if !thread_queue.push_frame(batch)
+                                && let Err(error) = receiver.request_keyframe()
+                            {
+                                thread_queue.push_error(format!(
+                                    "视频接收队列过载且关键帧请求失败：{error}"
+                                ));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            thread_queue.reset(AvcReceiveResetReason::ReceiverError);
+                            if let Err(feedback_error) = receiver.request_keyframe() {
+                                thread_queue.push_error(format!(
+                                    "AVC RTP/SRTP 接收失败：{error}；关键帧请求失败：{feedback_error}"
+                                ));
+                            } else {
+                                thread_queue
+                                    .push_error(format!("AVC RTP/SRTP 接收失败：{error}"));
+                            }
+                        }
+                    }
+                }
+                thread_stats.update(&receiver);
+                thread_queue.close();
+            })
+            .map_err(|error| format!("无法启动 AVC 网络接收线程：{error}"))?;
+        Ok(Self {
+            queue,
+            commands,
+            internal_stop,
+            stats,
+            join: Some(join),
+        })
+    }
+
+    pub(crate) fn receive_timeout(&self, timeout: Duration) -> Option<AvcReceiveEvent> {
+        self.queue.pop_timeout(timeout)
+    }
+
+    pub(crate) fn request_keyframe(&self) -> Result<(), String> {
+        self.queue.reset(AvcReceiveResetReason::DecoderRequested);
+        self.commands
+            .send(())
+            .map_err(|_| "AVC 网络接收线程已经停止".to_owned())
+    }
+
+    pub(crate) fn stats(&self) -> AvcReceiveStats {
+        self.stats.snapshot()
+    }
+}
+
+impl Drop for AvcReceivePump {
+    fn drop(&mut self) {
+        self.internal_stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
 
 /// Spawn the AVC video receive/decode loop for one stream.
 ///
@@ -49,7 +318,8 @@ pub fn spawn_avc_video_pipeline(
                 on_frame(Err("媒体协商未返回 RTP 负载类型".into()));
                 return;
             };
-            let mut receiver = match AvcVideoStreamReceiver::new(
+            let negotiated_dimensions = codec_config.width.zip(codec_config.height);
+            let receiver = match AvcVideoStreamReceiver::new(
                 &endpoints,
                 UdpStreamKind::Video1,
                 AvcStreamCrypto {
@@ -74,24 +344,27 @@ pub fn spawn_avc_video_pipeline(
             // receive/decode thread.
             key_blob.fill(0);
             feedback_key_blob.fill(0);
-            // The four SSRCs are one serial reference chain. The receiver
-            // schedules completed access units by timestamp and slice index,
-            // matching AVConference's interleaved-stream scheduler.
+            let receive_pump = match AvcReceivePump::spawn(receiver, Arc::clone(&stop)) {
+                Ok(pump) => pump,
+                Err(error) => {
+                    on_frame(Err(error));
+                    return;
+                }
+            };
+            // The four SSRCs are one serial reference chain. The dedicated
+            // receive pump drains UDP continuously and schedules access units
+            // by the native global DON/DONL order.
             let mut decoder = PlatformVideoDecoder::new(codec);
             let mut compositor = SliceCompositor::new(target_dimensions);
-            let mut observed_packet_losses = receiver.packet_losses();
             let mut last_frame = Instant::now();
             const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
             while !stop.load(Ordering::Relaxed) {
-                let received = receiver.receive_frame();
-                if receiver.packet_losses() != observed_packet_losses {
-                    observed_packet_losses = receiver.packet_losses();
-                    decoder.require_sync();
-                    compositor.reset();
-                }
-                match received {
-                    Ok(Some(batch)) => {
+                match receive_pump.receive_timeout(Duration::from_millis(20)) {
+                    Some(AvcReceiveEvent::Frame(batch)) => {
                         let timestamp = batch.timestamp;
+                        let first_packet_received_at = batch.first_packet_received_at;
+                        let first_access_unit_completed_at = batch.first_access_unit_completed_at;
+                        let batch_released_at = batch.released_at;
                         let mut outputs = Vec::with_capacity(batch.access_units.len());
                         let mut failure = None;
                         for (slice_index, unit) in batch.access_units {
@@ -111,8 +384,15 @@ pub fn spawn_avc_video_pipeline(
                         }
                         if failure.is_none() {
                             match compositor.finish_frame() {
-                                Ok(Some(frame)) => {
+                                Ok(Some(mut frame)) => {
                                     last_frame = Instant::now();
+                                    frame.timing = Some(AvcFrameTiming {
+                                        first_packet_received_at,
+                                        first_access_unit_completed_at,
+                                        batch_released_at,
+                                        decoded_at: last_frame,
+                                        negotiated_dimensions,
+                                    });
                                     on_frame(Ok(frame));
                                 }
                                 Ok(None) => {}
@@ -122,24 +402,36 @@ pub fn spawn_avc_video_pipeline(
                         if let Some(error) = failure {
                             decoder.require_sync();
                             compositor.reset();
-                            if let Err(feedback_error) = receiver.request_keyframe() {
+                            if let Err(feedback_error) = receive_pump.request_keyframe() {
                                 on_frame(Err(format!("{error}；关键帧请求失败：{feedback_error}")));
                             } else {
                                 on_frame(Err(error));
                             }
                         }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
+                    Some(AvcReceiveEvent::Reset(reason)) => {
                         decoder.require_sync();
                         compositor.reset();
-                        on_frame(Err(format!("AVC RTP/SRTP 接收失败：{error}")));
+                        if reason == AvcReceiveResetReason::ConsumerOverrun {
+                            on_frame(Err(
+                                "视频解码消费速度落后于网络接收，预测链已重置并请求真实关键帧"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    Some(AvcReceiveEvent::Error(error)) => {
+                        decoder.require_sync();
+                        compositor.reset();
+                        on_frame(Err(error));
                         if last_frame.elapsed() > IDLE_TIMEOUT {
                             break;
                         }
                     }
+                    None if last_frame.elapsed() > IDLE_TIMEOUT => break,
+                    None => {}
                 }
             }
+            drop(receive_pump);
             let outputs = decoder.flush();
             for error in decoder.take_errors() {
                 on_frame(Err(error));
@@ -264,27 +556,71 @@ impl SliceCompositor {
             return Ok(None);
         };
         let width = first.width;
-        let (target_width, height) = self.target_dimensions;
-        if width != target_width || height == 0 {
+        let (target_width, target_height) = self.target_dimensions;
+        if target_width == 0
+            || target_height == 0
+            || !target_width.is_multiple_of(2)
+            || !target_height.is_multiple_of(2)
+        {
             return Err(format!(
-                "AVC 原生分片尺寸与远端帧缓冲不一致：slice_width={width} framebuffer={target_width}x{height}"
+                "AVC 目标帧缓冲尺寸无效：{target_width}x{target_height}"
             ));
         }
-        let mut remaining_rows = height;
-        let mut remaining_uv_rows = height.div_ceil(2);
+        for (index, metadata) in self.metadata.iter().enumerate() {
+            let Some(metadata) = metadata.as_ref() else {
+                return Ok(None);
+            };
+            if metadata.width != width
+                || metadata.height != first.height
+                || metadata.range != first.range
+                || metadata.matrix != first.matrix
+            {
+                return Err(format!("AVC 分片 {index} 的 NV12 布局或色彩矩阵不一致"));
+            }
+        }
+
+        let encoded_slice_height = first.height;
+        let minimum_slice_height = target_height.div_ceil(AVC_VIDEO_SLICE_COUNT as u32);
+        let aligned_slice_height = minimum_slice_height
+            .checked_add(15)
+            .map(|height| height & !15)
+            .ok_or_else(|| "AVC 分片对齐高度溢出".to_owned())?;
+        // Screen Sharing divides the desktop into four ordered horizontal
+        // SSRC bands. The first three bands occupy the codec-aligned height;
+        // only the fourth band may contain bottom padding. This is observable
+        // in the native stream (for example 2224 = 560*3 + 544 and
+        // 1800 = 464*3 + 408). A decoder-provided clean aperture may instead
+        // make all four bands exactly one quarter high. Accept those two
+        // protocol layouts and reject every arbitrary crop/scale mismatch.
+        let clean_aperture_layout = target_height.is_multiple_of(AVC_VIDEO_SLICE_COUNT as u32)
+            && encoded_slice_height == target_height / AVC_VIDEO_SLICE_COUNT as u32;
+        let codec_aligned_layout = encoded_slice_height == aligned_slice_height;
+        let leading_height = encoded_slice_height
+            .checked_mul((AVC_VIDEO_SLICE_COUNT - 1) as u32)
+            .ok_or_else(|| "AVC 分片总高度溢出".to_owned())?;
+        let last_visible_height = target_height.checked_sub(leading_height);
+        if width != target_width
+            || (!clean_aperture_layout
+                && (!codec_aligned_layout
+                    || last_visible_height
+                        .is_none_or(|height| height == 0 || height > encoded_slice_height)))
+        {
+            let decoded_height = encoded_slice_height.saturating_mul(AVC_VIDEO_SLICE_COUNT as u32);
+            return Err(format!(
+                "服务器 AVC 分片几何与请求分辨率不一致：requested={target_width}x{target_height} decoded_slices={width}x{encoded_slice_height}x{AVC_VIDEO_SLICE_COUNT} decoded_total={width}x{decoded_height} expected_aligned_slice_height={aligned_slice_height}；拒绝任意裁切或缩放伪装成功"
+            ));
+        }
+
+        let mut remaining_uv_rows = target_height.div_ceil(2);
+        let mut remaining_y_rows = target_height;
         let mut y_origin = 0_u32;
         let mut uv_origin = 0_u32;
         let mut layouts = [(0, 0, 0, 0); AVC_VIDEO_SLICE_COUNT];
         let range = first.range;
         let matrix = first.matrix;
         for (index, metadata) in self.metadata.iter().enumerate() {
-            let Some(metadata) = metadata.as_ref() else {
-                return Ok(None);
-            };
-            if metadata.width != width || metadata.range != range || metadata.matrix != matrix {
-                return Err(format!("AVC 分片 {index} 的 NV12 布局或色彩矩阵不一致"));
-            }
-            let rows = metadata.height.min(remaining_rows);
+            let metadata = metadata.as_ref().expect("all slice metadata validated");
+            let rows = metadata.height.min(remaining_y_rows);
             let uv_rows = rows.div_ceil(2).min(remaining_uv_rows);
             layouts[index] = (y_origin, rows, uv_origin, uv_rows);
             y_origin = y_origin
@@ -293,12 +629,12 @@ impl SliceCompositor {
             uv_origin = uv_origin
                 .checked_add(uv_rows)
                 .ok_or_else(|| "AVC 色度分片位置溢出".to_owned())?;
-            remaining_rows -= rows;
+            remaining_y_rows -= rows;
             remaining_uv_rows -= uv_rows;
         }
-        if remaining_rows != 0 || remaining_uv_rows != 0 {
+        if remaining_y_rows != 0 || remaining_uv_rows != 0 {
             return Err(format!(
-                "AVC 四分片未覆盖远端帧缓冲：missing_y={remaining_rows} missing_uv={remaining_uv_rows}"
+                "AVC 四分片未覆盖远端帧缓冲：missing_y={remaining_y_rows} missing_uv={remaining_uv_rows}"
             ));
         }
         let updates = self
@@ -321,11 +657,12 @@ impl SliceCompositor {
         self.dirty = false;
         Ok(Some(DecodedFrame {
             width,
-            height,
+            height: target_height,
             encoded_bytes: std::mem::take(&mut self.pending_encoded_bytes),
             range,
             matrix,
             updates,
+            timing: None,
         }))
     }
 }
@@ -333,6 +670,55 @@ impl SliceCompositor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ard_rs::media_stream::AccessUnit;
+
+    fn compressed_batch(timestamp: u32) -> AvcFrameBatch {
+        let now = Instant::now();
+        AvcFrameBatch {
+            timestamp,
+            access_units: vec![(
+                0,
+                AccessUnit {
+                    timestamp,
+                    decode_order_number: Some(timestamp as u16),
+                    nal_units: vec![vec![0x41]],
+                },
+            )],
+            first_packet_received_at: now,
+            first_access_unit_completed_at: now,
+            released_at: now,
+        }
+    }
+
+    #[test]
+    fn receive_queue_overrun_discards_the_dependent_chain_and_emits_reset() {
+        let queue = AvcReceiveQueue::default();
+        for timestamp in 0..AVC_RECEIVE_QUEUE_CAPACITY as u32 {
+            assert!(queue.push_frame(compressed_batch(timestamp)));
+        }
+        assert!(!queue.push_frame(compressed_batch(999)));
+        assert!(matches!(
+            queue.pop_timeout(Duration::ZERO),
+            Some(AvcReceiveEvent::Reset(
+                AvcReceiveResetReason::ConsumerOverrun
+            ))
+        ));
+        assert!(queue.pop_timeout(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn receive_queue_reset_cannot_leak_an_older_prediction_batch() {
+        let queue = AvcReceiveQueue::default();
+        assert!(queue.push_frame(compressed_batch(1)));
+        queue.reset(AvcReceiveResetReason::DecoderRequested);
+        assert!(matches!(
+            queue.pop_timeout(Duration::ZERO),
+            Some(AvcReceiveEvent::Reset(
+                AvcReceiveResetReason::DecoderRequested
+            ))
+        ));
+        assert!(queue.pop_timeout(Duration::ZERO).is_none());
+    }
 
     fn slice(luma: u8) -> DecodedSlice {
         DecodedSlice {
@@ -406,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn crops_encoded_padding_to_the_rfb_framebuffer_height() {
+    fn rejects_same_width_height_mismatch_instead_of_cropping() {
         let mut compositor = SliceCompositor::new((2, 7));
         for index in 0..AVC_VIDEO_SLICE_COUNT - 1 {
             compositor
@@ -416,14 +802,76 @@ mod tests {
         compositor
             .push(3, 1, Some(two_row_slice(3, 255)))
             .expect("bottom padded slice");
+        let error = compositor
+            .finish_frame()
+            .expect_err("decoded height must not be silently cropped");
+        assert!(error.contains("AVC 目标帧缓冲尺寸无效：2x7"), "{error}");
+    }
+
+    #[test]
+    fn removes_only_proven_bottom_padding_from_the_last_native_slice() {
+        fn padded_slice(index: usize) -> DecodedSlice {
+            let mut frame = DecodedSlice {
+                width: 2,
+                height: 16,
+                y_plane: vec![index as u8; 32],
+                uv_plane: vec![128; 16],
+                range: YuvRange::Video,
+                matrix: YuvMatrix::Bt709,
+            };
+            if index == 3 {
+                frame.y_plane[24..].fill(255);
+            }
+            frame
+        }
+
+        // ceil(60/4)=15, encoded to the observed 16-row codec boundary.
+        // The first three native bands stay 16 rows; only the last contributes
+        // the remaining 12 visible rows.
+        let mut compositor = SliceCompositor::new((2, 60));
+        for index in 0..AVC_VIDEO_SLICE_COUNT {
+            compositor
+                .push(index, 1, Some(padded_slice(index)))
+                .expect("native padded slice");
+        }
         let frame = compositor
             .finish_frame()
-            .expect("valid cropped frame")
-            .expect("the padded bottom slice completes the frame");
-        assert_eq!((frame.width, frame.height), (2, 7));
-        assert_eq!(frame.updates[3].y_origin, 6);
-        assert_eq!(frame.updates[3].y_rows, 1);
-        assert_eq!(frame.updates[3].uv_origin, 3);
-        assert_eq!(frame.updates[3].uv_rows, 1);
+            .expect("validated native padding")
+            .expect("composite");
+        assert_eq!((frame.width, frame.height), (2, 60));
+        assert_eq!(
+            frame
+                .updates
+                .iter()
+                .map(|update| (update.y_origin, update.y_rows))
+                .collect::<Vec<_>>(),
+            vec![(0, 16), (16, 16), (32, 16), (48, 12)]
+        );
+        assert_eq!(frame.updates[3].uv_rows, 6);
+    }
+
+    #[test]
+    fn rejects_a_crop_that_does_not_match_native_codec_alignment() {
+        let mut compositor = SliceCompositor::new((2, 60));
+        for index in 0..AVC_VIDEO_SLICE_COUNT {
+            let frame = DecodedSlice {
+                width: 2,
+                height: 14,
+                y_plane: vec![index as u8; 28],
+                uv_plane: vec![128; 14],
+                range: YuvRange::Video,
+                matrix: YuvMatrix::Bt709,
+            };
+            compositor
+                .push(index, 1, Some(frame))
+                .expect("malformed slice");
+        }
+        let error = compositor
+            .finish_frame()
+            .expect_err("arbitrary undersized slices must fail");
+        assert!(
+            error.contains("expected_aligned_slice_height=16"),
+            "{error}"
+        );
     }
 }

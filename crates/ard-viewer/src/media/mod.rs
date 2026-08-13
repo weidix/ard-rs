@@ -4,6 +4,8 @@
 //! turn access units into displayable native YUV frames. macOS uses
 //! VideoToolbox and Windows uses Media Foundation Transforms (MFT).
 
+use std::time::{Duration, Instant};
+
 #[cfg(target_os = "macos")]
 pub mod vt;
 
@@ -65,6 +67,40 @@ pub struct DecodedFrame {
     pub range: YuvRange,
     pub matrix: YuvMatrix,
     pub updates: Vec<DecodedSliceUpdate>,
+    /// Monotonic timestamps for the live UDP/decode path. Synthetic and
+    /// non-AVC frames deliberately leave this unset.
+    pub timing: Option<AvcFrameTiming>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AvcFrameTiming {
+    pub first_packet_received_at: Instant,
+    pub first_access_unit_completed_at: Instant,
+    pub batch_released_at: Instant,
+    pub decoded_at: Instant,
+    pub negotiated_dimensions: Option<(u32, u32)>,
+}
+
+impl AvcFrameTiming {
+    pub fn packet_reassembly_duration(self) -> Duration {
+        self.first_access_unit_completed_at
+            .saturating_duration_since(self.first_packet_received_at)
+    }
+
+    pub fn batch_holdback(self) -> Duration {
+        self.batch_released_at
+            .saturating_duration_since(self.first_access_unit_completed_at)
+    }
+
+    pub fn decode_duration(self) -> Duration {
+        self.decoded_at
+            .saturating_duration_since(self.batch_released_at)
+    }
+
+    pub fn receive_to_decode(self) -> Duration {
+        self.decoded_at
+            .saturating_duration_since(self.first_packet_received_at)
+    }
 }
 
 /// Platform-neutral outcome for one submitted compressed access unit.
@@ -100,5 +136,8 @@ impl DecodedFrame {
         }
         self.updates.sort_by_key(|update| update.slice_index);
         self.encoded_bytes = self.encoded_bytes.saturating_add(older.encoded_bytes);
+        if self.timing.is_none() {
+            self.timing = older.timing;
+        }
     }
 }
