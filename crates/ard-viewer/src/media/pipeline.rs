@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -355,7 +355,12 @@ pub fn spawn_avc_video_pipeline(
             // receive pump drains UDP continuously and schedules access units
             // by the native global DON/DONL order.
             let mut decoder = PlatformVideoDecoder::new(codec);
-            let mut compositor = SliceCompositor::new(target_dimensions);
+            if let Some(error) = decoder.take_errors().into_iter().next() {
+                on_frame(Err(error));
+                return;
+            }
+            let mut output_assembler =
+                DecoderOutputAssembler::new(target_dimensions, negotiated_dimensions);
             let mut last_frame = Instant::now();
             const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
             while !stop.load(Ordering::Relaxed) {
@@ -365,9 +370,23 @@ pub fn spawn_avc_video_pipeline(
                         let first_packet_received_at = batch.first_packet_received_at;
                         let first_access_unit_completed_at = batch.first_access_unit_completed_at;
                         let batch_released_at = batch.released_at;
+                        let access_unit_count = batch.access_units.len();
                         let mut outputs = Vec::with_capacity(batch.access_units.len());
-                        let mut failure = None;
+                        let mut failure = output_assembler
+                            .register_batch(
+                                timestamp,
+                                access_unit_count,
+                                PendingFrameTiming {
+                                    first_packet_received_at,
+                                    first_access_unit_completed_at,
+                                    batch_released_at,
+                                },
+                            )
+                            .err();
                         for (slice_index, unit) in batch.access_units {
+                            if failure.is_some() {
+                                break;
+                            }
                             outputs.extend(decoder.decode(slice_index, &unit));
                             if let Some(error) = decoder.take_errors().into_iter().next() {
                                 failure = Some(error);
@@ -379,29 +398,19 @@ pub fn spawn_avc_video_pipeline(
                             failure = decoder.take_errors().into_iter().next();
                         }
                         if failure.is_none() {
-                            failure =
-                                apply_decoder_outputs(timestamp, outputs, &mut compositor).err();
-                        }
-                        if failure.is_none() {
-                            match compositor.finish_frame() {
-                                Ok(Some(mut frame)) => {
-                                    last_frame = Instant::now();
-                                    frame.timing = Some(AvcFrameTiming {
-                                        first_packet_received_at,
-                                        first_access_unit_completed_at,
-                                        batch_released_at,
-                                        decoded_at: last_frame,
-                                        negotiated_dimensions,
-                                    });
-                                    on_frame(Ok(frame));
+                            match output_assembler.push(outputs) {
+                                Ok(frames) => {
+                                    for frame in frames {
+                                        last_frame = Instant::now();
+                                        on_frame(Ok(frame));
+                                    }
                                 }
-                                Ok(None) => {}
                                 Err(error) => failure = Some(error),
                             }
                         }
                         if let Some(error) = failure {
                             decoder.require_sync();
-                            compositor.reset();
+                            output_assembler.reset();
                             if let Err(feedback_error) = receive_pump.request_keyframe() {
                                 on_frame(Err(format!("{error}；关键帧请求失败：{feedback_error}")));
                             } else {
@@ -411,7 +420,7 @@ pub fn spawn_avc_video_pipeline(
                     }
                     Some(AvcReceiveEvent::Reset(reason)) => {
                         decoder.require_sync();
-                        compositor.reset();
+                        output_assembler.reset();
                         if reason == AvcReceiveResetReason::ConsumerOverrun {
                             on_frame(Err(
                                 "视频解码消费速度落后于网络接收，预测链已重置并请求真实关键帧"
@@ -421,7 +430,7 @@ pub fn spawn_avc_video_pipeline(
                     }
                     Some(AvcReceiveEvent::Error(error)) => {
                         decoder.require_sync();
-                        compositor.reset();
+                        output_assembler.reset();
                         on_frame(Err(error));
                         if last_frame.elapsed() > IDLE_TIMEOUT {
                             break;
@@ -436,40 +445,156 @@ pub fn spawn_avc_video_pipeline(
             for error in decoder.take_errors() {
                 on_frame(Err(error));
             }
-            if !outputs.is_empty() {
-                on_frame(Err(format!(
-                    "视频解码器停止时仍返回 {} 个未归属 RTP 帧批次的输出",
-                    outputs.len()
-                )));
+            match output_assembler.push(outputs) {
+                Ok(frames) => {
+                    for frame in frames {
+                        on_frame(Ok(frame));
+                    }
+                }
+                Err(error) => on_frame(Err(error)),
             }
         })
         .expect("AVC media pipeline thread should start")
 }
 
-fn apply_decoder_outputs(
-    timestamp: u32,
-    outputs: Vec<DecodedOutput>,
-    compositor: &mut SliceCompositor,
-) -> Result<(), String> {
-    for output in outputs {
-        if output.timestamp != timestamp {
-            return Err(format!(
-                "视频解码输出跨越 RTP 帧边界：expected={timestamp} actual={}",
-                output.timestamp
-            ));
+#[derive(Debug, Clone, Copy)]
+struct PendingFrameTiming {
+    first_packet_received_at: Instant,
+    first_access_unit_completed_at: Instant,
+    batch_released_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingDecodeBatch {
+    expected_outputs: usize,
+    timing: PendingFrameTiming,
+}
+
+struct DecoderOutputAssembler {
+    compositor: SliceCompositor,
+    pending: HashMap<u32, PendingDecodeBatch>,
+    active_timestamp: Option<u32>,
+    active_outputs: usize,
+    negotiated_dimensions: Option<(u32, u32)>,
+}
+
+impl DecoderOutputAssembler {
+    fn new(target_dimensions: (u32, u32), negotiated_dimensions: Option<(u32, u32)>) -> Self {
+        Self {
+            compositor: SliceCompositor::new(target_dimensions),
+            pending: HashMap::new(),
+            active_timestamp: None,
+            active_outputs: 0,
+            negotiated_dimensions,
         }
-        if let Some(error) = output.conversion_error {
-            return Err(error);
-        }
-        if output.status != 0 {
-            return Err(format!(
-                "视频解码失败：status={} flags={:#x}",
-                output.status, output.info_flags
-            ));
-        }
-        compositor.push(output.stream_index, output.encoded_bytes, output.frame)?;
     }
-    Ok(())
+
+    fn register_batch(
+        &mut self,
+        timestamp: u32,
+        expected_outputs: usize,
+        timing: PendingFrameTiming,
+    ) -> Result<(), String> {
+        if expected_outputs == 0 {
+            return Err(format!("AVC 时间戳 {timestamp} 没有 access unit"));
+        }
+        if self.pending.len() >= AVC_RECEIVE_QUEUE_CAPACITY * 4 {
+            return Err("视频解码器延迟超过允许的 RTP 批次数".into());
+        }
+        if self
+            .pending
+            .insert(
+                timestamp,
+                PendingDecodeBatch {
+                    expected_outputs,
+                    timing,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!("重复提交 AVC RTP 时间戳 {timestamp}"));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, outputs: Vec<DecodedOutput>) -> Result<Vec<DecodedFrame>, String> {
+        let mut frames = Vec::new();
+        for output in outputs {
+            if let Some(error) = output.conversion_error {
+                return Err(error);
+            }
+            if output.status != 0 {
+                return Err(format!(
+                    "视频解码失败：status={} flags={:#x}",
+                    output.status, output.info_flags
+                ));
+            }
+            let batch = self
+                .pending
+                .get(&output.timestamp)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "视频解码输出无法对应到已提交的 RTP 批次：timestamp={}",
+                        output.timestamp
+                    )
+                })?;
+            if self
+                .active_timestamp
+                .is_some_and(|timestamp| timestamp != output.timestamp)
+            {
+                return Err(format!(
+                    "视频解码输出在上一 RTP 批次完成前改变时间戳：previous={} previous_outputs={} expected={} actual={}",
+                    self.active_timestamp.expect("checked active timestamp"),
+                    self.active_outputs,
+                    self.pending
+                        .get(&self.active_timestamp.expect("checked active timestamp"))
+                        .map_or(0, |pending| pending.expected_outputs),
+                    output.timestamp,
+                ));
+            }
+            self.active_timestamp = Some(output.timestamp);
+            self.compositor
+                .push(output.stream_index, output.encoded_bytes, output.frame)?;
+            self.active_outputs += 1;
+            if self.active_outputs > batch.expected_outputs {
+                return Err(format!(
+                    "视频解码输出数量超过 RTP 批次 access unit 数：timestamp={} outputs={} expected={}",
+                    output.timestamp, self.active_outputs, batch.expected_outputs
+                ));
+            }
+            if self.active_outputs == batch.expected_outputs {
+                let mut frame = self.compositor.finish_frame()?.ok_or_else(|| {
+                    format!(
+                        "视频解码 RTP 批次没有可显示图像：timestamp={}",
+                        output.timestamp
+                    )
+                })?;
+                let pending = self
+                    .pending
+                    .remove(&output.timestamp)
+                    .expect("decoded batch was validated");
+                frame.timing = Some(AvcFrameTiming {
+                    first_packet_received_at: pending.timing.first_packet_received_at,
+                    first_access_unit_completed_at: pending.timing.first_access_unit_completed_at,
+                    batch_released_at: pending.timing.batch_released_at,
+                    decoded_at: Instant::now(),
+                    negotiated_dimensions: self.negotiated_dimensions,
+                });
+                frames.push(frame);
+                self.active_timestamp = None;
+                self.active_outputs = 0;
+            }
+        }
+        Ok(frames)
+    }
+
+    fn reset(&mut self) {
+        self.compositor.reset();
+        self.pending.clear();
+        self.active_timestamp = None;
+        self.active_outputs = 0;
+    }
 }
 
 pub(crate) struct SliceCompositor {
@@ -740,6 +865,63 @@ mod tests {
             range: super::super::YuvRange::Video,
             matrix: super::super::YuvMatrix::Bt709,
         }
+    }
+
+    fn decoded_output(timestamp: u32, slice_index: usize) -> DecodedOutput {
+        DecodedOutput {
+            stream_index: slice_index,
+            timestamp,
+            submission: u64::from(timestamp) + slice_index as u64,
+            encoded_bytes: 1,
+            status: 0,
+            info_flags: 0,
+            conversion_error: None,
+            frame: Some(slice(slice_index as u8)),
+        }
+    }
+
+    #[test]
+    fn assembles_delayed_decoder_outputs_by_their_source_timestamp() {
+        let now = Instant::now();
+        let timing = PendingFrameTiming {
+            first_packet_received_at: now,
+            first_access_unit_completed_at: now,
+            batch_released_at: now,
+        };
+        let mut assembler = DecoderOutputAssembler::new((2, 4), Some((2, 4)));
+        assembler.register_batch(10, 4, timing).expect("batch 10");
+        assembler.register_batch(20, 4, timing).expect("batch 20");
+
+        assert!(
+            assembler
+                .push(vec![decoded_output(10, 0), decoded_output(10, 1)])
+                .expect("partial delayed output")
+                .is_empty()
+        );
+        let first = assembler
+            .push(vec![decoded_output(10, 2), decoded_output(10, 3)])
+            .expect("complete delayed output");
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0]
+                .updates
+                .iter()
+                .map(|update| update.slice_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+
+        let second = assembler
+            .push((0..4).map(|index| decoded_output(20, index)).collect())
+            .expect("following delayed output");
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0]
+                .timing
+                .expect("frame timing")
+                .negotiated_dimensions,
+            Some((2, 4))
+        );
     }
 
     #[test]

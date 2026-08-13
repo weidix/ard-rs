@@ -347,7 +347,7 @@ fn positioned_session_toolbar(
 }
 
 fn connection_progress(app: &ArdViewer) -> Element<'_, Message> {
-    if app.session_connection == ConnectionState::Connected {
+    if app.session_connection == ConnectionState::Connected && app.session_error.is_none() {
         return space().into();
     }
 

@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "windows"))]
 #![allow(dead_code)]
 
 #[path = "../src/config.rs"]
@@ -28,8 +28,11 @@ use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdDisplayConfiguration, ArdVideoQuality,
     ArdVirtualDisplay, Framebuffer,
 };
+#[cfg(target_os = "windows")]
+use media::mft::MftDecoder as PlatformVideoDecoder;
 use media::pipeline::{AvcReceiveEvent, AvcReceivePump, SliceCompositor};
-use media::vt::VideoToolboxDecoder;
+#[cfg(target_os = "macos")]
+use media::vt::VideoToolboxDecoder as PlatformVideoDecoder;
 use sha2::{Digest, Sha256};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -158,7 +161,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             feedback_key_blob.fill(0);
             let receive_pump = AvcReceivePump::spawn(receiver, Arc::new(AtomicBool::new(false)))
                 .map_err(io::Error::other)?;
-            let mut decoder = VideoToolboxDecoder::new(codec);
+            let mut decoder = PlatformVideoDecoder::new(codec);
             let mut compositor = SliceCompositor::new(target_dimensions);
             let mut access_units = 0usize;
             let mut decoded_frames = 0usize;
@@ -241,17 +244,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if !errors.is_empty() {
                     return Err(io::Error::other(errors.join("; ")).into());
                 }
+                if access_units <= 32 && !outputs.is_empty() {
+                    println!(
+                        "input timestamp={timestamp} produced output timestamps={:?}",
+                        outputs
+                            .iter()
+                            .map(|output| output.timestamp)
+                            .collect::<Vec<_>>()
+                    );
+                }
                 for output_frame in &outputs {
-                    if output_frame.timestamp != timestamp {
-                        return Err(io::Error::other(format!(
-                            "VCP callback crossed RTP frame boundary: expected={timestamp} actual={}",
-                            output_frame.timestamp
-                        ))
-                        .into());
-                    }
                     if output_frame.status != 0 {
                         return Err(io::Error::other(format!(
-                            "VCP callback failed: status={} flags={:#x}",
+                            "platform decoder callback failed: status={} flags={:#x}",
                             output_frame.status, output_frame.info_flags
                         ))
                         .into());

@@ -563,9 +563,9 @@ fn run_receiver(
 ) {
     let mut reconnecting = false;
     let mut attempts = 0;
-    let requested_quality = config.quality;
+    let configured_quality = config.quality;
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    if requested_quality.is_high_performance() {
+    if configured_quality.is_high_performance() {
         push_event(
             &mailbox,
             &frame_wake,
@@ -574,6 +574,28 @@ fn run_receiver(
             )),
         );
         return;
+    }
+    #[cfg(target_os = "windows")]
+    let (requested_quality, decoder_fallback) = match windows_media_quality(configured_quality) {
+        Ok(selection) => selection,
+        Err(error) => {
+            push_event(
+                &mailbox,
+                &frame_wake,
+                SessionEvent::State(ConnectionState::Failed(error)),
+            );
+            return;
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let requested_quality = configured_quality;
+    #[cfg(target_os = "windows")]
+    if let Some(warning) = decoder_fallback.as_ref() {
+        push_event(
+            &mailbox,
+            &frame_wake,
+            SessionEvent::RenderFailed(warning.clone()),
+        );
     }
     let requested_dimensions = config
         .display_configuration
@@ -756,6 +778,9 @@ fn run_receiver(
                                 )
                             });
                         let mut media_meter = RateMeter::new();
+                        #[cfg(target_os = "windows")]
+                        let mut render_failed = decoder_fallback.is_some();
+                        #[cfg(not(target_os = "windows"))]
                         let mut render_failed = false;
                         let mut measured_user_input_record =
                             pipeline_input.metrics().user_input_records_written;
@@ -889,6 +914,42 @@ fn run_receiver(
                 }
             }
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_media_quality(
+    quality: ArdVideoQuality,
+) -> Result<(ArdVideoQuality, Option<String>), String> {
+    use ard_rs::media_stream::MediaStreamCodec;
+
+    match quality {
+        ArdVideoQuality::HighPerformanceHevc => {
+            match crate::media::mft::MftDecoder::check_codec(MediaStreamCodec::Hevc) {
+                Ok(()) => Ok((quality, None)),
+                Err(hevc_error) => {
+                    crate::media::mft::MftDecoder::check_codec(MediaStreamCodec::H264).map_err(
+                        |h264_error| {
+                            format!(
+                                "Windows 没有可用的 HEVC 或 AVC Media Foundation 解码器：HEVC={hevc_error}；AVC={h264_error}"
+                            )
+                        },
+                    )?;
+                    Ok((
+                        ArdVideoQuality::HighPerformanceAvc,
+                        Some(format!(
+                            "Windows HEVC Media Foundation 解码器不可用，已自动改用 AVC (H.264)：{hevc_error}"
+                        )),
+                    ))
+                }
+            }
+        }
+        ArdVideoQuality::HighPerformanceAvc => {
+            crate::media::mft::MftDecoder::check_codec(MediaStreamCodec::H264)
+                .map_err(|error| format!("Windows AVC Media Foundation 解码器不可用：{error}"))?;
+            Ok((quality, None))
+        }
+        _ => Ok((quality, None)),
     }
 }
 

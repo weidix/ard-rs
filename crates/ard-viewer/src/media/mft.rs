@@ -375,6 +375,12 @@ pub struct MftDecoder {
 }
 
 impl MftDecoder {
+    /// Verify that the requested inbox decoder can be created and configured
+    /// before the media negotiation commits the server to that codec.
+    pub(crate) fn check_codec(codec: MediaStreamCodec) -> Result<(), String> {
+        NativeDecoder::new(codec).map(drop)
+    }
+
     pub fn new(codec: MediaStreamCodec) -> Self {
         let mut errors = VecDeque::new();
         let native = NativeDecoder::new(codec)
@@ -530,54 +536,51 @@ fn copy_nv12(buffer: &IMFMediaBuffer, format: OutputFormat) -> Result<DecodedSli
     unsafe { buffer.Lock(&mut pointer, None, Some(&mut current_length)) }
         .map_err(|error| format!("锁定 MFT NV12 buffer 失败：{error}"))?;
     let lock = BufferLock::new(buffer, pointer);
-    let y_storage = format
-        .stride
-        .checked_mul(format.height as usize)
-        .ok_or_else(|| "MFT NV12 亮度平面大小溢出".to_owned())?;
-    let uv_rows = format.height.div_ceil(2) as usize;
-    let required = y_storage
-        .checked_add(
-            format
-                .stride
-                .checked_mul(uv_rows)
-                .ok_or_else(|| "MFT NV12 色度平面大小溢出".to_owned())?,
-        )
-        .ok_or_else(|| "MFT NV12 buffer 大小溢出".to_owned())?;
-    if (current_length as usize) < required {
-        return Err(format!(
-            "MFT NV12 buffer 被截断：required={required} actual={current_length}"
-        ));
+    if pointer.is_null() && current_length != 0 {
+        return Err("MFT NV12 buffer 返回了空数据指针".to_owned());
     }
+    // `ConvertToContiguousBuffer` followed by `IMFMediaBuffer::Lock` exposes
+    // the format's contiguous representation. For NV12 that representation is
+    // width * height bytes of Y immediately followed by width * ceil(height/2)
+    // bytes of interleaved UV. `MF_MT_DEFAULT_STRIDE` describes the native 2D
+    // surface and may be larger than width; applying it here shifts the UV
+    // origin into later rows. The resulting chroma displacement appears as a
+    // coloured horizontal band at the top of every native desktop slice.
+    let bytes = if current_length == 0 {
+        &[]
+    } else {
+        // SAFETY: a successful non-empty IMFMediaBuffer lock returns at least
+        // `current_length` readable bytes and the RAII guard still owns it.
+        unsafe { std::slice::from_raw_parts(lock.pointer, current_length as usize) }
+    };
+    let frame = copy_contiguous_nv12(bytes, format)?;
+    drop(lock);
+    Ok(frame)
+}
+
+fn copy_contiguous_nv12(bytes: &[u8], format: OutputFormat) -> Result<DecodedSlice, String> {
     let width = format.width as usize;
     let height = format.height as usize;
-    let mut y_plane = vec![0; width * height];
-    let mut uv_plane = vec![0; width * uv_rows];
-    for row in 0..height {
-        // SAFETY: validated the complete padded source size above; both
-        // destination slices are tightly allocated for width*height bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                lock.pointer.add(row * format.stride),
-                y_plane.as_mut_ptr().add(row * width),
-                width,
-            );
-        }
+    let y_len = width
+        .checked_mul(height)
+        .ok_or_else(|| "MFT NV12 亮度平面大小溢出".to_owned())?;
+    let uv_len = width
+        .checked_mul(format.height.div_ceil(2) as usize)
+        .ok_or_else(|| "MFT NV12 色度平面大小溢出".to_owned())?;
+    let required = y_len
+        .checked_add(uv_len)
+        .ok_or_else(|| "MFT NV12 buffer 大小溢出".to_owned())?;
+    if bytes.len() < required {
+        return Err(format!(
+            "MFT NV12 buffer 被截断：required={required} actual={}",
+            bytes.len()
+        ));
     }
-    for row in 0..uv_rows {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                lock.pointer.add(y_storage + row * format.stride),
-                uv_plane.as_mut_ptr().add(row * width),
-                width,
-            );
-        }
-    }
-    drop(lock);
     Ok(DecodedSlice {
         width: format.width,
         height: format.height,
-        y_plane,
-        uv_plane,
+        y_plane: bytes[..y_len].to_vec(),
+        uv_plane: bytes[y_len..required].to_vec(),
         range: format.range,
         matrix: format.matrix,
     })
@@ -586,6 +589,63 @@ fn copy_nv12(buffer: &IMFMediaBuffer, format: OutputFormat) -> Result<DecodedSli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+        let mut offset = from;
+        while offset + 3 < data.len() {
+            if data[offset..].starts_with(&[0, 0, 0, 1]) {
+                return Some((offset, 4));
+            }
+            if data[offset..].starts_with(&[0, 0, 1]) {
+                return Some((offset, 3));
+            }
+            offset += 1;
+        }
+        None
+    }
+
+    fn access_units(data: &[u8], codec: MediaStreamCodec) -> Vec<AccessUnit> {
+        let mut nal_units = Vec::new();
+        let mut offset = 0;
+        while let Some((start, code_len)) = find_start_code(data, offset) {
+            let payload_start = start + code_len;
+            let payload_end = find_start_code(data, payload_start)
+                .map(|(start, _)| start)
+                .unwrap_or(data.len());
+            if payload_end > payload_start {
+                nal_units.push(data[payload_start..payload_end].to_vec());
+            }
+            offset = payload_end;
+        }
+
+        let mut units = Vec::new();
+        let mut current = Vec::new();
+        let mut current_has_vcl = false;
+        for nal in nal_units {
+            let is_vcl = match codec {
+                MediaStreamCodec::H264 => (1..=5).contains(&(nal[0] & 0x1f)),
+                MediaStreamCodec::Hevc => ((nal[0] >> 1) & 0x3f) <= 31,
+            };
+            if is_vcl && current_has_vcl {
+                units.push(AccessUnit {
+                    timestamp: units.len() as u32,
+                    decode_order_number: None,
+                    nal_units: std::mem::take(&mut current),
+                });
+                current_has_vcl = false;
+            }
+            current.push(nal);
+            current_has_vcl |= is_vcl;
+        }
+        if !current.is_empty() {
+            units.push(AccessUnit {
+                timestamp: units.len() as u32,
+                decode_order_number: None,
+                nal_units: current,
+            });
+        }
+        units
+    }
 
     #[test]
     fn sync_detection_is_codec_specific() {
@@ -608,5 +668,66 @@ mod tests {
         assert!(!is_sync_unit(MediaStreamCodec::H264, &h264_predictive));
         assert!(is_sync_unit(MediaStreamCodec::Hevc, &hevc_irap));
         assert!(!is_sync_unit(MediaStreamCodec::Hevc, &h264_idr));
+    }
+
+    #[test]
+    fn contiguous_nv12_ignores_the_native_surface_stride_for_the_uv_origin() {
+        let format = OutputFormat {
+            width: 4,
+            height: 2,
+            // A native 2D surface may pad each four-byte row to eight bytes,
+            // but ConvertToContiguousBuffer removes that row padding.
+            stride: 8,
+            range: YuvRange::Video,
+            matrix: YuvMatrix::Bt709,
+        };
+        let bytes = [
+            1, 2, 3, 4, 5, 6, 7, 8, // tightly packed Y
+            9, 10, 11, 12, // tightly packed UV
+            0xee, 0xee, 0xee, 0xee, // unrelated buffer capacity
+        ];
+
+        let frame = copy_contiguous_nv12(&bytes, format).expect("valid contiguous NV12");
+
+        assert_eq!(frame.y_plane, &bytes[..8]);
+        assert_eq!(frame.uv_plane, &bytes[8..12]);
+    }
+
+    #[test]
+    fn decodes_h264_smoke_sample_when_available() {
+        let Some(path) = std::env::var_os("ARD_MFT_TEST_H264") else {
+            return;
+        };
+        let bytes = std::fs::read(path).expect("read ARD_MFT_TEST_H264");
+        let units = access_units(&bytes, MediaStreamCodec::H264);
+        assert!(!units.is_empty());
+        let mut decoder = MftDecoder::new(MediaStreamCodec::H264);
+        let mut outputs = Vec::new();
+        for unit in &units {
+            outputs.extend(decoder.decode(0, unit));
+        }
+        outputs.extend(decoder.flush());
+        let errors = decoder.take_errors();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(outputs.iter().any(|output| output.frame.is_some()));
+    }
+
+    #[test]
+    fn decodes_hevc_smoke_sample_when_available() {
+        let Some(path) = std::env::var_os("ARD_MFT_TEST_HEVC") else {
+            return;
+        };
+        let bytes = std::fs::read(path).expect("read ARD_MFT_TEST_HEVC");
+        let units = access_units(&bytes, MediaStreamCodec::Hevc);
+        assert!(!units.is_empty());
+        let mut decoder = MftDecoder::new(MediaStreamCodec::Hevc);
+        let mut outputs = Vec::new();
+        for unit in &units {
+            outputs.extend(decoder.decode(0, unit));
+        }
+        outputs.extend(decoder.flush());
+        let errors = decoder.take_errors();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(outputs.iter().any(|output| output.frame.is_some()));
     }
 }
