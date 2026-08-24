@@ -275,96 +275,31 @@ Red and blue use symmetric rounding. Green combines its terms with a `32768`
 half-unit bias. Tests must cover positive and negative chroma and clamping to
 `0..=255`.
 
-## 10. Build a native macOS decoder oracle
+## 10. Validate with the unified oracle
 
-The core package contains:
+The server implementation now lives only in `crates/ard-core/src/oracle.rs`.
+`Oracle` accepts a connected TCP stream and uses the four synchronized samples
+under `crates/ard-core/examples/fixtures`. `OracleMode::Auto` follows the
+viewer's requested RFB encoding or media codec; an explicit mode makes a
+single-path experiment fail if the viewer negotiates something else.
 
-```text
-crates/ard-core/examples/mvs_oracle_server.rs
-```
-
-It is a minimal pure-Rust ARD server that accepts an authentication response
-from an explicitly allowed peer and sends a handcrafted MVS rectangle.
-
-macOS rejects some obvious self-connections. The original investigation put a
-static Linux build in a local Docker container so Screen Sharing saw a
-separate network endpoint.
-
-Apple Silicon example:
+Start with the in-process coverage:
 
 ```sh
-rustup target add aarch64-unknown-linux-musl
-
-cargo build -p ard-core --release \
-  --example mvs_oracle_server \
-  --target aarch64-unknown-linux-musl
+cargo test -p ard-core --lib oracle::tests
+cargo test -p ard-core --test viewer_client
 ```
 
-Mount the static binary and publish the port:
+These tests validate all 300 MVS and zlib records, all 1,200 H.264 and HEVC
+access units, every public RFB quality mode, both media negotiations, encrypted
+record splitting, and the client-to-server control stream. A native Screen
+Sharing experiment can host the same `Oracle::run` entry point in the chosen
+container or network harness without maintaining a second protocol
+implementation.
 
-```sh
-docker run --rm -it \
-  -p 5999:5999 \
-  -v "$PWD/target/aarch64-unknown-linux-musl/release/examples/mvs_oracle_server:/mvs-oracle:ro" \
-  alpine:3.22 \
-  /mvs-oracle 5999 0.0.0.0 192.168.65.1 ard dct-ac
-```
-
-Docker Desktop's host-side source address may differ from `192.168.65.1`. If
-the server reports `rejected non-local peer`, restart it with the exact peer IP
-printed in that message. Do not remove the source restriction for convenience.
-
-Connect Screen Sharing to:
-
-```text
-vnc://127.0.0.1:5999
-```
-
-The oracle accepts the local client's authentication response but does not
-read or print plaintext credentials.
-
-Available frame kinds are defined by the `match` in
-`mvs_oracle_server.rs`, including:
-
-```text
-white
-solid
-dct
-dct-ac
-dct-full
-dct-ac-full
-full-diff
-```
-
-For every experiment, preserve:
-
-- exact input bytes;
-- rectangle dimensions;
-- whether Apple disconnected;
-- Apple's rendered result;
-- Rust-decoded framebuffer pixels;
-- exact pixel differences.
-
-### Encrypted-transport oracle
-
-Once the MVS oracle path works, the modern encrypted transport can be
-validated the same way with `crates/ard-core/examples/encrypted_transport_oracle.rs`. It
-completes type-30 authentication, advertises command `0x12` through the
-extended ServerInit bitfield, sends a real 1103 control rectangle, waits for
-the client's eight-byte activation, and then exchanges AES-CBC records
-carrying MVS rectangles. Build it exactly like the MVS oracle:
-
-```sh
-cargo build -p ard-core --release \
-  --example encrypted_transport_oracle \
-  --target aarch64-unknown-linux-musl
-```
-
-The repository `.cargo/config.toml` selects the installed musl cross-linker
-so the playbook commands work without extra environment variables. Connect
-Screen Sharing to the published port and confirm from the printed report that
-the client sent `0x21`, the `0x12` proposal, and the activation, and that
-encrypted records flowed in both directions.
+For every native experiment, preserve the negotiated mode, exact fixture,
+rectangle dimensions or RTP SSRC/timestamp/DON sequence, disconnect behavior,
+rendered result, and exact pixel differences.
 
 ## 11. Avoid self-confirming tests
 

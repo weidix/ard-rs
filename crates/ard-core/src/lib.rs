@@ -51,7 +51,10 @@ pub use media_stream::{
     VideoPayloadConfig, parse_negotiation_payload,
 };
 pub use mvs::{MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate};
-pub use oracle::{EncryptedTransportOracle, OracleReport};
+pub use oracle::{
+    EncryptedTransportOracle, Oracle, OracleFixtureSummary, OracleFixtures, OracleMode,
+    OracleReport,
+};
 pub use protocol::{
     ArdAuthChallenge, ArdAuthResponse, ArdClientInit, ArdDisplayConfiguration,
     ArdEncryptionControl, ArdScrollWheelEvent, ArdServerInitExtension, ArdSessionOptions,

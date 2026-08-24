@@ -1,81 +1,186 @@
-//! Pure-Rust test server for validating the modern encrypted transport
-//! against Apple's Screen Sharing client.
-//!
-//! The server completes the type-30 exchange, advertises `0x12` command
-//! support through the extended `ServerInit`, sends a real 1103
-//! encryption-control rectangle, receives the client's activation message,
-//! and then exchanges AES-CBC records containing MVS framebuffer updates.
-//! Session keys and wrapped blocks are never printed or stored in reports.
+//! Fixture-backed ARD server for protocol and end-to-end validation.
 
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use aes::Aes128;
-use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-use flate2::{Compress, Compression, FlushCompress};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use md5::{Digest, Md5};
+use num_bigint::BigUint;
 
+use crate::media_stream::negotiation::{
+    MediaStreamCodec, MediaStreamOffer, build_media_stream_offer_with_ssrc_and_codec,
+    build_remote_endpoint_info,
+};
+use crate::media_stream::srtp::SrtpContext;
+use crate::media_stream::{
+    ENCODING_AVC_MEDIA_STREAM, MediaStreamConfiguration, MediaStreamMessage1,
+};
 use crate::{
-    ArdEncryptionControl, ArdSessionMaterial, ArdSetEncryptionLevel, ArdViewerInformation,
-    Encoding, PixelFormat, build_ard_server_init, parse_ard_set_encryption_level,
-    parse_ard_viewer_information,
+    ArdEncryptionControl, ArdSessionMaterial, ArdSessionRecordEncoder, ArdSetEncryptionLevel,
+    ArdViewerInformation, Encoding, PixelFormat, build_ard_server_init,
+    parse_ard_set_encryption_level, parse_ard_viewer_information,
 };
 
-const DH_GROUP2_PRIME: [u8; 128] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc9, 0x0f, 0xda, 0xa2, 0x21, 0x68, 0xc2, 0x34,
-    0xc4, 0xc6, 0x62, 0x8b, 0x80, 0xdc, 0x1c, 0xd1, 0x29, 0x02, 0x4e, 0x08, 0x8a, 0x67, 0xcc, 0x74,
-    0x02, 0x0b, 0xbe, 0xa6, 0x3b, 0x13, 0x9b, 0x22, 0x51, 0x4a, 0x08, 0x79, 0x8e, 0x34, 0x04, 0xdd,
-    0xef, 0x95, 0x19, 0xb3, 0xcd, 0x3a, 0x43, 0x1b, 0x30, 0x2b, 0x0a, 0x6d, 0xf2, 0x5f, 0x14, 0x37,
-    0x4f, 0xe1, 0x35, 0x6d, 0x6d, 0x51, 0xc2, 0x45, 0xe4, 0x85, 0xb5, 0x76, 0x62, 0x5e, 0x7e, 0xc6,
-    0xf4, 0x4c, 0x42, 0xe9, 0xa6, 0x37, 0xed, 0x6b, 0x0b, 0xff, 0x5c, 0xb6, 0xf4, 0x06, 0xb7, 0xed,
-    0xee, 0x38, 0x6b, 0xfb, 0x5a, 0x89, 0x9f, 0xa5, 0xae, 0x9f, 0x24, 0x11, 0x7c, 0x4b, 0x1f, 0xe6,
-    0x49, 0x28, 0x66, 0x51, 0xec, 0xe6, 0x53, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+const WIDTH: u16 = 1920;
+const HEIGHT: u16 = 1080;
+const DISPLAY_FRAME_COUNT: usize = 300;
+const MEDIA_ACCESS_UNIT_COUNT: usize = DISPLAY_FRAME_COUNT * 4;
+const MAX_PLAINTEXT_RECORD: usize = u16::MAX as usize;
+const MAX_RECORD_PAYLOAD: usize = 65_498;
+const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const MEDIA_PAYLOAD_BYTES: usize = 1_150;
+const MEDIA_BASE_SSRC: u32 = 0x6a11_0000;
+
+const DH_PRIME_HEX: &str = concat!(
+    "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404dd",
+    "ef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7ed",
+    "ee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f",
+    "83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3b",
+    "e39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa0510",
+    "15728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7",
+    "abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200c",
+    "bbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d7",
+    "88719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6",
+    "287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa9",
+    "93b4ea988d8fddc186ffb7dc90a6c08f4df435c934063199ffffffffffffffff",
+);
+const DH_KEY_BYTES: usize = 512;
+const DH_PRIVATE_KEY: [u8; 32] = [
+    0x82, 0x96, 0x7d, 0x4f, 0xa3, 0x2b, 0x18, 0xc5, 0x71, 0xe9, 0x06, 0x3d, 0xbc, 0x54, 0x2a, 0x8f,
+    0x39, 0xd1, 0x65, 0x7b, 0x24, 0xee, 0x90, 0x43, 0xaf, 0x12, 0xc8, 0x5d, 0x76, 0x31, 0x9b, 0xe7,
 ];
 
-const MAX_PLAINTEXT_RECORD: usize = u16::MAX as usize;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OracleMode {
+    #[default]
+    Auto,
+    Halftone,
+    Grayscale,
+    Thousands,
+    AdaptiveMvs,
+    FullColor,
+    H264,
+    Hevc,
+}
 
-/// One-shot ARD server that drives the full 1103 encrypted-record exchange.
+impl OracleMode {
+    fn encoding(self) -> Option<i32> {
+        match self {
+            Self::Auto => None,
+            Self::Halftone => Some(Encoding::ArdHalftone as i32),
+            Self::Grayscale => Some(Encoding::ArdGrayscale as i32),
+            Self::Thousands => Some(Encoding::ArdThousands as i32),
+            Self::AdaptiveMvs => Some(Encoding::ArdMvs as i32),
+            Self::FullColor => Some(Encoding::Zlib as i32),
+            Self::H264 | Self::Hevc => Some(ENCODING_AVC_MEDIA_STREAM),
+        }
+    }
+
+    fn codec(self) -> Option<MediaStreamCodec> {
+        match self {
+            Self::H264 => Some(MediaStreamCodec::H264),
+            Self::Hevc => Some(MediaStreamCodec::Hevc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleFixtures {
+    pub h264: PathBuf,
+    pub hevc: PathBuf,
+    pub mvs: PathBuf,
+    pub zlib: PathBuf,
+}
+
+impl OracleFixtures {
+    pub fn from_dir(directory: impl AsRef<Path>) -> Self {
+        let directory = directory.as_ref();
+        Self {
+            h264: directory.join("oracle-diagonal-frames-1920x1080-4x272.h264"),
+            hevc: directory.join("oracle-diagonal-frames-1920x1080-4x272.h265"),
+            mvs: directory.join("oracle-diagonal-frames-1920x1080.mvs"),
+            zlib: directory.join("oracle-diagonal-frames-1920x1080.zlib"),
+        }
+    }
+
+    pub fn repository() -> Self {
+        Self::from_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fixtures"))
+    }
+
+    pub fn validate(&self) -> io::Result<OracleFixtureSummary> {
+        let summary = OracleFixtureSummary {
+            mvs_frames: count_records(&self.mvs)?,
+            zlib_frames: count_records(&self.zlib)?,
+            h264_access_units: read_annex_b(&self.h264, MediaStreamCodec::H264)?.len(),
+            hevc_access_units: read_annex_b(&self.hevc, MediaStreamCodec::Hevc)?.len(),
+        };
+        if summary
+            != (OracleFixtureSummary {
+                mvs_frames: DISPLAY_FRAME_COUNT,
+                zlib_frames: DISPLAY_FRAME_COUNT,
+                h264_access_units: MEDIA_ACCESS_UNIT_COUNT,
+                hevc_access_units: MEDIA_ACCESS_UNIT_COUNT,
+            })
+        {
+            return Err(io::Error::other(format!(
+                "incomplete oracle fixtures: {summary:?}"
+            )));
+        }
+        Ok(summary)
+    }
+}
+
+impl Default for OracleFixtures {
+    fn default() -> Self {
+        Self::repository()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleFixtureSummary {
+    pub mvs_frames: usize,
+    pub zlib_frames: usize,
+    pub h264_access_units: usize,
+    pub hevc_access_units: usize,
+}
+
 #[derive(Debug, Clone)]
-pub struct EncryptedTransportOracle {
+pub struct Oracle {
     pub width: u16,
     pub height: u16,
     pub server_name: Vec<u8>,
     pub flags: u32,
-    /// MSB-first command-support bitfield advertised in `ServerInit`.
     pub command_support: [u8; 16],
     pub session_value: [u8; 16],
     pub initial_chaining_value: [u8; 16],
-    /// Optional server-to-client clipboard payload used by interoperability
-    /// tests. The normal oracle leaves the clipboard stream disabled.
     pub server_clipboard_text: Option<Vec<u8>>,
-    /// Reject peers other than this address. Defaults to loopback.
     pub allowed_peer: Option<IpAddr>,
-    /// Fail when the client does not send the `0x12` proposal. Set to false
-    /// to fall back to plain MVS frames for clients without encryption
-    /// enabled.
     pub require_encryption: bool,
-    /// Whether the client sends its one-byte security-type selection after
-    /// the offer. Apple's Screen Sharing client does; the in-process Rust
-    /// test client does not.
     pub expect_security_selection: bool,
     pub max_client_messages: usize,
-    /// Test-only interoperability hook: close the session after this many
-    /// server frames have been sent.
     pub close_after_frames: Option<usize>,
+    pub mode: OracleMode,
+    pub fixtures: OracleFixtures,
+    pub frame_interval: Duration,
 }
 
-impl Default for EncryptedTransportOracle {
+impl Default for Oracle {
     fn default() -> Self {
         let mut command_support = [0_u8; 16];
-        // Same low commands as the native default plus command 0x12
-        // (RFBSetEncryptionLevel), stored MSB-first per byte.
         command_support[0] = 0xbe;
         command_support[2] = 0x20;
         Self {
-            width: 64,
-            height: 64,
-            server_name: b"ard-rs encrypted oracle".to_vec(),
-            flags: 8,
+            width: WIDTH,
+            height: HEIGHT,
+            server_name: b"ard-rs fixture oracle".to_vec(),
+            flags: 0,
             command_support,
             session_value: [0x42; 16],
             initial_chaining_value: [0x24; 16],
@@ -85,12 +190,15 @@ impl Default for EncryptedTransportOracle {
             expect_security_selection: true,
             max_client_messages: 64,
             close_after_frames: None,
+            mode: OracleMode::Auto,
+            fixtures: OracleFixtures::default(),
+            frame_interval: DEFAULT_FRAME_INTERVAL,
         }
     }
 }
 
-/// Redacted summary of one oracle session. No key, wrapped block, password,
-/// or derived value is included.
+pub type EncryptedTransportOracle = Oracle;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleReport {
     pub peer: String,
@@ -102,21 +210,18 @@ pub struct OracleReport {
     pub activation_received: bool,
     pub server_to_client_records: usize,
     pub client_to_server_records: usize,
-    /// First byte (message type) of each decrypted client message. Multiple
-    /// messages may share a record and one message may span records.
     pub client_message_types: Vec<u8>,
-    /// Incremental flag from every decrypted type-3 framebuffer request.
     pub client_framebuffer_update_incremental: Vec<bool>,
-    /// Rectangle `(x, y, width, height)` from each decrypted type-3 request.
     pub client_framebuffer_update_rectangles: Vec<(u16, u16, u16, u16)>,
-    /// Rectangle `(x, y, width, height)` from each decrypted type-9 request.
     pub client_auto_frame_update_rectangles: Vec<(u16, u16, u16, u16)>,
     pub frames_sent: usize,
+    pub selected_mode: Option<OracleMode>,
+    pub media_configuration_received: bool,
 }
 
-impl EncryptedTransportOracle {
-    pub fn run(&self, mut stream: TcpStream, peer: SocketAddr) -> io::Result<OracleReport> {
-        let mut report = OracleReport {
+impl OracleReport {
+    fn new(peer: SocketAddr) -> Self {
+        Self {
             peer: peer.to_string(),
             client_banner: [0; 12],
             shared_session: false,
@@ -131,55 +236,295 @@ impl EncryptedTransportOracle {
             client_framebuffer_update_rectangles: Vec::new(),
             client_auto_frame_update_rectangles: Vec::new(),
             frames_sent: 0,
-        };
+            selected_mode: None,
+            media_configuration_received: false,
+        }
+    }
+}
 
+impl Oracle {
+    pub fn run(&self, mut stream: TcpStream, peer: SocketAddr) -> io::Result<OracleReport> {
+        if self
+            .allowed_peer
+            .is_some_and(|allowed| allowed != peer.ip())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "oracle rejected peer",
+            ));
+        }
+        if (self.width, self.height) != (WIDTH, HEIGHT) {
+            return Err(io::Error::other(
+                "fixture oracle framebuffer must be 1920x1080",
+            ));
+        }
+        let mut report = OracleReport::new(peer);
+        let authentication_value = self.authenticate(&mut stream, &mut report)?;
+        self.receive_client_setup(&mut stream, &mut report)?;
+        if report.set_encryption_level.is_none() {
+            if self.require_encryption {
+                return Err(io::Error::other(
+                    "client did not request encrypted transport",
+                ));
+            }
+            return self.run_plain(stream, report);
+        }
+
+        let control = build_control(
+            self.session_value,
+            self.initial_chaining_value,
+            authentication_value,
+        );
+        send_control_rectangle(&mut stream, &control)?;
+        eprintln!("oracle setup: encryption control sent");
+        let mut activation = [0_u8; 8];
+        stream.read_exact(&mut activation)?;
+        let (parsed, consumed) =
+            parse_ard_set_encryption_level(&activation, 16).map_err(io::Error::other)?;
+        if consumed != activation.len() || parsed.command != ArdSetEncryptionLevel::COMMAND_ACTIVATE
+        {
+            return Err(io::Error::other("client did not activate encryption"));
+        }
+        report.activation_received = true;
+        eprintln!("oracle setup: encryption activated");
+
+        let material = ArdSessionMaterial::new(self.session_value, self.initial_chaining_value);
+        let mut encoder = material
+            .record_encoder(MAX_PLAINTEXT_RECORD)
+            .map_err(io::Error::other)?;
+        let mut decoder = material
+            .record_decoder(MAX_PLAINTEXT_RECORD)
+            .map_err(io::Error::other)?;
+        let selected = self.select_mode(&report.viewer_encodings)?;
+        report.selected_mode = Some(selected);
+        let mut frames = selected
+            .codec()
+            .is_none()
+            .then(|| RfbFrames::open(selected, &self.fixtures, self.width, self.height))
+            .transpose()?;
+        let mut media = selected
+            .codec()
+            .is_some()
+            .then(|| {
+                MediaOracle::bind(
+                    stream.local_addr().map(|value| value.ip())?,
+                    peer.ip(),
+                    (self.mode != OracleMode::Auto)
+                        .then(|| self.mode.codec())
+                        .flatten(),
+                )
+            })
+            .transpose()?;
+
+        let mut plaintext = Vec::new();
+        let mut automatic = false;
+        let mut next_frame_at = Instant::now();
+        if report
+            .viewer_encodings
+            .contains(&(Encoding::ArdDisplayInfo as i32))
+        {
+            let display_info = framebuffer_update(
+                self.width,
+                self.height,
+                Encoding::ArdDisplayInfo as i32,
+                &display_info_payload(self.width, self.height),
+            );
+            write_encrypted_message(
+                &mut stream,
+                &mut encoder,
+                &display_info,
+                &mut report.server_to_client_records,
+            )?;
+        }
+        loop {
+            if automatic && let Some(frames) = frames.as_mut() {
+                let now = Instant::now();
+                if now >= next_frame_at {
+                    if !self.send_next_frame(&mut stream, &mut encoder, frames, &mut report)? {
+                        break;
+                    }
+                    next_frame_at += self.frame_interval;
+                    continue;
+                }
+                stream.set_read_timeout(Some(next_frame_at - now))?;
+            } else {
+                stream.set_read_timeout(None)?;
+            }
+
+            let mut length = [0_u8; 2];
+            match stream.read_exact(&mut length) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) if connection_closed(&error) => break,
+                Err(error) => return Err(error),
+            }
+            let cipher_len = usize::from(u16::from_be_bytes(length));
+            eprintln!("oracle transport: next record length {cipher_len}");
+            if cipher_len == 0 || !cipher_len.is_multiple_of(16) {
+                return Err(io::Error::other("invalid encrypted-record length"));
+            }
+            let mut ciphertext = vec![0_u8; cipher_len];
+            stream.read_exact(&mut ciphertext)?;
+            plaintext.extend_from_slice(&decoder.decode(&ciphertext).map_err(io::Error::other)?);
+            report.client_to_server_records += 1;
+
+            while let Some(message_len) = encrypted_client_message_len(&plaintext)? {
+                let message: Vec<_> = plaintext.drain(..message_len).collect();
+                report.client_message_types.push(message[0]);
+                record_client_message(&message, &mut report);
+                match message[0] {
+                    3 if frames.is_some() => {
+                        if !self.send_next_frame(
+                            &mut stream,
+                            &mut encoder,
+                            frames.as_mut().unwrap(),
+                            &mut report,
+                        )? {
+                            return Ok(report);
+                        }
+                    }
+                    3 if media.is_some() => {
+                        let bootstrap = media.as_ref().unwrap().bootstrap(self.width, self.height);
+                        write_encrypted_message(
+                            &mut stream,
+                            &mut encoder,
+                            &bootstrap,
+                            &mut report.server_to_client_records,
+                        )?;
+                    }
+                    9 if frames.is_some() => {
+                        automatic = true;
+                        next_frame_at = Instant::now() + self.frame_interval;
+                    }
+                    0x1c if media.is_some() => {
+                        let configuration = MediaStreamConfiguration::parse(&message)
+                            .map_err(io::Error::other)?
+                            .0;
+                        let (answer, codec) = media.as_mut().unwrap().answer(
+                            configuration,
+                            &self.fixtures,
+                            self.frame_interval,
+                            self.close_after_frames,
+                        )?;
+                        report.selected_mode = Some(match codec {
+                            MediaStreamCodec::H264 => OracleMode::H264,
+                            MediaStreamCodec::Hevc => OracleMode::Hevc,
+                        });
+                        write_encrypted_message(
+                            &mut stream,
+                            &mut encoder,
+                            &answer,
+                            &mut report.server_to_client_records,
+                        )?;
+                        report.media_configuration_received = true;
+                    }
+                    _ => {}
+                }
+                if report.client_message_types.len() >= self.max_client_messages {
+                    return Ok(report);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn authenticate(
+        &self,
+        stream: &mut TcpStream,
+        report: &mut OracleReport,
+    ) -> io::Result<[u8; 16]> {
         stream.write_all(b"RFB 003.889\n")?;
         stream.read_exact(&mut report.client_banner)?;
         if &report.client_banner != b"RFB 003.889\n" {
             return Err(io::Error::other("client did not negotiate ARD 3.889"));
         }
+        eprintln!("oracle handshake: ARD banner negotiated");
         stream.write_all(&[1, 30])?;
         stream.flush()?;
-
-        // Type-30 challenge. The server exponent is 1, so the shared integer
-        // equals the client public key and the authentication value is
-        // MD5(client_public_key).
-        stream.write_all(&2_u16.to_be_bytes())?; // generator 2
-        stream.write_all(&(DH_GROUP2_PRIME.len() as u16).to_be_bytes())?;
-        stream.write_all(&DH_GROUP2_PRIME)?;
-        let mut server_public_key = [0_u8; 128];
-        server_public_key[127] = 2;
-        stream.write_all(&server_public_key)?;
-        stream.flush()?;
-
-        let mut encrypted_credentials = [0_u8; 128];
         if self.expect_security_selection {
             let mut selection = [0_u8; 1];
             stream.read_exact(&mut selection)?;
+            eprintln!("oracle handshake: security type {} selected", selection[0]);
             if selection[0] != 30 {
-                encrypted_credentials[0] = selection[0];
-                stream.read_exact(&mut encrypted_credentials[1..])?;
-            } else {
-                stream.read_exact(&mut encrypted_credentials)?;
+                return Err(io::Error::other(format!(
+                    "client selected unsupported security type {}",
+                    selection[0]
+                )));
             }
-        } else {
-            stream.read_exact(&mut encrypted_credentials)?;
         }
-        let mut client_public_key = [0_u8; 128];
-        stream.read_exact(&mut client_public_key)?;
-        let authentication_value: [u8; 16] = Md5::digest(client_public_key).into();
-        println!("received redacted type-30 response");
-        // Do not log or retain the credential block or derived value.
 
-        stream.write_all(&0_u32.to_be_bytes())?; // SecurityResult OK
+        let modulus = BigUint::parse_bytes(DH_PRIME_HEX.as_bytes(), 16)
+            .expect("ARD DH modulus is a valid hexadecimal integer");
+        let modulus_bytes = modulus.to_bytes_be();
+        stream.write_all(&5_u16.to_be_bytes())?;
+        stream.write_all(&(DH_KEY_BYTES as u16).to_be_bytes())?;
+        stream.write_all(&modulus_bytes)?;
+        let private_key = BigUint::from_bytes_be(&DH_PRIVATE_KEY);
+        let server_public = BigUint::from(5_u8).modpow(&private_key, &modulus);
+        let mut public_key = [0_u8; DH_KEY_BYTES];
+        let server_public = server_public.to_bytes_be();
+        let public_key_offset = public_key.len() - server_public.len();
+        public_key[public_key_offset..].copy_from_slice(&server_public);
+        stream.write_all(&public_key)?;
         stream.flush()?;
-        println!("sent SecurityResult");
+        eprintln!("oracle handshake: type-30 challenge sent");
 
+        let mut response = [0_u8; 128 + DH_KEY_BYTES];
+        let mut received = 0;
+        while received < response.len() {
+            match stream.read(&mut response[received..])? {
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "received {received} of {} type-30 response bytes",
+                            response.len()
+                        ),
+                    ));
+                }
+                count => {
+                    received += count;
+                    eprintln!(
+                        "oracle handshake: received {received}/{} type-30 response bytes",
+                        response.len()
+                    );
+                }
+            }
+        }
+        let client_public_key = &response[128..];
+        eprintln!("oracle handshake: type-30 response received");
+        let shared_secret =
+            BigUint::from_bytes_be(client_public_key).modpow(&private_key, &modulus);
+        let mut shared_secret_bytes = [0_u8; DH_KEY_BYTES];
+        let shared_secret = shared_secret.to_bytes_be();
+        let shared_secret_offset = shared_secret_bytes.len() - shared_secret.len();
+        shared_secret_bytes[shared_secret_offset..].copy_from_slice(&shared_secret);
+        let authentication_value: [u8; 16] = Md5::digest(shared_secret_bytes).into();
+        let cipher = Aes128::new(GenericArray::from_slice(&authentication_value));
+        let mut credentials = response[..128].to_vec();
+        for block in credentials.chunks_exact_mut(16) {
+            cipher.decrypt_block(GenericArray::from_mut_slice(block));
+        }
+        let username_len = credentials[..64].iter().position(|&byte| byte == 0);
+        let password_len = credentials[64..].iter().position(|&byte| byte == 0);
+        eprintln!(
+            "oracle handshake: credentials decrypted (username bytes: {username_len:?}, password bytes: {password_len:?})"
+        );
+        credentials.fill(0);
+        stream.write_all(&0_u32.to_be_bytes())?;
+        stream.flush()?;
+        eprintln!("oracle handshake: SecurityResult sent");
         let mut shared = [0_u8; 1];
         stream.read_exact(&mut shared)?;
+        eprintln!("oracle handshake: ClientInit received");
         report.shared_session = shared[0] != 0;
-        println!("client init flags: {:#04x}", shared[0]);
-
         let init = build_ard_server_init(
             self.width,
             self.height,
@@ -191,147 +536,8 @@ impl EncryptedTransportOracle {
         .map_err(io::Error::other)?;
         stream.write_all(&init)?;
         stream.flush()?;
-        println!("sent extended ServerInit ({} bytes)", init.len());
-
-        self.receive_client_setup(&mut stream, &mut report)?;
-        if report.set_encryption_level.is_none() {
-            if self.require_encryption {
-                return Err(io::Error::other(
-                    "client did not send RFBSetEncryptionLevel; enable the \
-                     Screen Sharing encryption requirement",
-                ));
-            }
-            return self.send_plain_frames(&mut stream, report);
-        }
-
-        let control = self.build_control(authentication_value);
-        send_control_rectangle(&mut stream, &control)?;
-
-        let mut activation = [0_u8; 8];
-        stream.read_exact(&mut activation)?;
-        let (parsed, consumed) =
-            parse_ard_set_encryption_level(&activation, 16).map_err(io::Error::other)?;
-        if consumed != activation.len() || parsed.command != ArdSetEncryptionLevel::COMMAND_ACTIVATE
-        {
-            return Err(io::Error::other(
-                "client did not send encryption activation",
-            ));
-        }
-        report.activation_received = true;
-
-        let material = ArdSessionMaterial::new(self.session_value, self.initial_chaining_value);
-        let mut encoder = material
-            .record_encoder(MAX_PLAINTEXT_RECORD)
-            .map_err(io::Error::other)?;
-        let mut decoder = material
-            .record_decoder(MAX_PLAINTEXT_RECORD)
-            .map_err(io::Error::other)?;
-
-        // Exercise the first preferred family advertised by the client. MVS
-        // validates the GPU-native path; full-colour zlib validates the
-        // RDM-compatible lossless path with a persistent compression stream.
-        let mut pending_frames: Vec<Vec<u8>> = if report.viewer_encodings.contains(&1011) {
-            vec![
-                mvs_white_rectangle(self.width, self.height),
-                mvs_solid_ycbcr_rectangle(self.width, self.height, 200, 128, 128),
-            ]
-        } else {
-            let mut compressor = Compress::new(Compression::default(), true);
-            vec![
-                zlib_solid_rectangle(&mut compressor, self.width, self.height, [255, 255, 255])?,
-                zlib_solid_rectangle(&mut compressor, self.width, self.height, [32, 96, 192])?,
-            ]
-        };
-        let first = pending_frames.remove(0);
-        let record = encoder.encode_wire(&first).map_err(io::Error::other)?;
-        stream.write_all(&record)?;
-        stream.flush()?;
-        report.server_to_client_records += 1;
-        report.frames_sent += 1;
-
-        if self
-            .close_after_frames
-            .is_some_and(|limit| report.frames_sent >= limit)
-        {
-            return Ok(report);
-        }
-
-        if let Some(text) = &self.server_clipboard_text {
-            let mut clipboard = vec![3, 0, 0, 0];
-            clipboard.extend_from_slice(
-                &u32::try_from(text.len())
-                    .map_err(|_| io::Error::other("clipboard test payload is too large"))?
-                    .to_be_bytes(),
-            );
-            clipboard.extend_from_slice(text);
-            let record = encoder.encode_wire(&clipboard).map_err(io::Error::other)?;
-            stream.write_all(&record)?;
-            stream.flush()?;
-            report.server_to_client_records += 1;
-        }
-
-        // Read encrypted records as one continuous RFB client byte stream.
-        // Real clients legally batch small input messages into a record and
-        // split large clipboard messages across record boundaries.
-        let mut client_plaintext = Vec::new();
-        while report.client_message_types.len() < self.max_client_messages {
-            let mut length = [0_u8; 2];
-            match stream.read_exact(&mut length) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error),
-            }
-            let cipher_len = usize::from(u16::from_be_bytes(length));
-            if cipher_len == 0 || !cipher_len.is_multiple_of(16) {
-                return Err(io::Error::other("invalid client encrypted-record length"));
-            }
-            let mut ciphertext = vec![0_u8; cipher_len];
-            stream.read_exact(&mut ciphertext)?;
-            let payload = decoder.decode(&ciphertext).map_err(io::Error::other)?;
-            report.client_to_server_records += 1;
-            client_plaintext.extend_from_slice(&payload);
-            while let Some(message_len) = encrypted_client_message_len(&client_plaintext)? {
-                let message: Vec<_> = client_plaintext.drain(..message_len).collect();
-                let message_type = message[0];
-                report.client_message_types.push(message_type);
-                if message_type == 3 {
-                    report
-                        .client_framebuffer_update_incremental
-                        .push(message[1] != 0);
-                    report.client_framebuffer_update_rectangles.push((
-                        u16::from_be_bytes([message[2], message[3]]),
-                        u16::from_be_bytes([message[4], message[5]]),
-                        u16::from_be_bytes([message[6], message[7]]),
-                        u16::from_be_bytes([message[8], message[9]]),
-                    ));
-                } else if message_type == 9 {
-                    report.client_auto_frame_update_rectangles.push((
-                        u16::from_be_bytes([message[8], message[9]]),
-                        u16::from_be_bytes([message[10], message[11]]),
-                        u16::from_be_bytes([message[12], message[13]]),
-                        u16::from_be_bytes([message[14], message[15]]),
-                    ));
-                }
-                if matches!(message_type, 3 | 9)
-                    && let Some(frame) = pending_frames.first()
-                {
-                    let record = encoder.encode_wire(frame).map_err(io::Error::other)?;
-                    stream.write_all(&record)?;
-                    stream.flush()?;
-                    report.server_to_client_records += 1;
-                    report.frames_sent += 1;
-                    pending_frames.remove(0);
-                }
-            }
-        }
-        Ok(report)
+        eprintln!("oracle handshake: extended ServerInit sent");
+        Ok(authentication_value)
     }
 
     fn receive_client_setup(
@@ -339,167 +545,253 @@ impl EncryptedTransportOracle {
         stream: &mut TcpStream,
         report: &mut OracleReport,
     ) -> io::Result<()> {
-        let mut messages = 0_usize;
-        loop {
-            messages += 1;
-            if messages > self.max_client_messages {
-                return Err(io::Error::other("too many client setup messages"));
-            }
+        for _ in 0..self.max_client_messages {
             let mut kind = [0_u8; 1];
             stream.read_exact(&mut kind)?;
-            println!("client setup message: {:#04x}", kind[0]);
+            eprintln!("oracle setup: client message {:#04x}", kind[0]);
             match kind[0] {
                 0x21 => {
-                    let mut rest = vec![0_u8; 65];
-                    stream.read_exact(&mut rest)?;
                     let mut message = vec![kind[0]];
-                    message.extend_from_slice(&rest);
-                    let (information, consumed) =
-                        parse_ard_viewer_information(&message, 66).map_err(io::Error::other)?;
-                    if consumed != message.len() {
-                        return Err(io::Error::other("invalid viewer information length"));
-                    }
-                    report.viewer_information = Some(information);
+                    message.resize(66, 0);
+                    stream.read_exact(&mut message[1..])?;
+                    report.viewer_information = Some(
+                        parse_ard_viewer_information(&message, 66)
+                            .map_err(io::Error::other)?
+                            .0,
+                    );
                 }
                 0x12 => {
-                    let mut rest = vec![0_u8; 11];
-                    stream.read_exact(&mut rest)?;
                     let mut message = vec![kind[0]];
-                    message.extend_from_slice(&rest);
-                    let (parsed, consumed) =
-                        parse_ard_set_encryption_level(&message, 16).map_err(io::Error::other)?;
-                    if consumed != message.len() {
-                        return Err(io::Error::other("invalid set-encryption-level length"));
-                    }
+                    message.resize(12, 0);
+                    stream.read_exact(&mut message[1..])?;
+                    let parsed = parse_ard_set_encryption_level(&message, 16)
+                        .map_err(io::Error::other)?
+                        .0;
                     if parsed.command == ArdSetEncryptionLevel::COMMAND_SET_METHODS {
                         report.set_encryption_level = Some(parsed);
                     }
                 }
-                0 => {
-                    let mut payload = [0_u8; 19];
-                    stream.read_exact(&mut payload)?;
-                }
+                0 => read_discard(stream, 19)?,
                 2 => {
                     let mut header = [0_u8; 3];
                     stream.read_exact(&mut header)?;
                     let count = usize::from(u16::from_be_bytes([header[1], header[2]]));
-                    if count > 256 {
-                        return Err(io::Error::other("invalid encoding count"));
-                    }
-                    let mut encodings = vec![0_u8; count.saturating_mul(4)];
-                    stream.read_exact(&mut encodings)?;
-                    report.viewer_encodings = encodings
+                    let mut values = vec![0_u8; count * 4];
+                    stream.read_exact(&mut values)?;
+                    report.viewer_encodings = values
                         .chunks_exact(4)
-                        .map(|encoding| {
-                            i32::from_be_bytes(encoding.try_into().expect("encoding width checked"))
-                        })
+                        .map(|value| i32::from_be_bytes(value.try_into().unwrap()))
                         .collect();
+                    eprintln!("oracle setup: encodings {:?}", report.viewer_encodings);
+                    if report.set_encryption_level.is_some() {
+                        return Ok(());
+                    }
                 }
                 3 => {
-                    let mut request = [0_u8; 9];
-                    stream.read_exact(&mut request)?;
+                    read_discard(stream, 9)?;
                     return Ok(());
                 }
-                4 => {
-                    let mut key_event = [0_u8; 7];
-                    stream.read_exact(&mut key_event)?;
-                }
-                5 => {
-                    let mut pointer_event = [0_u8; 5];
-                    stream.read_exact(&mut pointer_event)?;
-                }
+                4 => read_discard(stream, 7)?,
+                5 => read_discard(stream, 5)?,
                 6 => {
                     let mut header = [0_u8; 7];
                     stream.read_exact(&mut header)?;
-                    let length = usize::try_from(u32::from_be_bytes(
-                        header[3..7].try_into().expect("cut-text length"),
-                    ))
-                    .map_err(|_| io::Error::other("invalid cut-text length"))?;
-                    if length > MAX_PLAINTEXT_RECORD {
-                        return Err(io::Error::other("cut-text length exceeds limit"));
-                    }
-                    let mut text = vec![0_u8; length];
-                    stream.read_exact(&mut text)?;
+                    read_discard(
+                        stream,
+                        u32::from_be_bytes(header[3..7].try_into().unwrap()) as usize,
+                    )?;
                 }
-                10 => {
-                    let mut options = [0_u8; 3];
-                    stream.read_exact(&mut options)?;
-                }
+                10 => read_discard(stream, 3)?,
                 other => {
                     return Err(io::Error::other(format!(
-                        "unsupported client setup message {other}"
+                        "unsupported setup message {other:#04x}"
                     )));
                 }
             }
         }
+        Err(io::Error::other("too many setup messages"))
     }
 
-    fn build_control(&self, authentication_value: [u8; 16]) -> ArdEncryptionControl {
-        let cipher = Aes128::new(GenericArray::from_slice(&authentication_value));
-        let mut wrapped = [self.session_value, self.initial_chaining_value];
-        for block in &mut wrapped {
-            cipher.encrypt_block(GenericArray::from_mut_slice(block));
+    fn select_mode(&self, encodings: &[i32]) -> io::Result<OracleMode> {
+        if let Some(encoding) = self.mode.encoding() {
+            return encodings
+                .contains(&encoding)
+                .then_some(self.mode)
+                .ok_or_else(|| {
+                    io::Error::other(format!("viewer did not offer encoding {encoding}"))
+                });
         }
-        ArdEncryptionControl::new(ArdEncryptionControl::ENABLE_COMMAND, wrapped)
-            .expect("enable command is valid")
+        [
+            (ENCODING_AVC_MEDIA_STREAM, OracleMode::H264),
+            (Encoding::ArdMvs as i32, OracleMode::AdaptiveMvs),
+            (Encoding::ArdHalftone as i32, OracleMode::Halftone),
+            (Encoding::ArdGrayscale as i32, OracleMode::Grayscale),
+            (Encoding::ArdThousands as i32, OracleMode::Thousands),
+            (Encoding::Zlib as i32, OracleMode::FullColor),
+        ]
+        .into_iter()
+        .find_map(|(encoding, mode)| encodings.contains(&encoding).then_some(mode))
+        .ok_or_else(|| io::Error::other("viewer offered no supported oracle encoding"))
     }
 
-    fn send_plain_frames(
+    fn send_next_frame(
         &self,
         stream: &mut TcpStream,
+        encoder: &mut ArdSessionRecordEncoder,
+        frames: &mut RfbFrames,
+        report: &mut OracleReport,
+    ) -> io::Result<bool> {
+        let frame = match frames.next()? {
+            Some(frame) => frame,
+            None if self.close_after_frames.is_some() => return Ok(false),
+            None => {
+                frames.rewind()?;
+                frames
+                    .next()?
+                    .ok_or_else(|| io::Error::other("oracle fixture has no frames"))?
+            }
+        };
+        match write_encrypted_message(
+            stream,
+            encoder,
+            &frame,
+            &mut report.server_to_client_records,
+        ) {
+            Ok(()) => {}
+            Err(error) if connection_closed(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        report.frames_sent += 1;
+        if report.frames_sent == 1
+            && let Some(text) = &self.server_clipboard_text
+        {
+            let mut clipboard = vec![3, 0, 0, 0];
+            clipboard.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            clipboard.extend_from_slice(text);
+            write_encrypted_message(
+                stream,
+                encoder,
+                &clipboard,
+                &mut report.server_to_client_records,
+            )?;
+        }
+        Ok(!self
+            .close_after_frames
+            .is_some_and(|limit| report.frames_sent >= limit))
+    }
+
+    fn run_plain(
+        &self,
+        mut stream: TcpStream,
         mut report: OracleReport,
     ) -> io::Result<OracleReport> {
-        let white = mvs_white_rectangle(self.width, self.height);
-        send_mvs_rectangle(stream, 0, 0, self.width, self.height, &white)?;
-        report.frames_sent += 1;
-        let solid = mvs_solid_ycbcr_rectangle(self.width, self.height, 200, 128, 128);
-        send_mvs_rectangle(stream, 0, 0, self.width, self.height, &solid)?;
-        report.frames_sent += 1;
-        let mut sink = [0_u8; 4096];
-        while stream.read(&mut sink)? != 0 {}
+        let selected = self.select_mode(&report.viewer_encodings)?;
+        report.selected_mode = Some(selected);
+        let mut frames = RfbFrames::open(selected, &self.fixtures, self.width, self.height)?;
+        while let Some(frame) = frames.next()? {
+            stream.write_all(&frame)?;
+            stream.flush()?;
+            report.frames_sent += 1;
+            if self
+                .close_after_frames
+                .is_some_and(|limit| report.frames_sent >= limit)
+            {
+                break;
+            }
+            thread::sleep(self.frame_interval);
+        }
         Ok(report)
     }
+}
+
+fn connection_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
+fn read_discard(stream: &mut TcpStream, length: usize) -> io::Result<()> {
+    let mut bytes = vec![0_u8; length];
+    stream.read_exact(&mut bytes)
 }
 
 fn encrypted_client_message_len(bytes: &[u8]) -> io::Result<Option<usize>> {
     let Some(&message_type) = bytes.first() else {
         return Ok(None);
     };
-    let fixed = match message_type {
-        3 => Some(10),
-        4 => Some(8),
-        5 => Some(6),
-        9 => Some(16),
-        0x17 => Some(58),
-        _ => None,
-    };
-    let length = if let Some(length) = fixed {
-        length
-    } else if message_type == 6 {
-        if bytes.len() < 8 {
-            return Ok(None);
+    let length = match message_type {
+        0 => 20,
+        2 => {
+            if bytes.len() < 4 {
+                return Ok(None);
+            }
+            4 + usize::from(u16::from_be_bytes([bytes[2], bytes[3]])) * 4
         }
-        8_usize
-            .checked_add(
-                u32::from_be_bytes(bytes[4..8].try_into().expect("cut text length")) as usize,
-            )
-            .ok_or_else(|| io::Error::other("client cut-text length overflow"))?
-    } else if matches!(message_type, 0x1c | 0x1d) {
-        if bytes.len() < 4 {
-            return Ok(None);
+        3 => 10,
+        4 => 8,
+        5 => 6,
+        9 => 16,
+        0x10 => 8,
+        0x17 => 58,
+        6 => {
+            if bytes.len() < 8 {
+                return Ok(None);
+            }
+            8 + u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize
         }
-        4_usize
-            .checked_add(usize::from(u16::from_be_bytes([bytes[2], bytes[3]])))
-            .ok_or_else(|| io::Error::other("ARD client message length overflow"))?
-    } else {
-        return Err(io::Error::other(format!(
-            "unsupported encrypted client message type {message_type:#04x}"
-        )));
+        0x1c | 0x1d => {
+            if bytes.len() < 4 {
+                return Ok(None);
+            }
+            4 + usize::from(u16::from_be_bytes([bytes[2], bytes[3]]))
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "unsupported encrypted client message type {other:#04x}"
+            )));
+        }
     };
-    if length > 16 * 1024 * 1024 {
-        return Err(io::Error::other("encrypted client message is too large"));
-    }
     Ok((bytes.len() >= length).then_some(length))
+}
+
+fn record_client_message(message: &[u8], report: &mut OracleReport) {
+    match message[0] {
+        3 => {
+            report
+                .client_framebuffer_update_incremental
+                .push(message[1] != 0);
+            report.client_framebuffer_update_rectangles.push((
+                u16::from_be_bytes([message[2], message[3]]),
+                u16::from_be_bytes([message[4], message[5]]),
+                u16::from_be_bytes([message[6], message[7]]),
+                u16::from_be_bytes([message[8], message[9]]),
+            ));
+        }
+        9 => report.client_auto_frame_update_rectangles.push((
+            u16::from_be_bytes([message[8], message[9]]),
+            u16::from_be_bytes([message[10], message[11]]),
+            u16::from_be_bytes([message[12], message[13]]),
+            u16::from_be_bytes([message[14], message[15]]),
+        )),
+        _ => {}
+    }
+}
+
+fn build_control(
+    session_value: [u8; 16],
+    initial_chaining_value: [u8; 16],
+    authentication_value: [u8; 16],
+) -> ArdEncryptionControl {
+    let cipher = Aes128::new(GenericArray::from_slice(&authentication_value));
+    let mut wrapped = [session_value, initial_chaining_value];
+    for block in &mut wrapped {
+        cipher.encrypt_block(GenericArray::from_mut_slice(block));
+    }
+    ArdEncryptionControl::new(ArdEncryptionControl::ENABLE_COMMAND, wrapped).unwrap()
 }
 
 fn send_control_rectangle(
@@ -517,221 +809,679 @@ fn send_control_rectangle(
     stream.flush()
 }
 
-fn send_mvs_rectangle(
+fn write_encrypted_message(
     stream: &mut TcpStream,
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
-    payload: &[u8],
+    encoder: &mut ArdSessionRecordEncoder,
+    message: &[u8],
+    records: &mut usize,
 ) -> io::Result<()> {
-    let mut update = vec![0, 0, 0, 1];
-    update.extend_from_slice(&x.to_be_bytes());
-    update.extend_from_slice(&y.to_be_bytes());
-    update.extend_from_slice(&width.to_be_bytes());
-    update.extend_from_slice(&height.to_be_bytes());
-    update.extend_from_slice(&(Encoding::ArdMvs as i32).to_be_bytes());
-    update.extend_from_slice(payload);
-    stream.write_all(&update)?;
+    for chunk in message.chunks(MAX_RECORD_PAYLOAD) {
+        stream.write_all(&encoder.encode_wire(chunk).map_err(io::Error::other)?)?;
+        *records += 1;
+    }
     stream.flush()
 }
 
-fn push_bits(output: &mut Vec<bool>, value: u32, width: u8) {
-    for shift in (0..width).rev() {
-        output.push(value & (1 << shift) != 0);
-    }
-}
-
-fn pack_bits(bits: &[bool]) -> Vec<u8> {
-    let mut output = vec![0_u8; bits.len().div_ceil(8)];
-    for (position, value) in bits.iter().copied().enumerate() {
-        if value {
-            output[position / 8] |= 0x80 >> (position % 8);
-        }
-    }
-    output
-}
-
-fn frame_mvs_rectangle(payload: &[u8], width: u16, height: u16) -> Vec<u8> {
-    let mut update = vec![0, 0, 0, 1];
-    update.extend_from_slice(&0_u16.to_be_bytes());
-    update.extend_from_slice(&0_u16.to_be_bytes());
+fn framebuffer_update(width: u16, height: u16, encoding: i32, payload: &[u8]) -> Vec<u8> {
+    let mut update = vec![0, 0, 0, 1, 0, 0, 0, 0];
     update.extend_from_slice(&width.to_be_bytes());
     update.extend_from_slice(&height.to_be_bytes());
-    update.extend_from_slice(&(Encoding::ArdMvs as i32).to_be_bytes());
+    update.extend_from_slice(&encoding.to_be_bytes());
     update.extend_from_slice(payload);
     update
 }
 
-fn zlib_solid_rectangle(
-    compressor: &mut Compress,
-    width: u16,
-    height: u16,
-    rgb: [u8; 3],
-) -> io::Result<Vec<u8>> {
-    let pixels = usize::from(width)
-        .checked_mul(usize::from(height))
-        .ok_or_else(|| io::Error::other("oracle framebuffer size overflow"))?;
-    let mut plain = Vec::with_capacity(pixels.saturating_mul(4));
-    for _ in 0..pixels {
-        // XRGB8888 is little-endian on the wire: B, G, R, unused.
-        plain.extend_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
-    }
-    let before_out = compressor.total_out();
-    let mut compressed = vec![0; plain.len().saturating_mul(2).saturating_add(128)];
-    compressor
-        .compress(&plain, &mut compressed, FlushCompress::Sync)
-        .map_err(io::Error::other)?;
-    let produced = usize::try_from(compressor.total_out() - before_out)
-        .map_err(|_| io::Error::other("oracle compressed size overflow"))?;
-    compressed.truncate(produced);
-
-    let mut update = vec![0, 0, 0, 1];
-    update.extend_from_slice(&0_u16.to_be_bytes());
-    update.extend_from_slice(&0_u16.to_be_bytes());
-    update.extend_from_slice(&width.to_be_bytes());
-    update.extend_from_slice(&height.to_be_bytes());
-    update.extend_from_slice(&(Encoding::Zlib as i32).to_be_bytes());
-    let compressed_len = u32::try_from(compressed.len())
-        .map_err(|_| io::Error::other("oracle compressed rectangle is too large"))?;
-    update.extend_from_slice(&compressed_len.to_be_bytes());
-    update.extend_from_slice(&compressed);
-    Ok(update)
+fn display_info_payload(width: u16, height: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(38);
+    payload.extend_from_slice(&0_u16.to_be_bytes());
+    payload.extend_from_slice(&0_u16.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&1_u16.to_be_bytes());
+    payload.extend_from_slice(&1_u32.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&[0; 16]);
+    payload
 }
 
-fn mvs_white_rectangle(width: u16, height: u16) -> Vec<u8> {
-    let tiles = usize::from(width).div_ceil(8) * usize::from(height).div_ceil(8);
-    let repeat = tiles - 1;
-    let mut bits = Vec::new();
-    push_bits(&mut bits, 0, 1); // initial state
-    push_bits(&mut bits, 0, 3); // white tile update
-    if repeat == 0 {
-        push_bits(&mut bits, 0, 1);
-    } else if repeat <= 15 {
-        push_bits(&mut bits, 1, 1);
-        push_bits(&mut bits, (repeat - 1) as u32, 4);
-    } else {
-        push_bits(&mut bits, 1, 1);
-        push_bits(&mut bits, 15, 4);
-        let mut value = repeat - 16;
-        for group_index in 0..3 {
-            let has_more = value >= 0x80 && group_index != 2;
-            let group = (value & 0x7f) | (usize::from(has_more) * 0x80);
-            push_bits(&mut bits, group as u32, 8);
-            value >>= 7;
-            if !has_more {
-                break;
+struct RecordReader {
+    reader: BufReader<File>,
+}
+
+impl RecordReader {
+    fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            reader: BufReader::new(File::open(path)?),
+        })
+    }
+
+    fn next(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut prefix = [0_u8; 4];
+        match self.reader.read_exact(&mut prefix[..1]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        self.reader.read_exact(&mut prefix[1..])?;
+        let length = u32::from_be_bytes(prefix) as usize;
+        let mut payload = Vec::with_capacity(4 + length);
+        payload.extend_from_slice(&prefix);
+        payload.resize(4 + length, 0);
+        self.reader.read_exact(&mut payload[4..])?;
+        Ok(Some(payload))
+    }
+
+    fn rewind(&mut self) -> io::Result<()> {
+        self.reader.rewind()
+    }
+}
+
+fn count_records(path: &Path) -> io::Result<usize> {
+    let mut reader = RecordReader::open(path)?;
+    let mut count = 0;
+    while reader.next()?.is_some() {
+        count += 1;
+    }
+    Ok(count)
+}
+
+enum RfbFrames {
+    Direct {
+        records: RecordReader,
+        encoding: i32,
+        width: u16,
+        height: u16,
+    },
+    Converted {
+        records: RecordReader,
+        input: Decompress,
+        output: Compress,
+        mode: OracleMode,
+        width: u16,
+        height: u16,
+    },
+}
+
+impl RfbFrames {
+    fn open(
+        mode: OracleMode,
+        fixtures: &OracleFixtures,
+        width: u16,
+        height: u16,
+    ) -> io::Result<Self> {
+        match mode {
+            OracleMode::AdaptiveMvs => Ok(Self::Direct {
+                records: RecordReader::open(&fixtures.mvs)?,
+                encoding: Encoding::ArdMvs as i32,
+                width,
+                height,
+            }),
+            OracleMode::FullColor => Ok(Self::Direct {
+                records: RecordReader::open(&fixtures.zlib)?,
+                encoding: Encoding::Zlib as i32,
+                width,
+                height,
+            }),
+            OracleMode::Halftone | OracleMode::Grayscale | OracleMode::Thousands => {
+                Ok(Self::Converted {
+                    records: RecordReader::open(&fixtures.zlib)?,
+                    input: Decompress::new(true),
+                    output: Compress::new(Compression::default(), true),
+                    mode,
+                    width,
+                    height,
+                })
+            }
+            _ => Err(io::Error::other("mode is not an RFB fixture mode")),
+        }
+    }
+
+    fn next(&mut self) -> io::Result<Option<Vec<u8>>> {
+        match self {
+            Self::Direct {
+                records,
+                encoding,
+                width,
+                height,
+            } => Ok(records
+                .next()?
+                .map(|payload| framebuffer_update(*width, *height, *encoding, &payload))),
+            Self::Converted {
+                records,
+                input,
+                output,
+                mode,
+                width,
+                height,
+            } => {
+                let Some(record) = records.next()? else {
+                    return Ok(None);
+                };
+                let pixels = usize::from(*width) * usize::from(*height);
+                let mut xrgb = vec![0_u8; pixels * 4];
+                let before = input.total_out();
+                input
+                    .decompress(&record[4..], &mut xrgb, FlushDecompress::Sync)
+                    .map_err(io::Error::other)?;
+                if input.total_out() - before != xrgb.len() as u64 {
+                    return Err(io::Error::other("zlib fixture frame has the wrong size"));
+                }
+                let encoded = convert_pixels(*mode, &xrgb, *width, *height);
+                let before = output.total_out();
+                let mut compressed = vec![0_u8; encoded.len() * 2 + 128];
+                output
+                    .compress(&encoded, &mut compressed, FlushCompress::Sync)
+                    .map_err(io::Error::other)?;
+                compressed.truncate((output.total_out() - before) as usize);
+                let mut payload = (compressed.len() as u32).to_be_bytes().to_vec();
+                payload.extend_from_slice(&compressed);
+                Ok(Some(framebuffer_update(
+                    *width,
+                    *height,
+                    mode.encoding().unwrap(),
+                    &payload,
+                )))
             }
         }
     }
-    push_bits(&mut bits, 0x6d, 8); // primary marker
 
-    let primary = pack_bits(&bits);
-    let secondary_offset = 6 + primary.len();
-    let mut update = vec![
-        0,
-        0,
-        0,
-        ((secondary_offset >> 16) & 0xff) as u8,
-        ((secondary_offset >> 8) & 0xff) as u8,
-        (secondary_offset & 0xff) as u8,
-    ];
-    update.extend_from_slice(&primary);
-    update.push(0x6d); // secondary marker
-
-    let mut framed = (update.len() as u32).to_be_bytes().to_vec();
-    framed.extend_from_slice(&update);
-    frame_mvs_rectangle(&framed, width, height)
+    fn rewind(&mut self) -> io::Result<()> {
+        match self {
+            Self::Direct { records, .. } => records.rewind(),
+            Self::Converted { records, input, .. } => {
+                records.rewind()?;
+                input.reset(true);
+                Ok(())
+            }
+        }
+    }
 }
 
-fn mvs_solid_ycbcr_rectangle(width: u16, height: u16, y: u8, cb: u8, cr: u8) -> Vec<u8> {
-    let tiles = usize::from(width).div_ceil(8) * usize::from(height).div_ceil(8);
-    let mut primary_bits = Vec::new();
-    push_bits(&mut primary_bits, 0, 1); // initial state
-    push_bits(&mut primary_bits, 4, 3); // solid/two-colour update
-    push_bits(&mut primary_bits, 0, 1); // no repeat
-    let remaining = tiles - 1;
-    if remaining > 0 {
-        push_bits(&mut primary_bits, 0, 3); // white tile update
-        let repeat = remaining - 1;
-        if repeat <= 15 {
-            push_bits(&mut primary_bits, 1, 1);
-            push_bits(&mut primary_bits, repeat as u32, 4);
+fn convert_pixels(mode: OracleMode, xrgb: &[u8], width: u16, height: u16) -> Vec<u8> {
+    fn luminance(pixel: &[u8]) -> u8 {
+        let value = u32::from(pixel[2]) * 54 + u32::from(pixel[1]) * 183 + u32::from(pixel[0]) * 19;
+        (value >> 8) as u8
+    }
+    match mode {
+        OracleMode::Halftone => {
+            let row_bytes = usize::from(width).div_ceil(8);
+            let mut output = vec![0_u8; row_bytes * usize::from(height)];
+            for (index, pixel) in xrgb.chunks_exact(4).enumerate() {
+                let x = index % usize::from(width);
+                let y = index / usize::from(width);
+                if luminance(pixel) >= 128 {
+                    output[y * row_bytes + x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+            output
+        }
+        OracleMode::Grayscale => {
+            let row_bytes = usize::from(width).div_ceil(2);
+            let mut output = vec![0_u8; row_bytes * usize::from(height)];
+            for (index, pixel) in xrgb.chunks_exact(4).enumerate() {
+                let x = index % usize::from(width);
+                let y = index / usize::from(width);
+                let value = luminance(pixel) >> 4;
+                output[y * row_bytes + x / 2] |= if x.is_multiple_of(2) {
+                    value << 4
+                } else {
+                    value
+                };
+            }
+            output
+        }
+        OracleMode::Thousands => {
+            let mut output = Vec::with_capacity(usize::from(width) * usize::from(height) * 2);
+            for pixel in xrgb.chunks_exact(4) {
+                let value = u16::from(pixel[2] >> 3) << 10
+                    | u16::from(pixel[1] >> 3) << 5
+                    | u16::from(pixel[0] >> 3);
+                output.extend_from_slice(&value.to_be_bytes());
+            }
+            output
+        }
+        _ => unreachable!(),
+    }
+}
+
+struct MediaOracle {
+    socket: Option<UdpSocket>,
+    peer_ip: IpAddr,
+    port: u16,
+    codec: Option<MediaStreamCodec>,
+}
+
+impl MediaOracle {
+    fn bind(
+        local_ip: IpAddr,
+        peer_ip: IpAddr,
+        codec: Option<MediaStreamCodec>,
+    ) -> io::Result<Self> {
+        let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))?;
+        let port = socket.local_addr()?.port();
+        Ok(Self {
+            socket: Some(socket),
+            peer_ip,
+            port,
+            codec,
+        })
+    }
+
+    fn bootstrap(&self, width: u16, height: u16) -> Vec<u8> {
+        let message = MediaStreamMessage1 {
+            encoding: ENCODING_AVC_MEDIA_STREAM,
+            video1_port: self.port,
+            video2_port: None,
+            audio_port: None,
+            video1_hdr: false,
+            video2_hdr: false,
+            stream_count: 1,
+        };
+        framebuffer_update(width, height, ENCODING_AVC_MEDIA_STREAM, &message.encode())
+    }
+
+    fn answer(
+        &mut self,
+        configuration: MediaStreamConfiguration,
+        fixtures: &OracleFixtures,
+        interval: Duration,
+        frame_limit: Option<usize>,
+    ) -> io::Result<(Vec<u8>, MediaStreamCodec)> {
+        let offer =
+            MediaStreamOffer::parse(&configuration.video1_offer).map_err(io::Error::other)?;
+        let requested = offer
+            .codec
+            .codec
+            .ok_or_else(|| io::Error::other("media offer did not select H.264 or HEVC"))?;
+        let codec = self.codec.unwrap_or(requested);
+        if requested != codec {
+            return Err(io::Error::other(
+                "media offer codec does not match oracle mode",
+            ));
+        }
+
+        let answer_body = build_media_stream_offer_with_ssrc_and_codec(
+            "6A110000-0000-0000-0000-000000000001",
+            &build_remote_endpoint_info("Mac16,12", "25G72"),
+            7,
+            2,
+            MEDIA_BASE_SSRC,
+            codec,
+        )
+        .map_err(io::Error::other)?;
+        let body_len = 14 + answer_body.len();
+        let mut compact = Vec::with_capacity(body_len + 2);
+        compact.extend_from_slice(&(body_len as u16).to_be_bytes());
+        compact.extend_from_slice(&0x0002_0002_u32.to_be_bytes());
+        compact.extend_from_slice(&0_u32.to_be_bytes());
+        compact.extend_from_slice(&[0; 6]);
+        compact.extend_from_slice(&answer_body);
+
+        let socket = self.socket.take().expect("one media offer per session");
+        let destination = SocketAddr::new(self.peer_ip, self.port);
+        let key = *configuration.keys.video1_server_to_viewer();
+        let path = match codec {
+            MediaStreamCodec::H264 => fixtures.h264.clone(),
+            MediaStreamCodec::Hevc => fixtures.hevc.clone(),
+        };
+        thread::spawn(move || {
+            let _ =
+                stream_media_fixture(socket, destination, path, key, codec, interval, frame_limit);
+        });
+        Ok((
+            framebuffer_update(WIDTH, HEIGHT, ENCODING_AVC_MEDIA_STREAM, &compact),
+            codec,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct FixtureAccessUnit {
+    nal_units: Vec<Vec<u8>>,
+}
+
+fn read_annex_b(path: &Path, codec: MediaStreamCodec) -> io::Result<Vec<FixtureAccessUnit>> {
+    let bytes = std::fs::read(path)?;
+    let mut starts = Vec::new();
+    let mut index = 0;
+    while index + 3 < bytes.len() {
+        let prefix = if bytes[index..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if bytes[index..].starts_with(&[0, 0, 1]) {
+            3
         } else {
-            push_bits(&mut primary_bits, 1, 1); // extended repeat
-            push_bits(&mut primary_bits, 15, 4);
-            let mut value = repeat - 16;
-            for group_index in 0..3 {
-                let has_more = value >= 0x80 && group_index != 2;
-                let group = (value & 0x7f) | (usize::from(has_more) * 0x80);
-                push_bits(&mut primary_bits, group as u32, 8);
-                value >>= 7;
-                if !has_more {
-                    break;
+            index += 1;
+            continue;
+        };
+        starts.push((index, prefix));
+        index += prefix;
+    }
+    let mut nals = Vec::new();
+    for (position, &(start, prefix)) in starts.iter().enumerate() {
+        let end = starts
+            .get(position + 1)
+            .map_or(bytes.len(), |entry| entry.0);
+        if start + prefix < end {
+            nals.push(bytes[start + prefix..end].to_vec());
+        }
+    }
+
+    let is_aud = |nal: &[u8]| match codec {
+        MediaStreamCodec::H264 => nal[0] & 0x1f == 9,
+        MediaStreamCodec::Hevc => (nal[0] >> 1) & 0x3f == 35,
+    };
+    let mut units = Vec::new();
+    let mut current = Vec::new();
+    let mut saw_aud = false;
+    for nal in nals {
+        if is_aud(&nal) {
+            if saw_aud && !current.is_empty() {
+                units.push(FixtureAccessUnit {
+                    nal_units: std::mem::take(&mut current),
+                });
+            }
+            saw_aud = true;
+        } else {
+            current.push(nal);
+        }
+    }
+    if !current.is_empty() {
+        units.push(FixtureAccessUnit { nal_units: current });
+    }
+    Ok(units)
+}
+
+fn stream_media_fixture(
+    socket: UdpSocket,
+    destination: SocketAddr,
+    path: PathBuf,
+    key: [u8; 46],
+    codec: MediaStreamCodec,
+    interval: Duration,
+    frame_limit: Option<usize>,
+) -> io::Result<()> {
+    let units = read_annex_b(&path, codec)?;
+    let limit = frame_limit
+        .map(|frames| frames.saturating_mul(4))
+        .unwrap_or(units.len())
+        .min(units.len());
+    let mut sequence = [0_u16; 4];
+    let mut crypto = [
+        SrtpContext::from_key_blob_with_derived_ssrc(&key, MEDIA_BASE_SSRC)
+            .map_err(io::Error::other)?,
+        SrtpContext::from_key_blob_with_derived_ssrc(&key, MEDIA_BASE_SSRC + 1)
+            .map_err(io::Error::other)?,
+        SrtpContext::from_key_blob_with_derived_ssrc(&key, MEDIA_BASE_SSRC + 2)
+            .map_err(io::Error::other)?,
+        SrtpContext::from_key_blob_with_derived_ssrc(&key, MEDIA_BASE_SSRC + 3)
+            .map_err(io::Error::other)?,
+    ];
+    let started = Instant::now();
+    for (index, unit) in units.into_iter().take(limit).enumerate() {
+        let layer = index % 4;
+        let timestamp = (index / 4) as u32 * 1_500;
+        let payloads = packetize_access_unit(&unit, codec, index as u16);
+        let count = payloads.len();
+        for (packet_index, payload) in payloads.into_iter().enumerate() {
+            let marker = packet_index + 1 == count;
+            let payload_type = match codec {
+                MediaStreamCodec::H264 => 123,
+                MediaStreamCodec::Hevc => 100,
+            };
+            let mut packet = Vec::with_capacity(12 + payload.len() + 10);
+            packet.push(0x80);
+            packet.push(payload_type | if marker { 0x80 } else { 0 });
+            packet.extend_from_slice(&sequence[layer].to_be_bytes());
+            packet.extend_from_slice(&timestamp.to_be_bytes());
+            packet.extend_from_slice(&(MEDIA_BASE_SSRC + layer as u32).to_be_bytes());
+            packet.extend_from_slice(&payload);
+            crypto[layer]
+                .protect_rtp_packet(&mut packet, sequence[layer], 12)
+                .map_err(io::Error::other)?;
+            socket.send_to(&packet, destination)?;
+            sequence[layer] = sequence[layer].wrapping_add(1);
+        }
+        if layer == 3 {
+            let deadline = started + interval.mul_f64((index / 4 + 1) as f64);
+            if let Some(delay) = deadline.checked_duration_since(Instant::now()) {
+                thread::sleep(delay);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn packetize_access_unit(
+    unit: &FixtureAccessUnit,
+    codec: MediaStreamCodec,
+    don: u16,
+) -> Vec<Vec<u8>> {
+    let mut packets = Vec::new();
+    for nal in &unit.nal_units {
+        match codec {
+            MediaStreamCodec::H264 if nal.len() + 5 <= MEDIA_PAYLOAD_BYTES => {
+                let mut payload = vec![nal[0] & 0xe0 | 25];
+                payload.extend_from_slice(&don.to_be_bytes());
+                payload.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+                payload.extend_from_slice(nal);
+                packets.push(payload);
+            }
+            MediaStreamCodec::H264 => {
+                let header = nal[0];
+                let chunks: Vec<_> = nal[1..].chunks(MEDIA_PAYLOAD_BYTES - 4).collect();
+                let count = chunks.len();
+                for (index, chunk) in chunks.into_iter().enumerate() {
+                    let mut payload = vec![
+                        header & 0xe0 | if index == 0 { 29 } else { 28 },
+                        header & 0x1f,
+                    ];
+                    if index == 0 {
+                        payload[1] |= 0x80;
+                        payload.extend_from_slice(&don.to_be_bytes());
+                    }
+                    if index + 1 == count {
+                        payload[1] |= 0x40;
+                    }
+                    payload.extend_from_slice(chunk);
+                    packets.push(payload);
+                }
+            }
+            MediaStreamCodec::Hevc if nal.len() + 6 <= MEDIA_PAYLOAD_BYTES => {
+                let mut payload = vec![nal[0] & 0x81 | (48 << 1), nal[1]];
+                payload.extend_from_slice(&don.to_be_bytes());
+                payload.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+                payload.extend_from_slice(nal);
+                packets.push(payload);
+            }
+            MediaStreamCodec::Hevc => {
+                let nal_type = (nal[0] >> 1) & 0x3f;
+                let chunks: Vec<_> = nal[2..].chunks(MEDIA_PAYLOAD_BYTES - 5).collect();
+                let count = chunks.len();
+                for (index, chunk) in chunks.into_iter().enumerate() {
+                    let mut payload = vec![nal[0] & 0x81 | (49 << 1), nal[1], nal_type];
+                    if index == 0 {
+                        payload[2] |= 0x80;
+                    }
+                    if index + 1 == count {
+                        payload[2] |= 0x40;
+                    }
+                    payload.extend_from_slice(&don.to_be_bytes());
+                    payload.extend_from_slice(chunk);
+                    packets.push(payload);
                 }
             }
         }
     }
-    push_bits(&mut primary_bits, 0x6d, 8); // primary marker
-    let primary = pack_bits(&primary_bits);
-
-    let mut secondary_bits = Vec::new();
-    push_bits(&mut secondary_bits, 0, 1); // solid rather than two-colour
-    push_bits(&mut secondary_bits, 0, 1); // transmit a new colour
-    push_bits(&mut secondary_bits, u32::from(y), 8);
-    push_bits(&mut secondary_bits, u32::from(cb >> 2), 6);
-    push_bits(&mut secondary_bits, u32::from(cr >> 2), 6);
-    push_bits(&mut secondary_bits, 0x6d, 8); // secondary marker
-    let secondary = pack_bits(&secondary_bits);
-
-    let secondary_offset = 6 + primary.len();
-    let mut update = vec![
-        0,
-        0,
-        0,
-        ((secondary_offset >> 16) & 0xff) as u8,
-        ((secondary_offset >> 8) & 0xff) as u8,
-        (secondary_offset & 0xff) as u8,
-    ];
-    update.extend_from_slice(&primary);
-    update.extend_from_slice(&secondary);
-
-    let mut framed = (update.len() as u32).to_be_bytes().to_vec();
-    framed.extend_from_slice(&update);
-    frame_mvs_rectangle(&framed, width, height)
+    packets
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{mvs_solid_ycbcr_rectangle, mvs_white_rectangle};
+    use super::*;
 
     #[test]
-    fn white_frame_is_a_complete_mvs_framebuffer_update() {
-        let frame = mvs_white_rectangle(64, 64);
-        assert_eq!(&frame[..4], &[0, 0, 0, 1]);
-        assert_eq!(&frame[4..8], &[0, 0, 0, 0]); // x, y
-        assert_eq!(&frame[8..12], &[0, 64, 0, 64]); // width, height
-        assert_eq!(&frame[12..16], &[0, 0, 3, 0xf3]); // MVS 1011
-        assert_eq!(&frame[16..20], &[0, 0, 0, 11]); // update length
-        // Type 0, zero Rice parameters, secondary offset 10, then the
-        // primary bitstream and both markers.
+    fn frames_native_post_activation_client_messages() {
+        assert_eq!(encrypted_client_message_len(&[0; 20]).unwrap(), Some(20));
         assert_eq!(
-            &frame[20..],
-            &[0, 0, 0, 0, 0, 10, 0x0f, 0x97, 0xb6, 0x80, 0x6d]
+            encrypted_client_message_len(&[2, 0, 0, 1, 0, 0, 0, 6]).unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            encrypted_client_message_len(&[0x10, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+            Some(8)
         );
     }
 
     #[test]
-    fn solid_frame_covers_one_solid_tile_and_white_rest() {
-        let frame = mvs_solid_ycbcr_rectangle(64, 64, 200, 128, 128);
-        assert_eq!(&frame[..4], &[0, 0, 0, 1]);
-        assert_eq!(&frame[12..16], &[0, 0, 3, 0xf3]);
-        assert_eq!(&frame[16..20], &[0, 0, 0, 14]);
+    fn display_info_matches_the_native_single_display_layout() {
+        let payload = display_info_payload(1920, 1080);
+        assert_eq!(payload.len(), 10 + 28);
+        assert_eq!(&payload[..10], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(u32::from_be_bytes(payload[10..14].try_into().unwrap()), 1);
         assert_eq!(
-            &frame[20..],
-            &[
-                0, 0, 0, 0, 0, 10, 0x40, 0xf9, 0x73, 0x68, 0x32, 0x20, 0x81, 0xb4
-            ]
+            u16::from_be_bytes(payload[14..16].try_into().unwrap()),
+            1920
         );
+        assert_eq!(
+            u16::from_be_bytes(payload[16..18].try_into().unwrap()),
+            1080
+        );
+        assert_eq!(&payload[18..], &[0; 20]);
+    }
+
+    #[test]
+    fn repository_fixtures_cover_every_oracle_path() {
+        assert_eq!(
+            OracleFixtures::repository().validate().unwrap(),
+            OracleFixtureSummary {
+                mvs_frames: 300,
+                zlib_frames: 300,
+                h264_access_units: 1200,
+                hevc_access_units: 1200,
+            }
+        );
+    }
+
+    #[test]
+    fn every_rfb_mode_reads_the_first_fixture_frame() {
+        let fixtures = OracleFixtures::repository();
+        for mode in [
+            OracleMode::Halftone,
+            OracleMode::Grayscale,
+            OracleMode::Thousands,
+            OracleMode::AdaptiveMvs,
+            OracleMode::FullColor,
+        ] {
+            let frame = RfbFrames::open(mode, &fixtures, WIDTH, HEIGHT)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(&frame[..4], &[0, 0, 0, 1]);
+            assert_eq!(
+                i32::from_be_bytes(frame[12..16].try_into().unwrap()),
+                mode.encoding().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn media_packetizers_cover_both_samples() {
+        use crate::{H264Depacketizer, HevcDepacketizer, RtpPacket};
+
+        let fixtures = OracleFixtures::repository();
+        for (codec, path) in [
+            (MediaStreamCodec::H264, fixtures.h264),
+            (MediaStreamCodec::Hevc, fixtures.hevc),
+        ] {
+            let units = read_annex_b(&path, codec).unwrap();
+            let mut h264 = H264Depacketizer::new();
+            let mut hevc = HevcDepacketizer::new_with_donl();
+            let mut sequence = 0_u16;
+            for (don, unit) in units.iter().enumerate() {
+                let packets = packetize_access_unit(unit, codec, don as u16);
+                assert!(!packets.is_empty());
+                assert!(
+                    packets
+                        .iter()
+                        .all(|packet| packet.len() <= MEDIA_PAYLOAD_BYTES)
+                );
+                let packet_count = packets.len();
+                let mut decoded = None;
+                for (index, payload) in packets.into_iter().enumerate() {
+                    let mut wire = vec![
+                        0x80,
+                        match codec {
+                            MediaStreamCodec::H264 => 123,
+                            MediaStreamCodec::Hevc => 100,
+                        } | if index + 1 == packet_count { 0x80 } else { 0 },
+                    ];
+                    wire.extend_from_slice(&sequence.to_be_bytes());
+                    wire.extend_from_slice(&((don / 4) as u32 * 1_500).to_be_bytes());
+                    wire.extend_from_slice(&MEDIA_BASE_SSRC.to_be_bytes());
+                    wire.extend_from_slice(&payload);
+                    let packet = RtpPacket::parse(&wire).unwrap();
+                    decoded = match codec {
+                        MediaStreamCodec::H264 => h264.push(&packet).unwrap(),
+                        MediaStreamCodec::Hevc => hevc.push(&packet).unwrap(),
+                    };
+                    sequence = sequence.wrapping_add(1);
+                }
+                let decoded = decoded.expect("marked packet completes access unit");
+                assert_eq!(decoded.decode_order_number, Some(don as u16));
+                assert_eq!(decoded.nal_units, unit.nal_units);
+            }
+        }
+    }
+
+    #[test]
+    fn every_committed_rfb_frame_decodes() {
+        use crate::{Decoder, Framebuffer, FramebufferFormat, Rectangle};
+
+        let fixtures = OracleFixtures::repository();
+        let mut records = RecordReader::open(&fixtures.mvs).unwrap();
+        let mut decoder = Decoder::new_gpu_mvs(PixelFormat::XRGB8888).unwrap();
+        let mut framebuffer = Framebuffer::new_metadata_with_format(
+            WIDTH,
+            HEIGHT,
+            FramebufferFormat::Native(PixelFormat::XRGB8888),
+        )
+        .unwrap();
+        let rect = Rectangle {
+            x: 0,
+            y: 0,
+            width: WIDTH,
+            height: HEIGHT,
+            encoding: Encoding::ArdMvs as i32,
+        };
+        let mut mvs_count = 0;
+        while let Some(payload) = records.next().unwrap() {
+            assert_eq!(
+                decoder
+                    .decode_complete_rectangle(rect, &payload, &mut framebuffer)
+                    .unwrap(),
+                payload.len()
+            );
+            assert_eq!(decoder.take_gpu_mvs_frames().len(), 1);
+            mvs_count += 1;
+        }
+        assert_eq!(mvs_count, DISPLAY_FRAME_COUNT);
+
+        let mut records = RecordReader::open(&fixtures.zlib).unwrap();
+        let mut decoder = Decompress::new(true);
+        let mut pixels = vec![0_u8; usize::from(WIDTH) * usize::from(HEIGHT) * 4];
+        let mut zlib_count = 0;
+        while let Some(payload) = records.next().unwrap() {
+            let before_in = decoder.total_in();
+            let before_out = decoder.total_out();
+            decoder
+                .decompress(&payload[4..], &mut pixels, FlushDecompress::Sync)
+                .unwrap();
+            assert_eq!(decoder.total_in() - before_in, (payload.len() - 4) as u64);
+            assert_eq!(decoder.total_out() - before_out, pixels.len() as u64);
+            zlib_count += 1;
+        }
+        assert_eq!(zlib_count, DISPLAY_FRAME_COUNT);
     }
 }

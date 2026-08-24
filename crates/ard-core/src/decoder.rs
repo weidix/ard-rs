@@ -126,6 +126,11 @@ impl Decoder {
             framebuffer.resize(rect.width, rect.height)?;
             return Ok(0);
         }
+        if encoding == Encoding::ArdDisplayInfo {
+            let consumed = apple_display_info_len(payload)?;
+            framebuffer.resize(rect.width, rect.height)?;
+            return fixed_payload_len(payload, consumed);
+        }
         if encoding == Encoding::ArdEncryption {
             if rect.x != 0 || rect.y != 0 || rect.width != 0 || rect.height != 0 {
                 return Err(Error::Invalid(
@@ -170,7 +175,10 @@ impl Decoder {
             Encoding::ArdGrayscale => self.decode_apple_zlib(rect, payload, framebuffer, 1),
             Encoding::ArdThousands => self.decode_apple_zlib(rect, payload, framebuffer, 2),
             Encoding::ArdMvs => self.decode_mvs(rect, payload, framebuffer, transactional_mvs),
-            Encoding::DesktopSize | Encoding::ArdEncryption | Encoding::CursorPosition => {
+            Encoding::DesktopSize
+            | Encoding::ArdDisplayInfo
+            | Encoding::ArdEncryption
+            | Encoding::CursorPosition => {
                 unreachable!("handled before rectangle validation")
             }
             Encoding::ArdAvcMediaStream => unreachable!("handled before rectangle validation"),
@@ -197,6 +205,9 @@ impl Decoder {
         }
         match encoding {
             Encoding::DesktopSize | Encoding::CursorPosition => Ok(0),
+            Encoding::ArdDisplayInfo => {
+                fixed_payload_len(payload, apple_display_info_len(payload)?)
+            }
             Encoding::ArdEncryption => {
                 if payload.len() < ArdEncryptionControl::WIRE_LEN {
                     Err(Error::NeedMore {
@@ -619,6 +630,23 @@ impl Decoder {
         }
         Ok(())
     }
+}
+
+fn apple_display_info_len(payload: &[u8]) -> Result<usize> {
+    if payload.len() < 10 {
+        return Err(Error::NeedMore {
+            needed: 10,
+            available: payload.len(),
+        });
+    }
+    let displays = usize::from(u16::from_be_bytes([payload[8], payload[9]]));
+    10_usize
+        .checked_add(
+            displays
+                .checked_mul(28)
+                .ok_or(Error::LimitExceeded("display-info records"))?,
+        )
+        .ok_or(Error::LimitExceeded("display-info records"))
 }
 
 fn decode_compact_pixel(pixel_format: PixelFormat, bytes: &[u8]) -> Result<[u8; 4]> {

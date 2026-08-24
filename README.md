@@ -141,10 +141,11 @@ on a VNC library or a native operating-system library.
 - a bounded incremental dispatcher that turns verified record payloads into
   server messages, routing FramebufferUpdate (including MVS `1011`) rectangles
   into the persistent decoder state and exposing `1103` controls
-- a pure-Rust encrypted-transport oracle server that completes the type-30
+- one fixture-backed pure-Rust oracle in `ard-core/src/oracle.rs` that completes the type-30
   exchange, sends a real 1103 control rectangle, validates the client's
-  activation and automatic-update subscription, and exchanges AES-CBC records
-  carrying either MVS or persistent full-colour zlib frames
+  activation and automatic-update subscription, and serves all low, medium,
+  high, adaptive MVS, full-colour zlib, H.264, and HEVC modes from synchronized
+  1920x1080 five-second samples
 - bounded parsing of security offers, `ServerInit`, and `FramebufferUpdate`
 - Apple's extended `ServerInit` command-support block, including the
   `0x12`-advertising bitfield that gates the encrypted transport

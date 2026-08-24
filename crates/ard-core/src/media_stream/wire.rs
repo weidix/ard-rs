@@ -141,6 +141,10 @@ impl MediaStreamKeyMaterial {
             video2_server_to_viewer: s2v,
         })
     }
+
+    pub(crate) fn video1_server_to_viewer(&self) -> &[u8; MEDIA_STREAM_KEY_LEN] {
+        &self.video1_server_to_viewer
+    }
 }
 
 impl Drop for MediaStreamKeyMaterial {

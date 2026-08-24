@@ -321,8 +321,9 @@ dropped every frame while the pointer moved and forced a reconnect).
 
 ## Native decoder oracle
 
-An isolated pure-Rust one-shot server in `crates/ard-core/examples/mvs_oracle_server.rs` was
-cross-compiled for `aarch64-unknown-linux-musl` and run in a local Linux
+An earlier isolated pure-Rust one-shot server (now superseded by the unified
+`crates/ard-core/src/oracle.rs`) was cross-compiled for
+`aarch64-unknown-linux-musl` and run in a local Linux
 container so macOS would not reject a self-connection. Screen Sharing 6.1
 (760.4) completed the `RFB 003.889` handshake, sent `ClientInit` flags `0xc1`
 and session options `10 00 00 01`, advertised 13 encodings including MVS
@@ -598,8 +599,8 @@ desktop update.
 
 ### Encrypted-transport oracle
 
-`EncryptedTransportOracle` (library module `oracle`, CLI wrapper
-`crates/ard-core/examples/encrypted_transport_oracle.rs`) is a one-shot pure-Rust server that
+`Oracle` (library module `oracle`, with `EncryptedTransportOracle` retained as
+an API alias) is a fixture-backed pure-Rust server that
 drives the whole modern path against a client:
 
 1. type-30 challenge (RFC 3526 group 2, server exponent 1) and server-side
@@ -611,9 +612,9 @@ drives the whole modern path against a client:
 5. validation of the client's eight-byte activation message;
 6. validation of the encrypted non-incremental type-`3` baseline request
    followed by the type-`9` automatic-update subscription;
-7. AES-CBC records carrying either MVS white/solid rectangles or two updates
-   from one persistent full-colour zlib stream, with the client direction
-   decrypted and redacted.
+7. AES-CBC records carrying synchronized 1920x1080 MVS, zlib, or zlib-derived
+   low/medium/high updates, plus negotiated H.264/HEVC SRTP streams, with the
+   client direction decrypted and redacted.
 
 The in-process integration tests run a Rust client through the complete
 session: banner, type-30 exchange, extended ServerInit, `0x21`/`0x12`, 1103
@@ -934,10 +935,10 @@ explicitly labelled non-causal next-frame proxy, and input queue/write timing.
 ## Live capture follow-up (2026-08-08)
 
 A real capture run was completed against Screen Sharing 6.1 on macOS 26.6
-build 25G72 using the AVC oracle in
-`crates/ard-core/examples/avc_oracle_server.rs` (cross-compiled to musl and
-run in a Docker container on the `v6net` bridge so macOS accepts the
-connection). Two workflow discoveries made the capture practical:
+build 25G72 using the earlier standalone AVC capture oracle (since superseded
+by `crates/ard-core/src/oracle.rs`), cross-compiled to musl and run in a Docker
+container on the `v6net` bridge so macOS accepted the connection. Two workflow
+discoveries made the capture practical:
 
 * **URL credentials bypass the login sheet.** `open "vnc://wei:x@IP:5901"`
   lets Screen Sharing complete the ARD DH exchange without UI interaction;

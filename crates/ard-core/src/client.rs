@@ -1124,18 +1124,8 @@ impl ArdClient {
         stream.write_all(&[10, 0, 0, 1])?;
         stream.write_all(&viewer_information())?;
         stream.write_all(&build_set_pixel_format(requested_pixel_format)?)?;
-        stream.write_all(&build_set_encodings(config.video_quality.encodings())?)?;
         stream.write_all(&build_ard_set_encryption_level(1, &[1])?)?;
-        // This request lets servers serialize the 1103 control as the update
-        // satisfying the initial non-incremental request. Current macOS also
-        // accepts the proposal before this message.
-        stream.write_all(&build_framebuffer_update_request(
-            false,
-            0,
-            0,
-            server_init.width,
-            server_init.height,
-        ))?;
+        stream.write_all(&build_set_encodings(config.video_quality.encodings())?)?;
         stream.flush()?;
 
         let control = read_encryption_control(&mut stream, &mut decoder, &mut framebuffer)?;

@@ -1586,6 +1586,34 @@ fn desktop_size_resets_the_framebuffer() {
 }
 
 #[test]
+fn apple_display_info_resizes_and_consumes_all_display_records() {
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(1, 1).unwrap();
+    let mut payload = vec![0; 10 + 28];
+    payload[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    payload[10..14].copy_from_slice(&1_u32.to_be_bytes());
+    payload[14..16].copy_from_slice(&1920_u16.to_be_bytes());
+    payload[16..18].copy_from_slice(&1080_u16.to_be_bytes());
+
+    let consumed = decoder
+        .decode_rectangle(
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                encoding: Encoding::ArdDisplayInfo as i32,
+            },
+            &payload,
+            &mut framebuffer,
+        )
+        .unwrap();
+
+    assert_eq!(consumed, payload.len());
+    assert_eq!((framebuffer.width(), framebuffer.height()), (1920, 1080));
+}
+
+#[test]
 fn cursor_position_rectangle_is_a_noop() {
     // Screen Sharing sends the pointer hotspot as an 1100 rectangle inside a
     // FramebufferUpdate; the native decoder treats it as a zero-payload

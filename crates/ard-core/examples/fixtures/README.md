@@ -22,17 +22,11 @@ The stream models the native remote media layout used by `ard-rs`:
   from `0001` through `0300` before the four-way split; only the number changes
   between desktop frames.
 
-When packetizing, the oracle must assign each consecutive group of four access
-units to four adjacent SSRCs, give the group one RTP timestamp, and increment a
+When packetizing, the oracle assigns each consecutive group of four access
+units to four adjacent SSRCs, gives the group one RTP timestamp, and increments a
 single global DON (H.264 FU-B/STAP-B) or DONL (HEVC FU/AP) for every access
 unit. AUD NAL units are present only to make elementary-stream access-unit
 boundaries unambiguous and may be dropped by the packetizer.
-
-Regenerate all four oracle streams from the repository root on macOS with:
-
-```sh
-./scripts/generate_oracle_fixtures.sh
-```
 
 ## MVS and zlib oracle streams
 
@@ -49,8 +43,9 @@ background and centered frame numbers `0001` through `0300`. Each file stores
   belong to one persistent deflate stream and use XRGB8888 little-endian wire
   pixels (`B, G, R, unused`), matching encoding 6 in the oracle and decoder.
 
-The oracle should wrap each record as a 1920x1080 rectangle with encoding 1011
-for MVS or encoding 6 for zlib and schedule records at its fixed native 60 Hz
-cadence; these payload files contain no clock. The single regeneration command
-above creates five seconds of AVC, HEVC, MVS, and zlib and validates them
-together.
+The fixture-backed implementation in `src/oracle.rs` wraps each record as a
+1920x1080 rectangle with encoding 1011 for MVS or encoding 6 for zlib and
+schedules records at its fixed native 60 Hz cadence. Low, medium, and high RFB
+quality are derived from the same persistent zlib pixel stream as encodings
+1000, 1001, and 1002, so every public quality mode exercises the same 300
+source frames. `OracleFixtures::validate` checks all four files together.

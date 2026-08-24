@@ -3,7 +3,8 @@ use std::thread;
 
 use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdDisplayConfiguration, ArdFrameOutput,
-    ArdReconnectPolicy, ArdVideoQuality, EncryptedTransportOracle, MvsGpuTile, PixelFormat,
+    ArdReconnectPolicy, ArdVideoQuality, EncryptedTransportOracle, MvsGpuTile, OracleMode,
+    PixelFormat,
 };
 
 #[test]
@@ -72,17 +73,17 @@ fn receive_only_client_delivers_gpu_mvs_tiles_without_cpu_frame_expansion() {
     assert!(frame.wire_bytes > frame.payload_bytes);
     assert_eq!(
         (client.framebuffer().width(), client.framebuffer().height()),
-        (64, 64)
+        (1920, 1080)
     );
     assert!(client.framebuffer().pixels().is_empty());
     let gpu_frames = client.take_gpu_mvs_frames();
     assert_eq!(gpu_frames.len(), 1);
-    assert_eq!(gpu_frames[0].tiles.len(), 64);
+    assert_eq!(gpu_frames[0].tiles.len(), 240 * 135);
     assert!(
         gpu_frames[0]
             .tiles
             .iter()
-            .all(|tile| matches!(tile.tile, MvsGpuTile::SolidRgba([255, 255, 255, 255])))
+            .any(|tile| matches!(tile.tile, MvsGpuTile::SolidYcbcr(_)))
     );
     let frame = client.next_frame().unwrap();
     assert_eq!(frame.index, 2);
@@ -128,13 +129,13 @@ fn full_quality_client_negotiates_lossless_zlib_and_updates_native_pixels() {
     let first = client.next_frame().unwrap();
     assert_eq!(first.index, 1);
     assert_eq!(first.framebuffer_updates, 1);
-    assert_eq!(client.framebuffer().pixels().len(), 64 * 64 * 4);
-    assert_eq!(&client.framebuffer().pixels()[..4], &[255, 255, 255, 0]);
+    assert_eq!(client.framebuffer().pixels().len(), 1920 * 1080 * 4);
+    assert_eq!(&client.framebuffer().pixels()[..4], &[216, 78, 29, 0]);
     assert!(client.take_gpu_mvs_frames().is_empty());
 
     let second = client.next_frame().unwrap();
     assert_eq!(second.index, 2);
-    assert_eq!(&client.framebuffer().pixels()[..4], &[192, 96, 32, 0]);
+    assert_eq!(&client.framebuffer().pixels()[..4], &[216, 78, 29, 0]);
 
     drop(client);
     let report = server.join().unwrap();
@@ -169,10 +170,81 @@ fn client_can_retain_server_native_pixel_bytes() {
         client.framebuffer().native_pixel_format(),
         Some(PixelFormat::XRGB8888)
     );
-    assert_eq!(client.framebuffer().pixels().len(), 64 * 64 * 4);
-    assert_eq!(&client.framebuffer().pixels()[..4], &[255, 255, 255, 0]);
+    assert_eq!(client.framebuffer().pixels().len(), 1920 * 1080 * 4);
+    assert_eq!(&client.framebuffer().pixels()[..4], &[216, 78, 29, 0]);
     drop(client);
     server.join().unwrap();
+}
+
+#[test]
+fn fixture_oracle_serves_every_rfb_quality_mode() {
+    for (quality, mode) in [
+        (ArdVideoQuality::Low, OracleMode::Halftone),
+        (ArdVideoQuality::Medium, OracleMode::Grayscale),
+        (ArdVideoQuality::High, OracleMode::Thousands),
+        (ArdVideoQuality::Adaptive, OracleMode::AdaptiveMvs),
+        (ArdVideoQuality::Full, OracleMode::FullColor),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, peer) = listener.accept().unwrap();
+            EncryptedTransportOracle {
+                allowed_peer: Some(peer.ip()),
+                expect_security_selection: false,
+                mode,
+                close_after_frames: Some(1),
+                ..EncryptedTransportOracle::default()
+            }
+            .run(stream, peer)
+            .unwrap()
+        });
+
+        let mut config =
+            ArdClientConfig::new(address.to_string(), b"viewer".to_vec(), b"oracle".to_vec());
+        config.video_quality = quality;
+        let mut client = ArdClient::connect(config).unwrap();
+        assert_eq!(client.next_frame().unwrap().index, 1);
+        drop(client);
+        assert_eq!(server.join().unwrap().selected_mode, Some(mode));
+    }
+}
+
+#[test]
+fn fixture_oracle_negotiates_both_media_codecs() {
+    for (quality, mode) in [
+        (ArdVideoQuality::HighPerformanceAvc, OracleMode::H264),
+        (ArdVideoQuality::HighPerformanceHevc, OracleMode::Hevc),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, peer) = listener.accept().unwrap();
+            EncryptedTransportOracle {
+                allowed_peer: Some(peer.ip()),
+                expect_security_selection: false,
+                mode,
+                close_after_frames: Some(1),
+                ..EncryptedTransportOracle::default()
+            }
+            .run(stream, peer)
+            .unwrap()
+        });
+
+        let mut config =
+            ArdClientConfig::new(address.to_string(), b"viewer".to_vec(), b"oracle".to_vec());
+        config.video_quality = quality;
+        let mut client = ArdClient::connect(config).unwrap();
+        loop {
+            if matches!(client.next_event().unwrap(), ArdClientEvent::MediaStream(_)) {
+                break;
+            }
+        }
+        drop(client);
+        let report = server.join().unwrap();
+        assert!(report.media_configuration_received);
+        assert_eq!(report.selected_mode, Some(mode));
+    }
 }
 
 #[test]

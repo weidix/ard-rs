@@ -228,6 +228,31 @@ impl SrtpContext {
         self.replay_window = 0;
     }
 
+    /// Encrypt and authenticate one RTP packet in place. The RTP header must
+    /// already contain `sequence`; only the bytes at and after
+    /// `payload_offset` are encrypted. The cipher-suite-5 authentication tag
+    /// is appended to `packet`.
+    pub fn protect_rtp_packet(
+        &mut self,
+        packet: &mut Vec<u8>,
+        sequence: u16,
+        payload_offset: usize,
+    ) -> Result<()> {
+        if payload_offset > packet.len() {
+            return Err(Error::Invalid("RTP payload offset"));
+        }
+        let packet_roc = self.guess_roc(sequence)?;
+        let index = (u64::from(packet_roc) << 16) | u64::from(sequence);
+        self.accept_replay_state(index, packet_roc, sequence)?;
+        let keystream = self.keystream(packet_roc, sequence, packet.len() - payload_offset);
+        for (byte, key) in packet[payload_offset..].iter_mut().zip(keystream) {
+            *byte ^= key;
+        }
+        let tag = self.authentication_tag(packet, packet_roc);
+        packet.extend_from_slice(&tag);
+        Ok(())
+    }
+
     /// Decrypt an RTP packet payload.
     ///
     /// `sequence` comes from the cleartext RTP header. The SSRC used for the
@@ -735,6 +760,26 @@ mod tests {
                 .is_err()
         );
         assert_eq!(receiver.highest_index, None);
+    }
+
+    #[test]
+    fn protects_a_complete_rtp_packet_for_the_receiver() {
+        let blob = [0x62_u8; MEDIA_STREAM_KEY_LEN];
+        let ssrc = 0x6a11_0000;
+        let sequence = 9;
+        let mut sender = SrtpContext::from_key_blob_with_derived_ssrc(&blob, ssrc).expect("sender");
+        let mut receiver =
+            SrtpContext::from_key_blob_with_derived_ssrc(&blob, ssrc).expect("receiver");
+        let mut packet = vec![0x80, 123, 0, sequence as u8, 0, 0, 0, 1, 0x6a, 0x11, 0, 0];
+        packet.extend_from_slice(b"fixture RTP payload");
+        sender
+            .protect_rtp_packet(&mut packet, sequence, 12)
+            .expect("protect");
+        let tag = packet.split_off(packet.len() - AUTH_TAG_LEN);
+        receiver
+            .decrypt_authenticated_rtp_packet_in_place(&mut packet, &tag, sequence, 12)
+            .expect("authenticate and decrypt");
+        assert_eq!(&packet[12..], b"fixture RTP payload");
     }
 
     #[test]

@@ -750,6 +750,9 @@ pub enum Encoding {
     /// rectangle header and the payload is empty. The server emits it when
     /// the pointer moves, even outside the shared framebuffer.
     CursorPosition = 1100,
+    /// Apple display topology. The rectangle dimensions carry the framebuffer
+    /// size and the payload describes the displays that compose it.
+    ArdDisplayInfo = 1101,
     ArdHalftone = 1000,
     ArdGrayscale = 1001,
     ArdThousands = 1002,
@@ -769,6 +772,7 @@ impl Encoding {
             6 => Self::Zlib,
             16 => Self::Zrle,
             1100 => Self::CursorPosition,
+            1101 => Self::ArdDisplayInfo,
             1000 => Self::ArdHalftone,
             1001 => Self::ArdGrayscale,
             1002 => Self::ArdThousands,
