@@ -140,7 +140,8 @@ on a VNC library or a native operating-system library.
   validation, and SHA-1 verification before plaintext is returned
 - a bounded incremental dispatcher that turns verified record payloads into
   server messages, routing FramebufferUpdate (including MVS `1011`) rectangles
-  into the persistent decoder state and exposing `1103` controls
+  into the persistent decoder state while exposing `1103` controls and `1105`
+  display layouts without misclassifying metadata-only updates as image frames
 - one fixture-backed pure-Rust oracle in `ard-core/src/oracle.rs` that completes the type-30
   exchange, sends a real 1103 control rectangle, validates the client's
   activation and automatic-update subscription, and serves all low, medium,
@@ -149,11 +150,15 @@ on a VNC library or a native operating-system library.
 - bounded parsing of security offers, `ServerInit`, and `FramebufferUpdate`
 - Apple's extended `ServerInit` command-support block, including the
   `0x12`-advertising bitfield that gates the encrypted transport
-- client message generation for pixel format, encodings, and update requests
+- client message generation for pixel format, encodings, display selection,
+  and update requests, including encrypted post-activation renegotiation
 - Apple's server-driven automatic frame-update message (`0x09`), including a
   configurable interval and the native zero-interval maximum-rate default
 - RDM-compatible low, medium, high, adaptive MVS, and full-quality encoding
   profiles
+- complete native topology/metadata pseudo-encoding negotiation (`-239`,
+  `1101`, `1104`, `1105`, `1107`, `1109`, and `1110`), bounded parsing, and
+  combined/single-display selection through Apple message `0x0d`
 - raw and full-colour zlib rectangles
 - ZRLE tiles (raw, solid, packed palette, plain RLE, and palette RLE)
 - Apple encoding `1000`: zlib-compressed 1-bit halftone

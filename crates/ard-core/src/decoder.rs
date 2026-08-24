@@ -3,8 +3,9 @@ use flate2::{Decompress, FlushDecompress, Status};
 use crate::mvs::MvsState;
 use crate::wire::Cursor;
 use crate::{
-    ArdEncryptionControl, Encoding, Error, Framebuffer, PixelFormat, Rectangle, Result,
-    media_stream::MediaStreamServerReply, parse_ard_encryption_control,
+    ArdDisplayLayout, ArdEncryptionControl, Encoding, Error, Framebuffer, PixelFormat, Rectangle,
+    Result, media_stream::MediaStreamServerReply, parse_ard_display_info2,
+    parse_ard_encryption_control,
 };
 
 const MAX_REUSABLE_ZRLE_SCRATCH: usize = 8 * 1024 * 1024;
@@ -35,6 +36,7 @@ pub struct Decoder {
     zrle_pixels_scratch: Vec<[u8; 4]>,
     mvs: MvsState,
     pending_encryption_control: Option<ArdEncryptionControl>,
+    pending_display_layouts: Vec<ArdDisplayLayout>,
     pending_media_stream_replies: Vec<MediaStreamServerReply>,
     gpu_mvs_output: bool,
     pending_gpu_mvs_frames: Vec<crate::MvsGpuFrame>,
@@ -58,6 +60,7 @@ impl Decoder {
             zrle_pixels_scratch: Vec::new(),
             mvs: MvsState::default(),
             pending_encryption_control: None,
+            pending_display_layouts: Vec::new(),
             pending_media_stream_replies: Vec::new(),
             gpu_mvs_output: false,
             pending_gpu_mvs_frames: Vec::new(),
@@ -131,6 +134,27 @@ impl Decoder {
             framebuffer.resize(rect.width, rect.height)?;
             return fixed_payload_len(payload, consumed);
         }
+        if encoding == Encoding::ArdDisplayInfo2 {
+            let (layout, consumed) = parse_ard_display_info2(payload)?;
+            let width = if layout.framebuffer_width == 0 {
+                rect.width
+            } else {
+                layout.framebuffer_width
+            };
+            let height = if layout.framebuffer_height == 0 {
+                rect.height
+            } else {
+                layout.framebuffer_height
+            };
+            if width == 0 || height == 0 {
+                return Err(Error::Invalid(
+                    "DisplayInfo2 has empty framebuffer geometry",
+                ));
+            }
+            framebuffer.resize(width, height)?;
+            self.pending_display_layouts.push(layout);
+            return Ok(consumed);
+        }
         if encoding == Encoding::ArdEncryption {
             if rect.x != 0 || rect.y != 0 || rect.width != 0 || rect.height != 0 {
                 return Err(Error::Invalid(
@@ -159,6 +183,18 @@ impl Decoder {
             // tolerate the rectangle so it does not abort the whole update.
             return Ok(0);
         }
+        if encoding == Encoding::RichCursor {
+            return rich_cursor_payload_len(rect, self.pixel_format, payload);
+        }
+        if encoding == Encoding::ArdCursor {
+            return ard_cursor_payload_len(payload, self.limits.max_compressed_bytes);
+        }
+        if matches!(
+            encoding,
+            Encoding::ArdVendorKeysyms | Encoding::ArdKeyboardInputSource | Encoding::ArdDeviceInfo
+        ) {
+            return apple_length_prefixed_payload_len(payload);
+        }
         framebuffer.validate_rect(&rect)?;
         if rect.width == 0 || rect.height == 0 {
             if encoding == Encoding::ArdMvs {
@@ -177,8 +213,14 @@ impl Decoder {
             Encoding::ArdMvs => self.decode_mvs(rect, payload, framebuffer, transactional_mvs),
             Encoding::DesktopSize
             | Encoding::ArdDisplayInfo
+            | Encoding::ArdDisplayInfo2
             | Encoding::ArdEncryption
-            | Encoding::CursorPosition => {
+            | Encoding::CursorPosition
+            | Encoding::RichCursor
+            | Encoding::ArdCursor
+            | Encoding::ArdVendorKeysyms
+            | Encoding::ArdKeyboardInputSource
+            | Encoding::ArdDeviceInfo => {
                 unreachable!("handled before rectangle validation")
             }
             Encoding::ArdAvcMediaStream => unreachable!("handled before rectangle validation"),
@@ -198,16 +240,31 @@ impl Decoder {
         if (rect.width == 0 || rect.height == 0)
             && !matches!(
                 encoding,
-                Encoding::ArdMvs | Encoding::ArdEncryption | Encoding::ArdAvcMediaStream
+                Encoding::ArdMvs
+                    | Encoding::ArdEncryption
+                    | Encoding::ArdAvcMediaStream
+                    | Encoding::ArdDisplayInfo2
+                    | Encoding::ArdCursor
+                    | Encoding::ArdVendorKeysyms
+                    | Encoding::ArdKeyboardInputSource
+                    | Encoding::ArdDeviceInfo
             )
         {
             return Ok(0);
         }
         match encoding {
             Encoding::DesktopSize | Encoding::CursorPosition => Ok(0),
+            Encoding::RichCursor => rich_cursor_payload_len(rect, self.pixel_format, payload),
+            Encoding::ArdCursor => {
+                ard_cursor_payload_len(payload, self.limits.max_compressed_bytes)
+            }
             Encoding::ArdDisplayInfo => {
                 fixed_payload_len(payload, apple_display_info_len(payload)?)
             }
+            Encoding::ArdDisplayInfo2 => parse_ard_display_info2(payload).map(|(_, len)| len),
+            Encoding::ArdVendorKeysyms
+            | Encoding::ArdKeyboardInputSource
+            | Encoding::ArdDeviceInfo => apple_length_prefixed_payload_len(payload),
             Encoding::ArdEncryption => {
                 if payload.len() < ArdEncryptionControl::WIRE_LEN {
                     Err(Error::NeedMore {
@@ -262,6 +319,10 @@ impl Decoder {
 
     pub fn take_ard_encryption_control(&mut self) -> Option<ArdEncryptionControl> {
         self.pending_encryption_control.take()
+    }
+
+    pub fn take_display_layouts(&mut self) -> Vec<ArdDisplayLayout> {
+        core::mem::take(&mut self.pending_display_layouts)
     }
 
     /// Takes AVC media-stream control messages recovered from 1010
@@ -647,6 +708,58 @@ fn apple_display_info_len(payload: &[u8]) -> Result<usize> {
                 .ok_or(Error::LimitExceeded("display-info records"))?,
         )
         .ok_or(Error::LimitExceeded("display-info records"))
+}
+
+fn apple_length_prefixed_payload_len(payload: &[u8]) -> Result<usize> {
+    if payload.len() < 2 {
+        return Err(Error::NeedMore {
+            needed: 2,
+            available: payload.len(),
+        });
+    }
+    let declared = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+    let total = declared
+        .checked_add(2)
+        .ok_or(Error::LimitExceeded("Apple metadata payload"))?;
+    fixed_payload_len(payload, total)
+}
+
+fn ard_cursor_payload_len(payload: &[u8], max_compressed_bytes: usize) -> Result<usize> {
+    if payload.len() < 8 {
+        return Err(Error::NeedMore {
+            needed: 8,
+            available: payload.len(),
+        });
+    }
+    let compressed = usize::try_from(u32::from_be_bytes(
+        payload[4..8].try_into().expect("cursor length checked"),
+    ))
+    .map_err(|_| Error::LimitExceeded("ARD cursor image"))?;
+    if compressed > max_compressed_bytes {
+        return Err(Error::LimitExceeded("ARD cursor image"));
+    }
+    let total = compressed
+        .checked_add(8)
+        .ok_or(Error::LimitExceeded("ARD cursor image"))?;
+    fixed_payload_len(payload, total)
+}
+
+fn rich_cursor_payload_len(
+    rect: Rectangle,
+    pixel_format: PixelFormat,
+    payload: &[u8],
+) -> Result<usize> {
+    let pixels = pixel_count(rect)?
+        .checked_mul(pixel_format.bytes_per_pixel()?)
+        .ok_or(Error::LimitExceeded("RichCursor pixels"))?;
+    let mask_row_bytes = usize::from(rect.width).div_ceil(8);
+    let mask = mask_row_bytes
+        .checked_mul(usize::from(rect.height))
+        .ok_or(Error::LimitExceeded("RichCursor mask"))?;
+    let total = pixels
+        .checked_add(mask)
+        .ok_or(Error::LimitExceeded("RichCursor payload"))?;
+    fixed_payload_len(payload, total)
 }
 
 fn decode_compact_pixel(pixel_format: PixelFormat, bytes: &[u8]) -> Result<[u8; 4]> {

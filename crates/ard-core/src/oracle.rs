@@ -22,8 +22,8 @@ use crate::media_stream::{
     ENCODING_AVC_MEDIA_STREAM, MediaStreamConfiguration, MediaStreamMessage1,
 };
 use crate::{
-    ArdEncryptionControl, ArdSessionMaterial, ArdSessionRecordEncoder, ArdSetEncryptionLevel,
-    ArdViewerInformation, Encoding, PixelFormat, build_ard_server_init,
+    ArdDisplaySelection, ArdEncryptionControl, ArdSessionMaterial, ArdSessionRecordEncoder,
+    ArdSetEncryptionLevel, ArdViewerInformation, Encoding, PixelFormat, build_ard_server_init,
     parse_ard_set_encryption_level, parse_ard_viewer_information,
 };
 
@@ -211,6 +211,7 @@ pub struct OracleReport {
     pub server_to_client_records: usize,
     pub client_to_server_records: usize,
     pub client_message_types: Vec<u8>,
+    pub client_display_selections: Vec<ArdDisplaySelection>,
     pub client_framebuffer_update_incremental: Vec<bool>,
     pub client_framebuffer_update_rectangles: Vec<(u16, u16, u16, u16)>,
     pub client_auto_frame_update_rectangles: Vec<(u16, u16, u16, u16)>,
@@ -232,6 +233,7 @@ impl OracleReport {
             server_to_client_records: 0,
             client_to_server_records: 0,
             client_message_types: Vec::new(),
+            client_display_selections: Vec::new(),
             client_framebuffer_update_incremental: Vec::new(),
             client_framebuffer_update_rectangles: Vec::new(),
             client_auto_frame_update_rectangles: Vec::new(),
@@ -328,6 +330,23 @@ impl Oracle {
                 self.height,
                 Encoding::ArdDisplayInfo as i32,
                 &display_info_payload(self.width, self.height),
+            );
+            write_encrypted_message(
+                &mut stream,
+                &mut encoder,
+                &display_info,
+                &mut report.server_to_client_records,
+            )?;
+        }
+        if report
+            .viewer_encodings
+            .contains(&(Encoding::ArdDisplayInfo2 as i32))
+        {
+            let display_info = framebuffer_update(
+                self.width,
+                self.height,
+                Encoding::ArdDisplayInfo2 as i32,
+                &display_info2_payload(self.width, self.height),
             );
             write_encrypted_message(
                 &mut stream,
@@ -735,6 +754,7 @@ fn encrypted_client_message_len(bytes: &[u8]) -> io::Result<Option<usize>> {
         4 => 8,
         5 => 6,
         9 => 16,
+        0x0d => 8,
         0x10 => 8,
         0x17 => 58,
         6 => {
@@ -777,6 +797,15 @@ fn record_client_message(message: &[u8], report: &mut OracleReport) {
             u16::from_be_bytes([message[12], message[13]]),
             u16::from_be_bytes([message[14], message[15]]),
         )),
+        0x0d => report.client_display_selections.push(if message[1] != 0 {
+            ArdDisplaySelection::Combined
+        } else {
+            ArdDisplaySelection::Display(u32::from_be_bytes(
+                message[4..8]
+                    .try_into()
+                    .expect("display selection length checked"),
+            ))
+        }),
         _ => {}
     }
 }
@@ -842,6 +871,51 @@ fn display_info_payload(width: u16, height: u16) -> Vec<u8> {
     payload.extend_from_slice(&height.to_be_bytes());
     payload.extend_from_slice(&0_u32.to_be_bytes());
     payload.extend_from_slice(&[0; 16]);
+    payload
+}
+
+fn display_info2_payload(width: u16, height: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(20 + 56);
+    body.extend_from_slice(&5_u16.to_be_bytes());
+    body.extend_from_slice(&width.to_be_bytes());
+    body.extend_from_slice(&height.to_be_bytes());
+    body.extend_from_slice(&width.to_be_bytes());
+    body.extend_from_slice(&height.to_be_bytes());
+    body.extend_from_slice(&u32::MAX.to_be_bytes());
+    body.extend_from_slice(&0x0200_0000_u32.to_be_bytes());
+    body.extend_from_slice(&1_u16.to_be_bytes());
+
+    body.extend_from_slice(&1.0_f64.to_bits().to_be_bytes());
+    body.extend_from_slice(&1.0_f64.to_bits().to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    for rect in [[0, 0, height, width], [0, 0, height, width]] {
+        for value in rect {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    let format = PixelFormat::XRGB8888;
+    body.extend_from_slice(&[
+        format.bits_per_pixel,
+        format.depth,
+        u8::from(format.big_endian),
+        u8::from(format.true_color),
+    ]);
+    body.extend_from_slice(&format.red_max.to_be_bytes());
+    body.extend_from_slice(&format.green_max.to_be_bytes());
+    body.extend_from_slice(&format.blue_max.to_be_bytes());
+    body.extend_from_slice(&[
+        format.red_shift,
+        format.green_shift,
+        format.blue_shift,
+        0,
+        0,
+        0,
+    ]);
+
+    let mut payload = Vec::with_capacity(body.len() + 2);
+    payload.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    payload.extend_from_slice(&body);
     payload
 }
 
@@ -1348,6 +1422,27 @@ mod tests {
             1080
         );
         assert_eq!(&payload[18..], &[0; 20]);
+    }
+
+    #[test]
+    fn display_info2_matches_the_single_display_layout() {
+        let payload = display_info2_payload(1920, 1080);
+        let (layout, consumed) = crate::parse_ard_display_info2(&payload).unwrap();
+        assert_eq!(consumed, payload.len());
+        assert_eq!(
+            (layout.framebuffer_width, layout.framebuffer_height),
+            (1920, 1080)
+        );
+        assert_eq!(layout.current_display, None);
+        assert_eq!(layout.displays.len(), 1);
+        assert_eq!(layout.displays[0].id, 1);
+        assert_eq!(
+            (
+                layout.displays[0].framebuffer_bounds.width,
+                layout.displays[0].framebuffer_bounds.height
+            ),
+            (1920, 1080)
+        );
     }
 
     #[test]

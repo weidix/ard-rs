@@ -2,9 +2,9 @@ use std::net::TcpListener;
 use std::thread;
 
 use ard_rs::{
-    ArdClient, ArdClientConfig, ArdClientEvent, ArdDisplayConfiguration, ArdFrameOutput,
-    ArdReconnectPolicy, ArdVideoQuality, EncryptedTransportOracle, MvsGpuTile, OracleMode,
-    PixelFormat,
+    ArdClient, ArdClientConfig, ArdClientEvent, ArdDisplayConfiguration, ArdDisplaySelection,
+    ArdFrameOutput, ArdReconnectPolicy, ArdVideoQuality, EncryptedTransportOracle, MvsGpuTile,
+    OracleMode, PixelFormat,
 };
 
 #[test]
@@ -34,7 +34,7 @@ fn client_sends_fixed_display_configuration_inside_encrypted_transport() {
     drop(client);
 
     let report = server.join().unwrap();
-    assert_eq!(report.client_message_types[..2], [0x1d, 3]);
+    assert_eq!(report.client_message_types[..5], [0, 2, 0x0d, 0x1d, 3]);
     assert_eq!(
         report.client_framebuffer_update_rectangles[0],
         (0, 0, 3840, 2160)
@@ -89,12 +89,23 @@ fn receive_only_client_delivers_gpu_mvs_tiles_without_cpu_frame_expansion() {
     assert_eq!(frame.index, 2);
     assert_eq!(frame.framebuffer_updates, 1);
     assert_eq!(client.take_gpu_mvs_frames().len(), 1);
+    let layout = client.display_layout().expect("DisplayInfo2 layout");
+    assert_eq!(layout.displays[0].id, 1);
 
     drop(client);
     let report = server.join().unwrap();
     assert!(report.activation_received);
-    assert_eq!(report.viewer_encodings, [1011, 1002, 6, 16, -223]);
-    assert_eq!(report.client_message_types, [3, 9]);
+    assert_eq!(
+        report.viewer_encodings,
+        [
+            1011, 1002, 6, 16, -239, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110
+        ]
+    );
+    assert_eq!(report.client_message_types, [0, 2, 0x0d, 3, 9]);
+    assert_eq!(
+        report.client_display_selections,
+        [ArdDisplaySelection::Combined]
+    );
     assert_eq!(report.client_framebuffer_update_incremental, [false]);
     let viewer = report
         .viewer_information
@@ -139,9 +150,43 @@ fn full_quality_client_negotiates_lossless_zlib_and_updates_native_pixels() {
 
     drop(client);
     let report = server.join().unwrap();
-    assert_eq!(report.viewer_encodings, [6, 16, -223]);
-    assert_eq!(report.client_message_types, [3, 9]);
+    assert_eq!(
+        report.viewer_encodings,
+        [6, 16, -239, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110]
+    );
+    assert_eq!(report.client_message_types, [0, 2, 0x0d, 3, 9]);
     assert_eq!(report.client_framebuffer_update_incremental, [false]);
+}
+
+#[test]
+fn client_selects_one_display_inside_the_encrypted_preface() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, peer) = listener.accept().unwrap();
+        EncryptedTransportOracle {
+            allowed_peer: Some(peer.ip()),
+            expect_security_selection: false,
+            close_after_frames: Some(1),
+            ..EncryptedTransportOracle::default()
+        }
+        .run(stream, peer)
+        .unwrap()
+    });
+
+    let mut config =
+        ArdClientConfig::new(address.to_string(), b"viewer".to_vec(), b"oracle".to_vec());
+    config.display_selection = ArdDisplaySelection::Display(1);
+    let mut client = ArdClient::connect(config).unwrap();
+    assert_eq!(client.next_frame().unwrap().index, 1);
+    drop(client);
+
+    let report = server.join().unwrap();
+    assert_eq!(
+        report.client_display_selections,
+        [ArdDisplaySelection::Display(1)]
+    );
+    assert_eq!(report.client_message_types[..4], [0, 2, 0x0d, 3]);
 }
 
 #[test]

@@ -169,6 +169,79 @@ fn dispatcher_routes_mvs_framebuffer_update_across_fragments() {
 }
 
 #[test]
+fn display_info_only_update_changes_topology_without_faking_a_frame() {
+    let mut legacy_payload = vec![0; 10 + 28];
+    legacy_payload[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    legacy_payload[10..14].copy_from_slice(&77_u32.to_be_bytes());
+    legacy_payload[14..16].copy_from_slice(&640_u16.to_be_bytes());
+    legacy_payload[16..18].copy_from_slice(&480_u16.to_be_bytes());
+    let legacy_update = framebuffer_update(&[(
+        Rectangle {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+            encoding: Encoding::ArdDisplayInfo as i32,
+        },
+        legacy_payload,
+    )]);
+    let mut dispatcher = ArdMessageDispatcher::new(1024, 1024).unwrap();
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(1, 1).unwrap();
+    assert!(
+        dispatcher
+            .push(&legacy_update, &mut decoder, &mut framebuffer)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&5_u16.to_be_bytes());
+    for value in [640_u16, 480, 1280, 480] {
+        body.extend_from_slice(&value.to_be_bytes());
+    }
+    body.extend_from_slice(&u32::MAX.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body.extend_from_slice(&1_u16.to_be_bytes());
+    body.extend_from_slice(&1.0_f64.to_bits().to_be_bytes());
+    body.extend_from_slice(&1.0_f64.to_bits().to_be_bytes());
+    body.extend_from_slice(&77_u32.to_be_bytes());
+    for bounds in [[0_u16, 0, 480, 640], [0_u16, 0, 480, 1280]] {
+        for value in bounds {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&[32, 24, 0, 1]);
+    for maximum in [255_u16; 3] {
+        body.extend_from_slice(&maximum.to_be_bytes());
+    }
+    body.extend_from_slice(&[16, 8, 0, 0, 0, 0]);
+    let mut payload = (body.len() as u16).to_be_bytes().to_vec();
+    payload.extend_from_slice(&body);
+    let update = framebuffer_update(&[(
+        Rectangle {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            encoding: Encoding::ArdDisplayInfo2 as i32,
+        },
+        payload,
+    )]);
+
+    let messages = dispatcher
+        .push(&update, &mut decoder, &mut framebuffer)
+        .unwrap();
+    assert!(matches!(
+        messages.as_slice(),
+        [ArdServerMessage::DisplayLayout(layout)]
+            if layout.displays[0].id == 77
+    ));
+    assert_eq!((framebuffer.width(), framebuffer.height()), (1280, 480));
+}
+
+#[test]
 fn dispatcher_exposes_encryption_control_rectangle() {
     let mut control = vec![1_u32.to_be_bytes().to_vec()];
     control.push(vec![0x11; 16]);
@@ -189,14 +262,8 @@ fn dispatcher_exposes_encryption_control_rectangle() {
     let messages = dispatcher
         .push(&update, &mut decoder, &mut framebuffer)
         .unwrap();
-    assert_eq!(messages.len(), 2);
+    assert_eq!(messages.len(), 1);
     match &messages[0] {
-        ArdServerMessage::FramebufferUpdate {
-            rectangle_count: 1, ..
-        } => {}
-        _ => panic!("expected FramebufferUpdate first"),
-    }
-    match &messages[1] {
         ArdServerMessage::EncryptionControl(control) => {
             assert_eq!(control.command, 1);
             assert_eq!(control.wrapped_session_blocks()[0], [0x11; 16]);

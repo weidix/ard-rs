@@ -15,15 +15,15 @@ use crate::media_stream::{
     build_media_stream_offer_with_ssrc_and_codec, build_remote_endpoint_info,
 };
 use crate::{
-    ArdDisplayConfiguration, ArdEncryptionControl, ArdMessageDispatcher, ArdScrollWheelEvent,
-    ArdServerMessage, ArdVerifiedRecordStream, ArdViewerInformation, Decoder, Framebuffer,
-    FramebufferFormat, PixelFormat, ProtocolVersion, SecurityType, build_ard_auto_frame_update,
-    build_ard_encryption_activation, build_ard_scroll_wheel_event,
-    build_ard_set_display_configuration, build_ard_set_encryption_level,
-    build_ard_type30_client_exchange, build_client_cut_text, build_framebuffer_update_request,
-    build_key_event, build_pointer_event, build_set_encodings, build_set_pixel_format,
-    parse_ard_auth_challenge, parse_framebuffer_update, parse_security_types, parse_server_init,
-    unwrap_ard_session_material,
+    ArdDisplayConfiguration, ArdDisplayLayout, ArdDisplaySelection, ArdEncryptionControl,
+    ArdMessageDispatcher, ArdScrollWheelEvent, ArdServerMessage, ArdVerifiedRecordStream,
+    ArdViewerInformation, Decoder, Framebuffer, FramebufferFormat, PixelFormat, ProtocolVersion,
+    SecurityType, build_ard_auto_frame_update, build_ard_encryption_activation,
+    build_ard_scroll_wheel_event, build_ard_set_display, build_ard_set_display_configuration,
+    build_ard_set_encryption_level, build_ard_type30_client_exchange, build_client_cut_text,
+    build_framebuffer_update_request, build_key_event, build_pointer_event, build_set_encodings,
+    build_set_pixel_format, parse_ard_auth_challenge, parse_framebuffer_update,
+    parse_security_types, parse_server_init, unwrap_ard_session_material,
 };
 
 const MAX_KEY_BYTES: usize = 512;
@@ -126,17 +126,36 @@ impl Default for ArdReconnectPolicy {
 impl ArdVideoQuality {
     pub fn encodings(self) -> &'static [i32] {
         match self {
-            Self::Low => &[1000, 6, 16, -223],
-            Self::Medium => &[1001, 6, 16, -223],
-            Self::High => &[1002, 6, 16, -223],
+            Self::Low => &[
+                1000, 6, 16, -239, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110,
+            ],
+            Self::Medium => &[
+                1001, 6, 16, -239, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110,
+            ],
+            Self::High => &[
+                1002, 6, 16, -239, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110,
+            ],
             Self::HighPerformanceHevc | Self::HighPerformanceAvc => {
                 // High-performance is an explicit transport contract. Do not
                 // silently negotiate MVS/zlib/raw when AVC media setup fails;
                 // callers must receive a visible negotiation failure instead.
-                &[ENCODING_AVC_MEDIA_STREAM, -223]
+                &[
+                    ENCODING_AVC_MEDIA_STREAM,
+                    -239,
+                    1104,
+                    1100,
+                    -223,
+                    1101,
+                    1105,
+                    1107,
+                    1109,
+                    1110,
+                ]
             }
-            Self::Adaptive => &[1011, 1002, 6, 16, -223],
-            Self::Full => &[6, 16, -223],
+            Self::Adaptive => &[
+                1011, 1002, 6, 16, -239, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110,
+            ],
+            Self::Full => &[6, 16, -239, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110],
         }
     }
 
@@ -175,6 +194,10 @@ pub struct ArdClientConfig {
     /// Optional fixed virtual-display layout requested from the server.
     /// `None` keeps the server's existing physical display layout.
     pub display_configuration: Option<ArdDisplayConfiguration>,
+    /// Physical display selection. The default requests the server's combined
+    /// multi-display framebuffer; use a DisplayInfo2 identifier for one
+    /// physical display.
+    pub display_selection: ArdDisplaySelection,
     /// Optional external UDP destinations for a remote Mac behind explicit
     /// port forwarding. Empty fields keep the ports negotiated over RFB.
     pub media_udp_port_overrides: MediaUdpPortOverrides,
@@ -199,6 +222,7 @@ impl fmt::Debug for ArdClientConfig {
             .field("timeout", &self.timeout)
             .field("video_quality", &self.video_quality)
             .field("display_configuration", &self.display_configuration)
+            .field("display_selection", &self.display_selection)
             .field("media_udp_port_overrides", &self.media_udp_port_overrides)
             .field("output_format", &self.output_format)
             .field("automatic_updates", &self.automatic_updates)
@@ -221,6 +245,7 @@ impl ArdClientConfig {
             timeout: Duration::from_secs(20),
             video_quality: ArdVideoQuality::Adaptive,
             display_configuration: None,
+            display_selection: ArdDisplaySelection::Combined,
             media_udp_port_overrides: MediaUdpPortOverrides::default(),
             output_format: ArdFrameOutput::ServerNative,
             automatic_updates: true,
@@ -882,6 +907,11 @@ impl ArdClientInput {
         Ok(())
     }
 
+    /// Selects the aggregate desktop or one DisplayInfo2 display at runtime.
+    pub fn select_display(&self, selection: ArdDisplaySelection) -> Result<(), ArdClientError> {
+        self.send_payload(build_ard_set_display(selection).to_vec())
+    }
+
     fn submit(&self, payload: Vec<u8>, mode: OutboundMode) -> Result<(), ArdClientError> {
         self.check_writer_error()?;
         self.queue.submit(payload, mode, true)
@@ -921,6 +951,7 @@ pub struct ArdClient {
     dispatcher: ArdMessageDispatcher,
     decoder: Decoder,
     framebuffer: Framebuffer,
+    display_layout: Option<ArdDisplayLayout>,
     record_scratch: Vec<u8>,
     server_name: String,
     frame_index: u64,
@@ -1146,6 +1177,16 @@ impl ArdClient {
         } else {
             0
         };
+        // The encryption activation changes the transport boundary. Match the
+        // native client by re-establishing both negotiated RFB settings inside
+        // the encrypted record stream before requesting any framebuffer data.
+        stream
+            .write_all(&encoder.encode_wire(&build_set_pixel_format(requested_pixel_format)?)?)?;
+        stream.write_all(
+            &encoder.encode_wire(&build_set_encodings(config.video_quality.encodings())?)?,
+        )?;
+        stream
+            .write_all(&encoder.encode_wire(&build_ard_set_display(config.display_selection))?)?;
         if let Some(configuration) = &config.display_configuration {
             let request = build_ard_set_display_configuration(configuration)?;
             stream.write_all(&encoder.encode_wire(&request)?)?;
@@ -1194,6 +1235,7 @@ impl ArdClient {
             dispatcher: ArdMessageDispatcher::new(MAX_MESSAGE_BYTES, MAX_CUT_TEXT_BYTES)?,
             decoder,
             framebuffer,
+            display_layout: None,
             record_scratch: Vec::new(),
             server_name: server_init.name,
             frame_index: 0,
@@ -1211,6 +1253,11 @@ impl ArdClient {
 
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.framebuffer
+    }
+
+    /// Latest authoritative DisplayInfo2 topology received from the server.
+    pub fn display_layout(&self) -> Option<&ArdDisplayLayout> {
+        self.display_layout.as_ref()
     }
 
     pub fn server_name(&self) -> &str {
@@ -1250,6 +1297,14 @@ impl ArdClient {
 
     pub fn send_clipboard_text(&self, text: &str) -> Result<(), ArdClientError> {
         self.input.send_clipboard_text(text)
+    }
+
+    pub fn select_display(&mut self, selection: ArdDisplaySelection) -> Result<(), ArdClientError> {
+        self.input.select_display(selection)?;
+        self.reconnect_config.display_selection = selection;
+        let (width, height) = (self.framebuffer.width(), self.framebuffer.height());
+        self.input
+            .send_payload(build_framebuffer_update_request(false, 0, 0, width, height).to_vec())
     }
 
     pub fn take_gpu_mvs_frames(&mut self) -> Vec<crate::MvsGpuFrame> {
@@ -1541,6 +1596,9 @@ impl ArdClient {
                     ArdServerMessage::Bell => batch_events.push(ArdClientEvent::Bell),
                     ArdServerMessage::StateChange => batch_events.push(ArdClientEvent::StateChange),
                     ArdServerMessage::EncryptionControl(_) => {}
+                    ArdServerMessage::DisplayLayout(layout) => {
+                        self.display_layout = Some(layout);
+                    }
                     ArdServerMessage::MediaStream(reply) => {
                         if let Some(event) = self.handle_media_stream_reply(reply)? {
                             batch_events.push(event);
@@ -1766,17 +1824,21 @@ fn viewer_information() -> [u8; ArdViewerInformation::WIRE_LEN] {
 #[cfg(test)]
 mod outbound_queue_tests {
     use super::*;
+    use crate::Encoding;
 
     #[test]
     fn high_performance_profiles_do_not_advertise_a_visual_fallback() {
-        assert_eq!(
-            ArdVideoQuality::HighPerformanceHevc.encodings(),
-            [ENCODING_AVC_MEDIA_STREAM, -223]
-        );
-        assert_eq!(
-            ArdVideoQuality::HighPerformanceAvc.encodings(),
-            [ENCODING_AVC_MEDIA_STREAM, -223]
-        );
+        for quality in [
+            ArdVideoQuality::HighPerformanceHevc,
+            ArdVideoQuality::HighPerformanceAvc,
+        ] {
+            let encodings = quality.encodings();
+            assert_eq!(encodings[0], ENCODING_AVC_MEDIA_STREAM);
+            assert!(!encodings.contains(&(Encoding::ArdMvs as i32)));
+            assert!(!encodings.contains(&(Encoding::Zlib as i32)));
+            assert!(encodings.contains(&(Encoding::ArdDisplayInfo as i32)));
+            assert!(encodings.contains(&(Encoding::ArdDisplayInfo2 as i32)));
+        }
     }
 
     #[test]

@@ -1614,6 +1614,113 @@ fn apple_display_info_resizes_and_consumes_all_display_records() {
 }
 
 #[test]
+fn apple_display_info2_resizes_and_retains_display_ids() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&5_u16.to_be_bytes());
+    for value in [800_u16, 600, 1600, 600] {
+        body.extend_from_slice(&value.to_be_bytes());
+    }
+    body.extend_from_slice(&u32::MAX.to_be_bytes());
+    body.extend_from_slice(&0x0200_0000_u32.to_be_bytes());
+    body.extend_from_slice(&1_u16.to_be_bytes());
+    body.extend_from_slice(&1.0_f64.to_bits().to_be_bytes());
+    body.extend_from_slice(&2.0_f64.to_bits().to_be_bytes());
+    body.extend_from_slice(&42_u32.to_be_bytes());
+    for bounds in [[0_u16, 0, 600, 800], [0_u16, 0, 600, 1600]] {
+        for value in bounds {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&[32, 24, 0, 1]);
+    for maximum in [255_u16; 3] {
+        body.extend_from_slice(&maximum.to_be_bytes());
+    }
+    body.extend_from_slice(&[16, 8, 0, 0, 0, 0]);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    payload.extend_from_slice(&body);
+
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(1, 1).unwrap();
+    let consumed = decoder
+        .decode_rectangle(
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                encoding: Encoding::ArdDisplayInfo2 as i32,
+            },
+            &payload,
+            &mut framebuffer,
+        )
+        .unwrap();
+    assert_eq!(consumed, payload.len());
+    assert_eq!((framebuffer.width(), framebuffer.height()), (1600, 600));
+    let layouts = decoder.take_display_layouts();
+    assert_eq!(layouts.len(), 1);
+    assert_eq!(layouts[0].displays[0].id, 42);
+}
+
+#[test]
+fn apple_metadata_and_cursor_pseudo_encodings_are_bounded_noops() {
+    let mut decoder = Decoder::new(PixelFormat::XRGB8888).unwrap();
+    let mut framebuffer = Framebuffer::new(8, 8).unwrap();
+    framebuffer.pixels_mut().fill(0x5a);
+
+    let rich_cursor = Rectangle {
+        x: 1,
+        y: 2,
+        width: 2,
+        height: 1,
+        encoding: Encoding::RichCursor as i32,
+    };
+    assert_eq!(
+        decoder
+            .decode_rectangle(rich_cursor, &[0; 9], &mut framebuffer)
+            .unwrap(),
+        9
+    );
+
+    let cached_cursor = Rectangle {
+        encoding: Encoding::ArdCursor as i32,
+        ..rich_cursor
+    };
+    let mut cursor_payload = 1000_u32.to_be_bytes().to_vec();
+    cursor_payload.extend_from_slice(&0_u32.to_be_bytes());
+    assert_eq!(
+        decoder
+            .decode_rectangle(cached_cursor, &cursor_payload, &mut framebuffer)
+            .unwrap(),
+        8
+    );
+
+    for encoding in [
+        Encoding::ArdVendorKeysyms,
+        Encoding::ArdKeyboardInputSource,
+        Encoding::ArdDeviceInfo,
+    ] {
+        let payload = [0, 2, 0xaa, 0xbb];
+        let consumed = decoder
+            .decode_rectangle(
+                Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                    encoding: encoding as i32,
+                },
+                &payload,
+                &mut framebuffer,
+            )
+            .unwrap();
+        assert_eq!(consumed, payload.len());
+    }
+    assert!(framebuffer.pixels().iter().all(|&byte| byte == 0x5a));
+}
+
+#[test]
 fn cursor_position_rectangle_is_a_noop() {
     // Screen Sharing sends the pointer hotspot as an 1100 rectangle inside a
     // FramebufferUpdate; the native decoder treats it as a zero-payload

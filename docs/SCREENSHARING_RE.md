@@ -311,13 +311,27 @@ ordinary FramebufferUpdate rectangles:
 | ---: | --- | --- |
 | `1100` | pointer hotspot | zero (position is in the rectangle header) |
 | `-239` | cursor image | variable cursor bitmap, read directly by the handler |
+| `1104` | cached Apple cursor image | cache id, compressed length, optional zlib payload |
 
 The server records `-239` and `1100` in `HandleSetEncodingsMessage` (flags at
 viewer offsets `0x9a` and `0x9b` in the tested build) and only emits cursor
 rectangles to viewers that advertise them. The native client still tolerates
 an unadvertised `1100` rectangle; the Rust decoder now consumes it as a
 zero-payload no-op instead of rejecting the whole FramebufferUpdate (which
-dropped every frame while the pointer moved and forced a reconnect).
+dropped every frame while the pointer moved and forced a reconnect). The Rust
+client now advertises and safely consumes both cursor-image variants; cursor
+metadata does not advance the image-frame sequence.
+
+### Display topology and metadata pseudo-encodings
+
+The negotiated native capability suffix is `[-239, 1104, 1100, -223, 1101,
+1105, 1107, 1109, 1110]`. Encoding `1105` is the length-prefixed DisplayInfo2
+layout: it reports the logical and backing framebuffer sizes plus 56-byte
+per-display records containing display ids, bounds, scale values, flags, and
+pixel-format metadata. The core retains the latest authoritative layout and
+supports Apple message `0x0d` for either the combined desktop or one reported
+display id. Encodings `1107`, `1109`, and `1110` are bounded length-prefixed
+metadata and are consumed without being surfaced as image frames.
 
 ## Native decoder oracle
 

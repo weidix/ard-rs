@@ -753,6 +753,17 @@ pub enum Encoding {
     /// Apple display topology. The rectangle dimensions carry the framebuffer
     /// size and the payload describes the displays that compose it.
     ArdDisplayInfo = 1101,
+    /// Apple's cached cursor-image pseudo-encoding.
+    ArdCursor = 1104,
+    /// Current Apple display topology, including per-display identifiers,
+    /// logical bounds, backing-pixel bounds and pixel formats.
+    ArdDisplayInfo2 = 1105,
+    /// Apple vendor-specific keysym capability metadata.
+    ArdVendorKeysyms = 1107,
+    /// The server's active keyboard input-source identifier.
+    ArdKeyboardInputSource = 1109,
+    /// Apple machine-model and enclosure metadata.
+    ArdDeviceInfo = 1110,
     ArdHalftone = 1000,
     ArdGrayscale = 1001,
     ArdThousands = 1002,
@@ -762,6 +773,8 @@ pub enum Encoding {
     ArdMvs = 1011,
     ArdEncryption = 1103,
     DesktopSize = -223,
+    /// Standard RFB RichCursor pseudo-encoding.
+    RichCursor = -239,
 }
 
 impl Encoding {
@@ -773,6 +786,11 @@ impl Encoding {
             16 => Self::Zrle,
             1100 => Self::CursorPosition,
             1101 => Self::ArdDisplayInfo,
+            1104 => Self::ArdCursor,
+            1105 => Self::ArdDisplayInfo2,
+            1107 => Self::ArdVendorKeysyms,
+            1109 => Self::ArdKeyboardInputSource,
+            1110 => Self::ArdDeviceInfo,
             1000 => Self::ArdHalftone,
             1001 => Self::ArdGrayscale,
             1002 => Self::ArdThousands,
@@ -780,8 +798,23 @@ impl Encoding {
             1011 => Self::ArdMvs,
             1103 => Self::ArdEncryption,
             -223 => Self::DesktopSize,
+            -239 => Self::RichCursor,
             _ => return None,
         })
+    }
+
+    pub(crate) const fn carries_image_pixels(self) -> bool {
+        matches!(
+            self,
+            Self::Raw
+                | Self::CopyRect
+                | Self::Zlib
+                | Self::Zrle
+                | Self::ArdHalftone
+                | Self::ArdGrayscale
+                | Self::ArdThousands
+                | Self::ArdMvs
+        )
     }
 }
 
@@ -959,6 +992,192 @@ pub fn build_ard_auto_frame_update(
     out[12..14].copy_from_slice(&width.to_be_bytes());
     out[14..16].copy_from_slice(&height.to_be_bytes());
     out
+}
+
+/// Selects which physical display(s) the ARD server should publish.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ArdDisplaySelection {
+    /// Publish the aggregate framebuffer containing every display.
+    #[default]
+    Combined,
+    /// Publish one display by the identifier reported by DisplayInfo2.
+    Display(u32),
+}
+
+/// Builds Apple's fixed eight-byte `RFBSetDisplay` client message (`0x0d`).
+pub fn build_ard_set_display(selection: ArdDisplaySelection) -> [u8; 8] {
+    let mut out = [0_u8; 8];
+    out[0] = 0x0d;
+    match selection {
+        ArdDisplaySelection::Combined => out[1] = 1,
+        ArdDisplaySelection::Display(display_id) => {
+            out[4..8].copy_from_slice(&display_id.to_be_bytes());
+        }
+    }
+    out
+}
+
+/// One rectangle in the logical or backing-pixel coordinate space reported
+/// by Apple's DisplayInfo2 pseudo-encoding.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArdDisplayRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// One physical display reported by Apple's DisplayInfo2 pseudo-encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArdDisplay {
+    pub id: u32,
+    pub logical_bounds: ArdDisplayRect,
+    pub framebuffer_bounds: ArdDisplayRect,
+    pub flags: u32,
+    /// Raw IEEE-754 bits retained so the topology remains `Eq` and can be
+    /// compared without NaN corner cases.
+    pub horizontal_scale_bits: u64,
+    pub vertical_scale_bits: u64,
+    pub bits_per_pixel: u8,
+    pub depth: u8,
+    pub big_endian: bool,
+    pub true_color: bool,
+    pub red_max: u16,
+    pub green_max: u16,
+    pub blue_max: u16,
+    pub red_shift: u8,
+    pub green_shift: u8,
+    pub blue_shift: u8,
+}
+
+impl ArdDisplay {
+    pub fn horizontal_scale(&self) -> f64 {
+        f64::from_bits(self.horizontal_scale_bits)
+    }
+
+    pub fn vertical_scale(&self) -> f64 {
+        f64::from_bits(self.vertical_scale_bits)
+    }
+}
+
+/// Authoritative multi-display topology from encoding `1105` (DisplayInfo2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArdDisplayLayout {
+    pub version: u16,
+    pub scaled_width: u16,
+    pub scaled_height: u16,
+    pub framebuffer_width: u16,
+    pub framebuffer_height: u16,
+    pub current_display: Option<u32>,
+    pub flags: u32,
+    pub displays: Vec<ArdDisplay>,
+}
+
+/// Parses the length-prefixed DisplayInfo2 layout used by current macOS.
+///
+/// The fixed body is 20 bytes followed by 56 bytes per display. Rectangle
+/// coordinates are transmitted as `(y0, x0, y1, x1)` endpoints.
+pub fn parse_ard_display_info2(bytes: &[u8]) -> Result<(ArdDisplayLayout, usize)> {
+    const HEADER_LEN: usize = 20;
+    const DISPLAY_LEN: usize = 56;
+
+    let mut wire = Cursor::new(bytes);
+    let payload_len = usize::from(wire.u16()?);
+    let payload = wire.take(payload_len)?;
+    if payload.len() < HEADER_LEN {
+        return Err(Error::Invalid("DisplayInfo2 header is truncated"));
+    }
+
+    let mut cursor = Cursor::new(payload);
+    let version = cursor.u16()?;
+    let scaled_width = cursor.u16()?;
+    let scaled_height = cursor.u16()?;
+    let framebuffer_width = cursor.u16()?;
+    let framebuffer_height = cursor.u16()?;
+    let current_display = match cursor.u32()? {
+        u32::MAX => None,
+        id => Some(id),
+    };
+    let flags = cursor.u32()?;
+    let display_count = usize::from(cursor.u16()?);
+    let records_len = display_count
+        .checked_mul(DISPLAY_LEN)
+        .ok_or(Error::LimitExceeded("DisplayInfo2 records"))?;
+    if cursor.remaining() < records_len {
+        return Err(Error::Invalid("DisplayInfo2 records are truncated"));
+    }
+
+    let mut displays = Vec::with_capacity(display_count);
+    for _ in 0..display_count {
+        let horizontal_scale_bits = cursor.u64()?;
+        let vertical_scale_bits = cursor.u64()?;
+        let id = cursor.u32()?;
+        let logical_bounds = parse_ard_display_rect(&mut cursor)?;
+        let framebuffer_bounds = parse_ard_display_rect(&mut cursor)?;
+        let flags = cursor.u32()?;
+        let bits_per_pixel = cursor.u8()?;
+        let depth = cursor.u8()?;
+        let big_endian = cursor.u8()? != 0;
+        let true_color = cursor.u8()? != 0;
+        let red_max = cursor.u16()?;
+        let green_max = cursor.u16()?;
+        let blue_max = cursor.u16()?;
+        let red_shift = cursor.u8()?;
+        let green_shift = cursor.u8()?;
+        let blue_shift = cursor.u8()?;
+        cursor.take(3)?;
+        displays.push(ArdDisplay {
+            id,
+            logical_bounds,
+            framebuffer_bounds,
+            flags,
+            horizontal_scale_bits,
+            vertical_scale_bits,
+            bits_per_pixel,
+            depth,
+            big_endian,
+            true_color,
+            red_max,
+            green_max,
+            blue_max,
+            red_shift,
+            green_shift,
+            blue_shift,
+        });
+    }
+
+    Ok((
+        ArdDisplayLayout {
+            version,
+            scaled_width,
+            scaled_height,
+            framebuffer_width,
+            framebuffer_height,
+            current_display,
+            flags,
+            displays,
+        },
+        wire.position(),
+    ))
+}
+
+fn parse_ard_display_rect(cursor: &mut Cursor<'_>) -> Result<ArdDisplayRect> {
+    let y0 = cursor.u16()?;
+    let x0 = cursor.u16()?;
+    let y1 = cursor.u16()?;
+    let x1 = cursor.u16()?;
+    let width = x1.checked_sub(x0).ok_or(Error::Invalid(
+        "DisplayInfo2 rectangle x endpoints are reversed",
+    ))?;
+    let height = y1.checked_sub(y0).ok_or(Error::Invalid(
+        "DisplayInfo2 rectangle y endpoints are reversed",
+    ))?;
+    Ok(ArdDisplayRect {
+        x: x0,
+        y: y0,
+        width,
+        height,
+    })
 }
 
 /// One fixed-resolution virtual display requested from the ARD server.
@@ -1163,14 +1382,20 @@ pub fn parse_framebuffer_update(
     decoder: &mut Decoder,
     framebuffer: &mut Framebuffer,
 ) -> Result<usize> {
-    parse_framebuffer_update_impl(bytes, decoder, framebuffer, false)
+    parse_framebuffer_update_impl(bytes, decoder, framebuffer, false).map(|update| update.consumed)
+}
+
+pub(crate) struct ParsedFramebufferUpdate {
+    pub consumed: usize,
+    pub rectangle_count: usize,
+    pub has_image_rectangles: bool,
 }
 
 pub(crate) fn parse_complete_framebuffer_update(
     bytes: &[u8],
     decoder: &mut Decoder,
     framebuffer: &mut Framebuffer,
-) -> Result<usize> {
+) -> Result<ParsedFramebufferUpdate> {
     parse_framebuffer_update_impl(bytes, decoder, framebuffer, true)
 }
 
@@ -1179,7 +1404,7 @@ fn parse_framebuffer_update_impl(
     decoder: &mut Decoder,
     framebuffer: &mut Framebuffer,
     complete: bool,
-) -> Result<usize> {
+) -> Result<ParsedFramebufferUpdate> {
     let mut cursor = Cursor::new(bytes);
     if cursor.u8()? != 0 {
         return Err(Error::Invalid("not a FramebufferUpdate message"));
@@ -1189,6 +1414,7 @@ fn parse_framebuffer_update_impl(
     if count > decoder.limits().max_rectangles {
         return Err(Error::LimitExceeded("rectangle count"));
     }
+    let mut has_image_rectangles = false;
     for _ in 0..count {
         let rect = Rectangle {
             x: cursor.u16()?,
@@ -1197,6 +1423,9 @@ fn parse_framebuffer_update_impl(
             height: cursor.u16()?,
             encoding: cursor.i32()?,
         };
+        let encoding =
+            Encoding::from_i32(rect.encoding).ok_or(Error::UnsupportedEncoding(rect.encoding))?;
+        has_image_rectangles |= encoding.carries_image_pixels();
         let consumed = if complete {
             decoder.decode_complete_rectangle(rect, cursor.tail(), framebuffer)?
         } else {
@@ -1204,7 +1433,11 @@ fn parse_framebuffer_update_impl(
         };
         cursor.take(consumed)?;
     }
-    Ok(cursor.position())
+    Ok(ParsedFramebufferUpdate {
+        consumed: cursor.position(),
+        rectangle_count: count,
+        has_image_rectangles,
+    })
 }
 
 /// Finds the exact boundary of a framebuffer update without running any
@@ -1312,6 +1545,87 @@ mod display_configuration_tests {
             ArdVirtualDisplay::new(1320, 848)
                 .backing_dimensions()
                 .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod display_info2_tests {
+    use super::*;
+
+    fn display_record(id: u32, x: u16, y: u16, width: u16, height: u16) -> Vec<u8> {
+        let mut record = Vec::with_capacity(56);
+        record.extend_from_slice(&1.0_f64.to_bits().to_be_bytes());
+        record.extend_from_slice(&2.0_f64.to_bits().to_be_bytes());
+        record.extend_from_slice(&id.to_be_bytes());
+        for bounds in [[y, x, y + height, x + width], [y, x, y + height, x + width]] {
+            for value in bounds {
+                record.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        record.extend_from_slice(&0_u32.to_be_bytes());
+        record.extend_from_slice(&[32, 24, 0, 1]);
+        for maximum in [255_u16; 3] {
+            record.extend_from_slice(&maximum.to_be_bytes());
+        }
+        record.extend_from_slice(&[16, 8, 0, 0, 0, 0]);
+        assert_eq!(record.len(), 56);
+        record
+    }
+
+    fn two_display_layout() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&5_u16.to_be_bytes());
+        for value in [1600_u16, 600, 3200, 1200] {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+        body.extend_from_slice(&7_u32.to_be_bytes());
+        body.extend_from_slice(&0x0200_0000_u32.to_be_bytes());
+        body.extend_from_slice(&2_u16.to_be_bytes());
+        body.extend_from_slice(&display_record(7, 0, 0, 1600, 1200));
+        body.extend_from_slice(&display_record(9, 1600, 0, 1600, 1200));
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&body);
+        payload
+    }
+
+    #[test]
+    fn parses_two_display_layout_and_ids() {
+        let payload = two_display_layout();
+        let (layout, consumed) = parse_ard_display_info2(&payload).unwrap();
+        assert_eq!(consumed, payload.len());
+        assert_eq!(layout.current_display, Some(7));
+        assert_eq!(
+            (layout.framebuffer_width, layout.framebuffer_height),
+            (3200, 1200)
+        );
+        assert_eq!(layout.displays.len(), 2);
+        assert_eq!(layout.displays[0].horizontal_scale(), 1.0);
+        assert_eq!(layout.displays[0].vertical_scale(), 2.0);
+        assert_eq!(layout.displays[1].id, 9);
+        assert_eq!(layout.displays[1].framebuffer_bounds.x, 1600);
+    }
+
+    #[test]
+    fn rejects_truncated_display_records() {
+        let mut payload = two_display_layout();
+        payload.truncate(payload.len() - 1);
+        assert!(matches!(
+            parse_ard_display_info2(&payload),
+            Err(Error::NeedMore { .. })
+        ));
+    }
+
+    #[test]
+    fn builds_combined_and_single_display_selection() {
+        assert_eq!(
+            build_ard_set_display(ArdDisplaySelection::Combined),
+            [0x0d, 1, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            build_ard_set_display(ArdDisplaySelection::Display(0x1020_3040)),
+            [0x0d, 0, 0, 0, 0x10, 0x20, 0x30, 0x40]
         );
     }
 }

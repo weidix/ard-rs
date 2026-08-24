@@ -52,6 +52,11 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_be_bytes(bytes))
     }
 
+    pub(crate) fn u64(&mut self) -> Result<u64> {
+        let bytes: [u8; 8] = self.take(8)?.try_into().expect("length checked");
+        Ok(u64::from_be_bytes(bytes))
+    }
+
     pub(crate) fn i32(&mut self) -> Result<i32> {
         Ok(self.u32()? as i32)
     }

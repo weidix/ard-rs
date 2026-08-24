@@ -1,7 +1,8 @@
 use crate::protocol::{complete_framebuffer_update_len, parse_complete_framebuffer_update};
 use crate::wire::Cursor;
 use crate::{
-    ArdEncryptionControl, Decoder, Error, Framebuffer, Result, media_stream::MediaStreamServerReply,
+    ArdDisplayLayout, ArdEncryptionControl, Decoder, Error, Framebuffer, Result,
+    media_stream::MediaStreamServerReply,
 };
 
 /// One complete server message recovered from the decrypted record payload
@@ -15,6 +16,9 @@ pub enum ArdServerMessage {
     /// The zero-sized 1103 rectangle inside a FramebufferUpdate. The decoder
     /// stores it separately so the session material can be unwrapped.
     EncryptionControl(ArdEncryptionControl),
+    /// Authoritative multi-display topology from encoding 1105. It is a
+    /// control update and is deliberately not surfaced as an image frame.
+    DisplayLayout(ArdDisplayLayout),
     /// AVC media-stream bootstrap/control data. The corresponding encoded
     /// frames arrive on the negotiated UDP stream.
     MediaStream(MediaStreamServerReply),
@@ -129,25 +133,27 @@ impl ArdMessageDispatcher {
             };
             match message_type {
                 0 => {
-                    let rectangle_count = usize::from(u16::from_be_bytes([buffer[2], buffer[3]]));
-                    let message_len =
+                    let update =
                         match parse_complete_framebuffer_update(buffer, decoder, framebuffer) {
                             Ok(consumed) => consumed,
                             Err(Error::NeedMore { .. }) => return Ok((consumed, messages)),
                             Err(error) => return Err(error),
                         };
                     consumed = consumed
-                        .checked_add(message_len)
+                        .checked_add(update.consumed)
                         .ok_or(Error::LimitExceeded("ARD buffered messages"))?;
                     let media_replies = decoder.take_media_stream_replies();
-                    if media_replies.len() < rectangle_count {
+                    if update.has_image_rectangles {
                         messages.push(ArdServerMessage::FramebufferUpdate {
-                            rectangle_count,
-                            bytes: message_len,
+                            rectangle_count: update.rectangle_count,
+                            bytes: update.consumed,
                         });
                     }
                     if let Some(control) = decoder.take_ard_encryption_control() {
                         messages.push(ArdServerMessage::EncryptionControl(control));
+                    }
+                    for layout in decoder.take_display_layouts() {
+                        messages.push(ArdServerMessage::DisplayLayout(layout));
                     }
                     for reply in media_replies {
                         messages.push(ArdServerMessage::MediaStream(reply));
