@@ -3,7 +3,7 @@ use std::f32::consts::TAU;
 use iced::widget::{
     button, column, container, mouse_area, progress_bar, row, space, stack, text, text_input,
 };
-use iced::{Alignment, Element, Fill, Padding, window};
+use iced::{Alignment, Color, Element, Fill, Padding, window};
 
 use crate::icons::{Icon, icon};
 use crate::session_renderer;
@@ -14,6 +14,10 @@ use crate::widgets::window_chrome_with_title;
 use crate::{ArdViewer, Message, SESSION_TOOLBAR_COLLAPSED_WIDTH, SessionAction};
 
 pub(crate) const SESSION_TITLEBAR_HEIGHT: f32 = 50.0;
+
+/// Recording indicator colour. Red is the universal cue for "this is being
+/// captured" and must not follow the theme's muted palette.
+const RECORDING_RED: Color = Color::from_rgb(1.0, 0.27, 0.23);
 
 pub fn session(app: &ArdViewer, window_id: window::Id) -> Element<'_, Message> {
     let maximized = app.session_fullscreen || app.is_window_maximized(window_id);
@@ -75,6 +79,7 @@ fn remote_canvas(
             app.session_actual_size,
             runtime.should_interpolate(),
             runtime.sharp_sampling(),
+            app.recording_control(),
         ))
         .height(Fill)
         .width(Fill)
@@ -241,9 +246,34 @@ fn performance_hud(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> 
     } else {
         "输入写出→下一收到帧 —".to_owned()
     };
+    // Recording counters belong next to the pipeline timings: they are the only
+    // place where a dropped frame would otherwise be invisible.
+    let recording = if app.is_recording() {
+        let progress = app.recording_progress();
+        let megabytes = progress.written_bytes as f64 / (1024.0 * 1024.0);
+        let elapsed = crate::format_recording_elapsed(app.recording_elapsed());
+        let encoder = match progress.hardware_encoder {
+            Some(true) => app.language.tr("硬件编码"),
+            Some(false) => app.language.tr("软件编码"),
+            None => "",
+        };
+        if app.language == crate::i18n::Language::English {
+            format!(
+                "\nrecording {elapsed}  captured {}  encoded {}  dropped {}  {megabytes:.1} MB  {encoder}",
+                progress.captured_frames, progress.encoded_frames, progress.dropped_frames,
+            )
+        } else {
+            format!(
+                "\n录制 {elapsed}  捕获 {}  编码 {}  丢弃 {}  {megabytes:.1} MB  {encoder}",
+                progress.captured_frames, progress.encoded_frames, progress.dropped_frames,
+            )
+        }
+    } else {
+        String::new()
+    };
     let label = if app.language == crate::i18n::Language::English {
         format!(
-            "source {actual}  requested {requested}{resolution_state}  negotiated {negotiated}\ndisplay {scale}  {path}  {:.1} fps  {:.2} Mb/s\n{video_latency}\n{render_latency}\n{input_frame_proxy}\ninput queue avg {:.2} / peak {:.2} ms  depth {}\nTCP encode/write latest {:.2} / peak {:.2} ms  coalesced {}",
+            "source {actual}  requested {requested}{resolution_state}  negotiated {negotiated}\ndisplay {scale}  {path}  {:.1} fps  {:.2} Mb/s\n{video_latency}\n{render_latency}\n{input_frame_proxy}\ninput queue avg {:.2} / peak {:.2} ms  depth {}\nTCP encode/write latest {:.2} / peak {:.2} ms  coalesced {}{recording}",
             metrics.frames_per_second,
             metrics.megabits_per_second,
             metrics.input_queue_average_ms,
@@ -255,7 +285,7 @@ fn performance_hud(app: &ArdViewer, is_dark: bool) -> Element<'static, Message> 
         )
     } else {
         format!(
-            "源图像 {actual}  请求 {requested}{resolution_state}  协商声明 {negotiated}\n显示比例 {scale}  {path}  {:.1} fps  {:.2} Mb/s\n{video_latency}\n{render_latency}\n{input_frame_proxy}\n输入队列 平均 {:.2} / 峰值 {:.2} ms  深度 {}\nTCP 编码/写入 最近 {:.2} / 峰值 {:.2} ms  位置合并 {}",
+            "源图像 {actual}  请求 {requested}{resolution_state}  协商声明 {negotiated}\n显示比例 {scale}  {path}  {:.1} fps  {:.2} Mb/s\n{video_latency}\n{render_latency}\n{input_frame_proxy}\n输入队列 平均 {:.2} / 峰值 {:.2} ms  深度 {}\nTCP 编码/写入 最近 {:.2} / 峰值 {:.2} ms  位置合并 {}{recording}",
             metrics.frames_per_second,
             metrics.megabits_per_second,
             metrics.input_queue_average_ms,
@@ -404,6 +434,8 @@ fn toolbar_controls(app: &ArdViewer, is_dark: bool) -> Element<'static, Message>
         controls = controls.push(quick_button(*button, app, is_dark));
     }
     controls = controls
+        .push(record_button(app, is_dark))
+        .push(recording_badge(app))
         .push(toolbar_button(
             Icon::Fullscreen,
             false,
@@ -429,13 +461,68 @@ fn windowed_toolbar_controls(app: &ArdViewer, is_dark: bool) -> Element<'static,
     for button in &app.toolbar_buttons {
         controls = controls.push(quick_button(*button, app, is_dark));
     }
-    controls = controls.push(toolbar_button(
-        Icon::Fullscreen,
-        false,
-        Message::ToggleFullscreen,
-        is_dark,
-    ));
+    controls = controls
+        .push(record_button(app, is_dark))
+        .push(recording_badge(app))
+        .push(toolbar_button(
+            Icon::Fullscreen,
+            false,
+            Message::ToggleFullscreen,
+            is_dark,
+        ));
     controls.spacing(2).align_y(Alignment::Center).into()
+}
+
+/// Toggle for recording the presented frames into a video file.
+///
+/// The button is always present rather than configurable: whether a session is
+/// being recorded has to be visible at a glance.
+fn record_button(app: &ArdViewer, is_dark: bool) -> iced::widget::Button<'static, Message> {
+    let recording = app.is_recording();
+    let color = if recording {
+        RECORDING_RED
+    } else {
+        theme::toolbar_foreground(is_dark)
+    };
+    button(
+        container(icon(Icon::Record, 15.0, color))
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill),
+    )
+    .width(30)
+    .height(30)
+    .padding(0)
+    .style(theme::toolbar_glass_button(is_dark, recording))
+    .on_press(Message::ToggleRecording)
+}
+
+/// Elapsed time of the running take, so a forgotten recording is obvious.
+fn recording_badge(app: &ArdViewer) -> Element<'static, Message> {
+    if !app.is_recording() {
+        return space().width(0).into();
+    }
+    let label = if app.is_saving_recording() {
+        app.language.tr("正在保存录制文件…").to_owned()
+    } else {
+        crate::format_recording_elapsed(app.recording_elapsed())
+    };
+    container(
+        text(label)
+            .size(11)
+            .color(RECORDING_RED)
+            .font(iced::Font::MONOSPACE),
+    )
+    .padding(Padding {
+        top: 0.0,
+        right: 8.0,
+        bottom: 0.0,
+        left: 4.0,
+    })
+    .height(30)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn quick_button(

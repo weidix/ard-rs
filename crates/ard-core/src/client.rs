@@ -14,11 +14,13 @@ use crate::media_stream::{
     MediaUdpPortOverrides, VideoCodecConfig, build_media_stream_offer_with_ssrc,
     build_media_stream_offer_with_ssrc_and_codec, build_remote_endpoint_info,
 };
+use crate::protocol::complete_framebuffer_update_len;
+use crate::raw_stream::RawStreamSink;
 use crate::{
     ArdDisplayConfiguration, ArdDisplayLayout, ArdDisplaySelection, ArdEncryptionControl,
     ArdMessageDispatcher, ArdScrollWheelEvent, ArdServerMessage, ArdVerifiedRecordStream,
-    ArdViewerInformation, Decoder, Framebuffer, FramebufferFormat, PixelFormat, ProtocolVersion,
-    SecurityType, build_ard_auto_frame_update, build_ard_encryption_activation,
+    ArdViewerInformation, Decoder, Framebuffer, FramebufferFormat, MAX_AUTH_KEY_BYTES, PixelFormat,
+    ProtocolVersion, SecurityType, build_ard_auto_frame_update, build_ard_encryption_activation,
     build_ard_scroll_wheel_event, build_ard_set_display, build_ard_set_display_configuration,
     build_ard_set_encryption_level, build_ard_type30_client_exchange, build_client_cut_text,
     build_framebuffer_update_request, build_key_event, build_pointer_event, build_set_encodings,
@@ -26,13 +28,73 @@ use crate::{
     parse_security_types, parse_server_init, unwrap_ard_session_material,
 };
 
-const MAX_KEY_BYTES: usize = 512;
+/// Largest accepted Diffie-Hellman modulus width in bytes.
+///
+/// The native client accepts `key_length` in `[64, 1024]`
+/// (`_AuthenticateDHNamePassword` computes `key_length - 0x401` and rejects
+/// anything above `0xfc3f`, i.e. above 1024). The installed macOS server uses
+/// the RFC 5054 4096-bit group, so 512 is the value seen in practice, but an
+/// 8192-bit group is legal and must not be rejected before authentication.
+const MAX_KEY_BYTES: usize = MAX_AUTH_KEY_BYTES;
+
 const MAX_RECORD_BYTES: usize = u16::MAX as usize;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CUT_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_SERVER_NAME_BYTES: usize = 1024 * 1024;
 const MAX_INPUT_QUEUE: usize = 512;
 const MAX_OUTBOUND_PAYLOAD_BYTES: usize = 65_498;
+/// Upper bound on the outbound-input flush performed when a session is torn
+/// down. A peer that has stopped reading can stall `write_all` until the socket
+/// write timeout fires, so teardown must never wait indefinitely.
+const INPUT_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether the RFB framebuffer path may ask the server for anything at all.
+///
+/// That path and the AVC media stream both make the server capture and encode
+/// this screen, and only one of them should: the native client's
+/// `SSFrameBufferAVCMediaView` answers `isUsingAVCMediaStream` and refuses the
+/// cached RFB image for exactly that reason. While a media stream is being
+/// negotiated or is running, this path stays silent in every form, including
+/// the plain request-per-frame loop a viewer with automatic updates turned off
+/// would otherwise keep sending.
+fn rfb_framebuffer_updates_allowed(media_stream_pending: bool, media_stream_active: bool) -> bool {
+    if rfb_updates_forced() {
+        // Development switch for the A/B that measures what this loop costs the
+        // media stream (`ARD_MEDIA_RFB_UPDATES=on`): it restores the behaviour
+        // this client had before the loop was suppressed.
+        return true;
+    }
+    !media_stream_pending && !media_stream_active
+}
+
+/// Whether the development switch that keeps the RFB framebuffer loop running
+/// beside a media stream is set.
+fn rfb_updates_forced() -> bool {
+    matches!(
+        std::env::var("ARD_MEDIA_RFB_UPDATES").ok().as_deref(),
+        Some("on") | Some("1") | Some("true")
+    )
+}
+
+/// The frame interval below which the offer still asks the server for 60 fps.
+///
+/// The protocol has one bit for it (`VIDEO1_60FPS`) and no other way to express
+/// a rate, so a viewer that asked for 30 fps or less offers an offer without it
+/// and the server paces the screen encoder at its own ladder instead of at the
+/// 60 fps the bit requests. An empty setting means "auto" and keeps the bit.
+const SIXTY_FPS_INTERVAL_MS: u128 = 33;
+
+/// Flags for the video1 media-stream offer, from the requested frame interval.
+fn video_flags_for_frame_interval(frame_interval: Duration) -> MediaStreamFlags {
+    let mut flags =
+        MediaStreamFlags::new(MediaStreamFlags::SEND_CURSOR | MediaStreamFlags::VIEWER_APP);
+    let wants_sixty =
+        frame_interval.is_zero() || frame_interval.as_millis() < SIXTY_FPS_INTERVAL_MS;
+    if wants_sixty {
+        flags = MediaStreamFlags::new(flags.raw() | MediaStreamFlags::VIDEO1_60FPS);
+    }
+    flags
+}
 
 fn generate_media_ssrc() -> Result<u32, ArdClientError> {
     loop {
@@ -206,10 +268,19 @@ pub struct ArdClientConfig {
     /// Use Apple's server-driven update stream instead of serial
     /// request/response polling.
     pub automatic_updates: bool,
-    /// Minimum interval between automatic updates. Zero is the native default
-    /// and permits the server's maximum supported rate.
+    /// Minimum interval between automatic updates.
+    ///
+    /// The native client never sends zero: `-[SSEventSession
+    /// stSetFrameUpdateInterval]` multiplies the seconds value by 1000 and
+    /// clamps anything below 250 ms to a "maximum rate" sentinel. Zero here
+    /// therefore means "unbounded, server-driven rate", which is what the
+    /// viewer's automatic mode asks for, not the native default.
     pub frame_interval: Duration,
     pub reconnect: ArdReconnectPolicy,
+    /// Shared development dump of the server streams, when the application
+    /// asked for one. `None` keeps the client from dumping anything, which is
+    /// the normal case.
+    pub raw_stream: Option<Arc<RawStreamSink>>,
 }
 
 impl fmt::Debug for ArdClientConfig {
@@ -228,6 +299,7 @@ impl fmt::Debug for ArdClientConfig {
             .field("automatic_updates", &self.automatic_updates)
             .field("frame_interval", &self.frame_interval)
             .field("reconnect", &self.reconnect)
+            .field("raw_stream", &self.raw_stream.is_some())
             .finish()
     }
 }
@@ -251,7 +323,16 @@ impl ArdClientConfig {
             automatic_updates: true,
             frame_interval: Duration::ZERO,
             reconnect: ArdReconnectPolicy::default(),
+            raw_stream: None,
         }
+    }
+
+    /// Dump the server's streams through `sink`, which the caller owns and
+    /// shares with anything else that receives server data.
+    #[must_use]
+    pub fn with_raw_stream(mut self, sink: Arc<RawStreamSink>) -> Self {
+        self.raw_stream = Some(sink);
+        self
     }
 }
 
@@ -595,6 +676,11 @@ enum OutboundMode {
 struct OutboundQueueState {
     messages: VecDeque<OutboundMessage>,
     stopped: bool,
+    /// True while the writer thread is inside `write_all`/`flush` for a batch
+    /// that has already left the queue. Draining must wait for this to clear,
+    /// otherwise a caller could observe an empty queue while the final record
+    /// is still being written.
+    in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -602,6 +688,8 @@ struct OutboundQueue {
     state: Mutex<OutboundQueueState>,
     available: Condvar,
     space: Condvar,
+    /// Notified whenever a batch finishes writing or the queue drains.
+    drained: Condvar,
     producers: AtomicUsize,
     metrics: InputMetricCounters,
 }
@@ -612,9 +700,40 @@ impl OutboundQueue {
             state: Mutex::new(OutboundQueueState::default()),
             available: Condvar::new(),
             space: Condvar::new(),
+            drained: Condvar::new(),
             producers: AtomicUsize::new(1),
             metrics: InputMetricCounters::default(),
         })
+    }
+
+    /// Blocks until every queued message has been handed to the socket, or the
+    /// timeout expires. Returns whether the queue drained in time.
+    ///
+    /// `stop` must be called first (or concurrently) so the writer is willing
+    /// to exit; this only observes the drain.
+    fn wait_until_drained(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if state.messages.is_empty() && !state.in_flight {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return state.messages.is_empty() && !state.in_flight;
+            }
+            let (next, wait) = self
+                .drained
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poison| poison.into_inner());
+            state = next;
+            if wait.timed_out() && state.messages.is_empty() && !state.in_flight {
+                return true;
+            }
+        }
     }
 
     fn submit(
@@ -628,6 +747,7 @@ impl OutboundQueue {
                 "ARD outbound payload exceeds one encrypted record".to_owned(),
             ));
         }
+        trace_client_message(&payload);
         let mut state = self
             .state
             .lock()
@@ -703,6 +823,7 @@ impl OutboundQueue {
             .unwrap_or_else(|poison| poison.into_inner());
         while state.messages.is_empty() && !state.stopped {
             if self.producers.load(Ordering::Acquire) == 0 {
+                self.drained.notify_all();
                 return None;
             }
             state = self
@@ -711,6 +832,7 @@ impl OutboundQueue {
                 .unwrap_or_else(|poison| poison.into_inner());
         }
         if state.messages.is_empty() {
+            self.drained.notify_all();
             return None;
         }
 
@@ -726,6 +848,7 @@ impl OutboundQueue {
             payload_bytes = next_payload_bytes;
             batch.push(state.messages.pop_front().expect("queue front checked"));
         }
+        state.in_flight = true;
         self.metrics
             .queue_depth
             .store(state.messages.len(), Ordering::Relaxed);
@@ -734,12 +857,24 @@ impl OutboundQueue {
         Some(batch)
     }
 
+    /// Marks the batch returned by [`Self::receive_batch`] as written.
+    fn finish_batch(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight = false;
+            self.metrics
+                .queue_depth
+                .store(state.messages.len(), Ordering::Relaxed);
+        }
+        self.drained.notify_all();
+    }
+
     fn stop(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.stopped = true;
         }
         self.available.notify_all();
         self.space.notify_all();
+        self.drained.notify_all();
     }
 
     fn producer_cloned(&self) {
@@ -762,6 +897,9 @@ pub struct ArdClientInput {
     queue: Arc<OutboundQueue>,
     writer_error: Arc<Mutex<Option<String>>>,
     supports_extended_scroll: bool,
+    /// The session's development dump, shared with the media receiver so both
+    /// server-to-client paths land in one place.
+    raw_stream: Option<Arc<RawStreamSink>>,
 }
 
 impl Clone for ArdClientInput {
@@ -771,6 +909,7 @@ impl Clone for ArdClientInput {
             queue: Arc::clone(&self.queue),
             writer_error: Arc::clone(&self.writer_error),
             supports_extended_scroll: self.supports_extended_scroll,
+            raw_stream: self.raw_stream.clone(),
         }
     }
 }
@@ -787,6 +926,7 @@ impl fmt::Debug for ArdClientInput {
             .debug_struct("ArdClientInput")
             .field("writer_error", &self.writer_error)
             .field("supports_extended_scroll", &self.supports_extended_scroll)
+            .field("raw_stream", &self.raw_stream.is_some())
             .field("metrics", &self.metrics())
             .finish()
     }
@@ -796,6 +936,14 @@ impl ArdClientInput {
     /// Whether the server accepts Apple's extended mouse/scroll input family.
     pub fn supports_extended_scroll(&self) -> bool {
         self.supports_extended_scroll
+    }
+
+    /// The session's development dump, when the application asked for one.
+    ///
+    /// The media receiver shares it so a UDP video session is dumped too, in
+    /// files of its own.
+    pub fn raw_stream(&self) -> Option<Arc<RawStreamSink>> {
+        self.raw_stream.clone()
     }
 
     /// Returns a lock-free snapshot of the outbound real-time queue.
@@ -945,8 +1093,11 @@ impl ArdClientInput {
 /// MVS output is emitted as tile commands and DCT coefficients so a renderer
 /// can expand it on the GPU without materializing a CPU image frame.
 pub struct ArdClient {
-    stream: TcpStream,
+    /// Declared first so the encrypted-record writer drains and stops before
+    /// the session socket is closed underneath it.
+    input_writer: InputWriter,
     input: ArdClientInput,
+    stream: TcpStream,
     verified: ArdVerifiedRecordStream,
     dispatcher: ArdMessageDispatcher,
     decoder: Decoder,
@@ -958,6 +1109,9 @@ pub struct ArdClient {
     automatic_updates: bool,
     automatic_frame_interval_ms: u32,
     automatic_updates_started: bool,
+    /// Set once an AVC media stream has been handed to the session, which takes
+    /// the picture away from the RFB framebuffer path.
+    media_stream_active: bool,
     requested_framebuffer_dimensions: Option<(u16, u16)>,
     pending_events: VecDeque<ArdClientEvent>,
     reconnect_config: ArdClientConfig,
@@ -971,6 +1125,25 @@ struct PendingMediaStream {
     video1_server_to_viewer: Vec<u8>,
     video1_viewer_to_server: Vec<u8>,
     video1_local_ssrc: u32,
+}
+
+/// A cloneable handle that can interrupt a receiver blocked on another thread.
+///
+/// It owns a duplicate of the session socket, so shutting it down makes a
+/// blocked `read` in [`ArdClient::next_event`] return immediately even though
+/// the owning [`ArdClient`] lives on a worker thread.
+#[derive(Debug)]
+pub struct ArdShutdownHandle {
+    stream: TcpStream,
+}
+
+impl ArdShutdownHandle {
+    /// Unblocks any pending read or write on the session socket. Subsequent
+    /// operations on the owning client fail with an I/O error.
+    pub fn shutdown(&self) -> Result<(), ArdClientError> {
+        self.stream.shutdown(std::net::Shutdown::Both)?;
+        Ok(())
+    }
 }
 
 impl Drop for PendingMediaStream {
@@ -1028,9 +1201,14 @@ impl ArdClient {
                 "server did not offer Apple security type 30".to_owned(),
             ));
         }
-        if security_types.len() != 1 {
-            stream.write_all(&[30])?;
-        }
+        // The native client writes the selection byte unconditionally on every
+        // connection (`_AuthenticateDHNamePassword` calls WriteSocketData with
+        // length 1 before reading the challenge), and `screensharingd`'s
+        // `HandleAuthTypeMessage` unconditionally reads exactly one byte and
+        // validates it against the advertised list. Skipping the write when the
+        // server advertises a single type would leave both peers waiting on
+        // each other until they time out, so always send it.
+        stream.write_all(&[30])?;
 
         let mut challenge_wire = read_exact_vector(&mut stream, 4)?;
         let key_len = usize::from(u16::from_be_bytes([challenge_wire[2], challenge_wire[3]]));
@@ -1154,9 +1332,16 @@ impl ArdClient {
         };
         stream.write_all(&[10, 0, 0, 1])?;
         stream.write_all(&viewer_information())?;
-        stream.write_all(&build_set_pixel_format(requested_pixel_format)?)?;
-        stream.write_all(&build_ard_set_encryption_level(1, &[1])?)?;
-        stream.write_all(&build_set_encodings(config.video_quality.encodings())?)?;
+        let set_pixel_format = build_set_pixel_format(requested_pixel_format)?;
+        trace_client_message(&set_pixel_format);
+
+        stream.write_all(&set_pixel_format)?;
+        let set_encryption = build_ard_set_encryption_level(1, &[1])?;
+        trace_client_message(&set_encryption);
+        stream.write_all(&set_encryption)?;
+        let set_encodings = build_set_encodings(config.video_quality.encodings())?;
+        trace_client_message(&set_encodings);
+        stream.write_all(&set_encodings)?;
         stream.flush()?;
 
         let control = read_encryption_control(&mut stream, &mut decoder, &mut framebuffer)?;
@@ -1180,13 +1365,15 @@ impl ArdClient {
         // The encryption activation changes the transport boundary. Match the
         // native client by re-establishing both negotiated RFB settings inside
         // the encrypted record stream before requesting any framebuffer data.
-        stream
-            .write_all(&encoder.encode_wire(&build_set_pixel_format(requested_pixel_format)?)?)?;
-        stream.write_all(
-            &encoder.encode_wire(&build_set_encodings(config.video_quality.encodings())?)?,
-        )?;
-        stream
-            .write_all(&encoder.encode_wire(&build_ard_set_display(config.display_selection))?)?;
+        let encrypted_pixel_format = build_set_pixel_format(requested_pixel_format)?;
+        trace_client_message(&encrypted_pixel_format);
+        stream.write_all(&encoder.encode_wire(&encrypted_pixel_format)?)?;
+        let encrypted_encodings = build_set_encodings(config.video_quality.encodings())?;
+        trace_client_message(&encrypted_encodings);
+        stream.write_all(&encoder.encode_wire(&encrypted_encodings)?)?;
+        let set_display = build_ard_set_display(config.display_selection);
+        trace_client_message(&set_display);
+        stream.write_all(&encoder.encode_wire(&set_display)?)?;
         if let Some(configuration) = &config.display_configuration {
             let request = build_ard_set_display_configuration(configuration)?;
             stream.write_all(&encoder.encode_wire(&request)?)?;
@@ -1210,6 +1397,7 @@ impl ArdClient {
             requested_framebuffer.0,
             requested_framebuffer.1,
         );
+        trace_client_message(&request);
         stream.write_all(&encoder.encode_wire(&request)?)?;
         stream.flush()?;
         // Incremental RFB requests are allowed to remain pending while the
@@ -1225,10 +1413,12 @@ impl ArdClient {
             queue: Arc::clone(&queue),
             writer_error: writer_error.clone(),
             supports_extended_scroll,
+            raw_stream: config.raw_stream.clone(),
         };
-        spawn_input_writer(writer_stream, encoder, queue, writer_error);
+        let input_writer = spawn_input_writer(writer_stream, encoder, queue, writer_error);
 
         Ok(Self {
+            input_writer,
             stream,
             input,
             verified,
@@ -1242,6 +1432,7 @@ impl ArdClient {
             automatic_updates: config.automatic_updates,
             automatic_frame_interval_ms,
             automatic_updates_started: false,
+            media_stream_active: false,
             requested_framebuffer_dimensions,
             pending_events: VecDeque::new(),
             reconnect_config: config.clone(),
@@ -1277,9 +1468,46 @@ impl ArdClient {
         Ok(())
     }
 
+    /// Interrupts the connection so a thread blocked in [`Self::next_event`]
+    /// returns instead of waiting for a server that may stay silent for the
+    /// whole session.
+    ///
+    /// After `connect` the receive socket intentionally has no read timeout
+    /// (an idle desktop must not look like a disconnect), which also means a
+    /// receiver thread can block indefinitely. Tearing a session down without
+    /// shutting the socket down would therefore leak that thread, its
+    /// `TcpStream`, and the server-side session. Callers that drop a client
+    /// from another thread must shut it down first.
+    pub fn shutdown(&self) -> Result<(), ArdClientError> {
+        self.stream.shutdown(std::net::Shutdown::Both)?;
+        Ok(())
+    }
+
+    /// Returns a cloneable handle that can unblock a receiver owned by another
+    /// thread. The clone refers to the same underlying socket.
+    pub fn shutdown_handle(&self) -> Result<ArdShutdownHandle, ArdClientError> {
+        Ok(ArdShutdownHandle {
+            stream: self.stream.try_clone()?,
+        })
+    }
+
     /// Returns a cloneable handle for GUI or application input dispatch.
     pub fn input(&self) -> ArdClientInput {
         self.input.clone()
+    }
+
+    /// Blocks until every input message submitted so far has been written to
+    /// the session socket, or `timeout` expires.
+    ///
+    /// Callers that must observe the remote's reaction to input (screenshot
+    /// capture, automated verification, graceful shutdown) use this instead of
+    /// racing the writer thread. Returns whether every queued message reached
+    /// the socket: a `false` also covers the case where the writer failed and
+    /// abandoned its remaining queue, which is otherwise only observable on the
+    /// next `send_*` call.
+    pub fn flush_input(&self, timeout: Duration) -> bool {
+        let drained = self.input_writer.queue.wait_until_drained(timeout);
+        drained && self.input.check_writer_error().is_ok()
     }
 
     pub fn send_key_event(&self, pressed: bool, keysym: u32) -> Result<(), ArdClientError> {
@@ -1313,6 +1541,36 @@ impl ArdClient {
 
     pub fn drain_gpu_mvs_frames(&mut self, visit: impl FnMut(crate::MvsGpuFrame)) {
         self.decoder.drain_gpu_mvs_frames(visit);
+    }
+
+    /// Ask the server for the next RFB framebuffer update.
+    ///
+    /// `media_stream_pending` is set while a media-stream offer is in flight, so
+    /// the offer itself is what turns this path off. Automatic updates are the
+    /// native default: one request arms a server-side loop. A viewer that turned
+    /// them off gets one plain request per frame instead, which is the classic
+    /// RFB loop.
+    fn request_framebuffer_update(
+        &mut self,
+        media_stream_pending: bool,
+    ) -> Result<(), ArdClientError> {
+        if !rfb_framebuffer_updates_allowed(media_stream_pending, self.media_stream_active) {
+            return Ok(());
+        }
+        let (width, height) = self.frame_request_dimensions();
+        if self.automatic_updates {
+            if self.automatic_updates_started {
+                return Ok(());
+            }
+            let request =
+                build_ard_auto_frame_update(self.automatic_frame_interval_ms, 0, 0, width, height);
+            self.input.send_payload(request.to_vec())?;
+            self.automatic_updates_started = true;
+        } else {
+            let request = build_framebuffer_update_request(true, 0, 0, width, height);
+            self.input.send_payload(request.to_vec())?;
+        }
+        Ok(())
     }
 
     fn handle_media_stream_reply(
@@ -1375,11 +1633,7 @@ impl ArdClient {
                 let endpoint_info = build_remote_endpoint_info("Mac16,12", "25G72");
                 let configuration = MediaStreamConfiguration {
                     message_version: MEDIA_STREAM_MESSAGE_VERSION,
-                    flags: MediaStreamFlags::new(
-                        MediaStreamFlags::VIDEO1_60FPS
-                            | MediaStreamFlags::SEND_CURSOR
-                            | MediaStreamFlags::VIEWER_APP,
-                    ),
+                    flags: video_flags_for_frame_interval(self.reconnect_config.frame_interval),
                     session_id,
                     audio_offer: build_media_stream_offer_with_ssrc(
                         &call_id,
@@ -1420,22 +1674,15 @@ impl ArdClient {
                     video1_viewer_to_server: video1_feedback_key_blob,
                     video1_local_ssrc: video1_derived_ssrc,
                 });
-                if self.automatic_updates && !self.automatic_updates_started {
-                    let (width, height) = self.frame_request_dimensions();
-                    let request = build_ard_auto_frame_update(
-                        self.automatic_frame_interval_ms,
-                        0,
-                        0,
-                        width,
-                        height,
-                    );
-                    self.input.send_payload(request.to_vec())?;
-                    self.automatic_updates_started = true;
-                } else if !self.automatic_updates {
-                    let (width, height) = self.frame_request_dimensions();
-                    let request = build_framebuffer_update_request(true, 0, 0, width, height);
-                    self.input.send_payload(request.to_vec())?;
-                }
+                // Only one path should make the server capture and encode this
+                // screen. The native client stops fetching the RFB image as soon
+                // as its media stream is up: `SSFrameBufferAVCMediaView` answers
+                // true for `isUsingAVCMediaStream` and false for `useCachedImage`.
+                // Keeping both running left the server encoding the same screen
+                // twice, which measurably raised what the stream cost (about 15%
+                // more pictures in a paired take) for a picture the viewer does
+                // not use while the stream is up.
+                self.request_framebuffer_update(self.pending_media_stream.is_some())?;
                 // Message1 only supplies the endpoint and key. Wait for the
                 // negotiator answer before starting SRTP: its media blob
                 // carries the server stream SSRC.
@@ -1476,7 +1723,11 @@ impl ArdClient {
                     if !mapping.encoding_name.is_empty() {
                         codec_config.encoding_name = Some(mapping.encoding_name.clone());
                     }
-                } else if codec_config.codec != Some(preferred_codec) {
+                } else if codec_config.codec != Some(preferred_codec)
+                    && !std::env::var("ARD_MEDIA_OFFER_CODECS")
+                        .map(|value| value == "both")
+                        .unwrap_or(false)
+                {
                     return Err(ArdClientError::Message(format!(
                         "AVC negotiator did not accept requested codec {}",
                         preferred_codec.name()
@@ -1495,6 +1746,7 @@ impl ArdClient {
                 })?;
                 let key_blob = core::mem::take(&mut pending.video1_server_to_viewer);
                 let feedback_key_blob = core::mem::take(&mut pending.video1_viewer_to_server);
+                self.media_stream_active = true;
                 Ok(Some(ArdClientEvent::MediaStream(Box::new(
                     ArdMediaStream {
                         endpoints: pending.endpoints,
@@ -1560,6 +1812,20 @@ impl ArdClient {
                     ))
                 })?;
             let payload = &self.record_scratch;
+            self.dump_record(record_sequence, payload);
+            if std::env::var_os("ARD_TRACE_SERVER_RECORDS").is_some() {
+                let prefix = payload
+                    .iter()
+                    .take(48)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "server record #{record_sequence}: {}B buffered={} start={prefix}",
+                    payload.len(),
+                    self.dispatcher.buffered_bytes(),
+                );
+            }
             let messages = self
                 .dispatcher
                 .push(payload, &mut self.decoder, &mut self.framebuffer)
@@ -1608,22 +1874,11 @@ impl ArdClient {
             }
             if let Some(frame_event_position) = frame_event_position {
                 self.frame_index = self.frame_index.wrapping_add(framebuffer_updates as u64);
-                if self.automatic_updates && !self.automatic_updates_started {
-                    let (width, height) = self.frame_request_dimensions();
-                    let request = build_ard_auto_frame_update(
-                        self.automatic_frame_interval_ms,
-                        0,
-                        0,
-                        width,
-                        height,
-                    );
-                    self.input.send_payload(request.to_vec())?;
-                    self.automatic_updates_started = true;
-                } else if !self.automatic_updates {
-                    let (width, height) = self.frame_request_dimensions();
-                    let request = build_framebuffer_update_request(true, 0, 0, width, height);
-                    self.input.send_payload(request.to_vec())?;
-                }
+                // A media stream in play means this framebuffer is not the
+                // picture, so this path stays silent (see the media-stream offer
+                // for why). A session that never gets a media stream still
+                // reaches this path and starts the loop.
+                self.request_framebuffer_update(false)?;
                 batch_events.insert(
                     frame_event_position,
                     ArdClientEvent::Frame(ArdFrameInfo {
@@ -1651,6 +1906,52 @@ impl ArdClient {
             }
         }
     }
+
+    /// Append one received record's decrypted payload to the development dump.
+    ///
+    /// The bytes are what the server put in the record: the record has been
+    /// authenticated and decrypted, and the dispatcher has not parsed a byte of
+    /// it, so the dump holds the server's own message and not something this
+    /// client derived from it. Nothing is written unless a take is being
+    /// recorded, and a dump failure must not interrupt the session.
+    fn dump_record(&self, sequence: u32, payload: &[u8]) {
+        if let Some(sink) = self.input.raw_stream() {
+            sink.record_tcp(sequence, payload);
+        }
+    }
+}
+
+/// Owns the encrypted-record writer thread for one session.
+///
+/// The writer must outlive every queued message: tearing the session socket
+/// down while input is still queued silently drops the final key release or
+/// clipboard write. [`InputWriter::shutdown`] therefore stops admission, waits
+/// for the queue to drain and only then lets the socket close.
+struct InputWriter {
+    queue: Arc<OutboundQueue>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl InputWriter {
+    /// Refuses new messages, waits for the queue to drain and joins the writer.
+    ///
+    /// The wait is bounded because a peer that stops reading can stall
+    /// `write_all` until the socket write timeout fires; losing the tail of the
+    /// input stream in that case is unavoidable, but it must not hang teardown.
+    fn shutdown(&mut self, timeout: Duration) -> bool {
+        self.queue.stop();
+        let drained = self.queue.wait_until_drained(timeout);
+        if drained && let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        drained
+    }
+}
+
+impl Drop for InputWriter {
+    fn drop(&mut self) {
+        self.shutdown(INPUT_WRITER_DRAIN_TIMEOUT);
+    }
 }
 
 fn spawn_input_writer(
@@ -1658,8 +1959,9 @@ fn spawn_input_writer(
     mut encoder: crate::ArdSessionRecordEncoder,
     queue: Arc<OutboundQueue>,
     writer_error: Arc<Mutex<Option<String>>>,
-) {
-    thread::spawn(move || {
+) -> InputWriter {
+    let writer_queue = Arc::clone(&queue);
+    let handle = thread::spawn(move || {
         while let Some(messages) = queue.receive_batch() {
             let payload_bytes = messages.iter().map(|message| message.payload.len()).sum();
             let mut payload = Vec::with_capacity(payload_bytes);
@@ -1683,13 +1985,43 @@ fn spawn_input_writer(
                     if let Ok(mut current) = writer_error.lock() {
                         *current = Some(format!("ARD input writer failed: {error}"));
                     }
+                    queue.finish_batch();
                     queue.stop();
                     break;
                 }
             }
+            queue.finish_batch();
         }
         queue.stop();
     });
+    InputWriter {
+        queue: writer_queue,
+        handle: Some(handle),
+    }
+}
+
+/// Traces one outbound client message.
+///
+/// `quality=full` against a real server receives control rectangles only and no
+/// image data at all; comparing the exact request sequence with a working codec
+/// is the fastest way to tell a rejected request from a missing handshake step.
+/// Enabled with `ARD_TRACE_CLIENT_MESSAGES=1`; prints message type and prefix
+/// only, never credentials.
+fn trace_client_message(payload: &[u8]) {
+    if std::env::var_os("ARD_TRACE_CLIENT_MESSAGES").is_none() {
+        return;
+    }
+    let prefix = payload
+        .iter()
+        .take(24)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "client message: type={:#04x} len={} bytes={prefix}",
+        payload.first().copied().unwrap_or(0),
+        payload.len(),
+    );
 }
 
 fn format_uuid(bytes: [u8; 16]) -> String {
@@ -1739,27 +2071,92 @@ fn read_encryption_control(
             0 => {
                 let mut update = vec![message_type];
                 update.extend_from_slice(&read_exact_vector(stream, 3)?);
-                let count = u16::from_be_bytes([update[2], update[3]]);
-                for _ in 0..count {
-                    let rectangle = read_exact_vector(stream, 12)?;
-                    let encoding = i32::from_be_bytes(
-                        rectangle[8..12]
-                            .try_into()
-                            .expect("rectangle encoding has fixed width"),
-                    );
-                    update.extend_from_slice(&rectangle);
-                    if encoding != 1103 {
-                        return Err(ArdClientError::Message(format!(
-                            "expected encryption control, received encoding {encoding}"
-                        )));
+                // Frame the update with the decoder's own per-encoding length
+                // rules instead of assuming every rectangle is the 36-byte
+                // encryption control. The server legitimately interleaves other
+                // rectangles here — a live AVC session sends encoding 1010
+                // (`MediaStreamMessage1`) and 1105 (`DisplayInfo2`) — and the
+                // old fixed-size reader aborted the whole connection with
+                // "expected encryption control, received encoding 1010".
+                // Reading exactly the remaining bytes keeps the byte stream
+                // aligned with the encrypted records that follow.
+                loop {
+                    match complete_framebuffer_update_len(&update, decoder) {
+                        Ok(total) => {
+                            if total > MAX_MESSAGE_BYTES {
+                                return Err(ArdClientError::Message(
+                                    "encryption-control update is too large".to_owned(),
+                                ));
+                            }
+                            if update.len() < total {
+                                update.extend_from_slice(&read_exact_vector(
+                                    stream,
+                                    total - update.len(),
+                                )?);
+                            }
+                            break;
+                        }
+                        Err(crate::Error::NeedMore { .. }) => {
+                            // `needed` is the minimum size that lets the parser
+                            // make progress and can exceed the update's eventual
+                            // total, so it must never be used as a read size:
+                            // reading `needed` bytes swallowed the start of the
+                            // next message and produced a bogus 68-byte update.
+                            // Advancing one byte at a time and re-framing keeps
+                            // the stream exactly aligned with what follows.
+                            if update.len() >= MAX_MESSAGE_BYTES {
+                                return Err(ArdClientError::Message(
+                                    "encryption-control update is too large".to_owned(),
+                                ));
+                            }
+                            update.extend_from_slice(&read_exact_vector(stream, 1)?);
+                        }
+                        Err(error) => return Err(ArdClientError::from(error)),
                     }
-                    update.extend_from_slice(&read_exact_vector(
-                        stream,
-                        ArdEncryptionControl::WIRE_LEN,
-                    )?);
                 }
                 let consumed = parse_framebuffer_update(&update, decoder, framebuffer)?;
                 if consumed != update.len() {
+                    if std::env::var_os("ARD_TRACE_ENCRYPTION_PREFACE").is_some() {
+                        let count = u16::from_be_bytes([update[2], update[3]]);
+                        let mut at = 4usize;
+                        let mut shapes = Vec::new();
+                        for _ in 0..count {
+                            if at + 12 > update.len() {
+                                break;
+                            }
+                            let encoding = i32::from_be_bytes(
+                                update[at + 8..at + 12].try_into().expect("encoding width"),
+                            );
+                            let payload_len = decoder
+                                .complete_rectangle_payload_len(
+                                    crate::protocol::Rectangle {
+                                        x: u16::from_be_bytes([update[at], update[at + 1]]),
+                                        y: u16::from_be_bytes([update[at + 2], update[at + 3]]),
+                                        width: u16::from_be_bytes([update[at + 4], update[at + 5]]),
+                                        height: u16::from_be_bytes([
+                                            update[at + 6],
+                                            update[at + 7],
+                                        ]),
+                                        encoding,
+                                    },
+                                    &update[at + 12..],
+                                )
+                                .unwrap_or(0);
+                            shapes.push((encoding, payload_len));
+                            at += 12 + payload_len;
+                        }
+                        let prefix = update
+                            .iter()
+                            .take(60)
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        eprintln!(
+                            "encryption preface: update={}B consumed={}B rects={count} shapes={shapes:?}\n  bytes={prefix}",
+                            update.len(),
+                            consumed,
+                        );
+                    }
                     return Err(ArdClientError::Message(
                         "trailing encryption-control bytes".to_owned(),
                     ));
@@ -1825,6 +2222,70 @@ fn viewer_information() -> [u8; ArdViewerInformation::WIRE_LEN] {
 mod outbound_queue_tests {
     use super::*;
     use crate::Encoding;
+
+    /// Teardown must never discard input that `send_*` already accepted.
+    ///
+    /// Regression guard for the intermittent
+    /// `encrypted_client_input_sends_keyboard_pointer_and_clipboard_messages`
+    /// failure: the clipboard (and sometimes the key events) were accepted by
+    /// the queue but never reached the server because the writer thread was
+    /// detached and the session socket closed underneath it. The drain now
+    /// happens before `ArdClient` releases the socket.
+    #[test]
+    fn stopping_the_queue_still_delivers_every_accepted_message() {
+        let queue = OutboundQueue::new();
+        let mut accepted = 0_usize;
+        for index in 0..64_u8 {
+            queue
+                .submit(vec![index], OutboundMode::Reliable, true)
+                .expect("queue accepts a bounded burst");
+            accepted += 1;
+        }
+        queue.producer_dropped();
+        queue.stop();
+
+        let consumer = Arc::clone(&queue);
+        let writer = std::thread::spawn(move || {
+            let mut delivered = 0_usize;
+            while let Some(batch) = consumer.receive_batch() {
+                delivered += batch.len();
+                consumer.finish_batch();
+            }
+            delivered
+        });
+
+        assert!(
+            queue.wait_until_drained(Duration::from_secs(5)),
+            "stop() must drain the queue instead of leaving messages stranded"
+        );
+        assert_eq!(
+            writer.join().expect("writer thread joins"),
+            accepted,
+            "queued input must never be dropped"
+        );
+        assert!(
+            queue.submit(vec![0], OutboundMode::Reliable, true).is_err(),
+            "a stopped queue must refuse new input loudly"
+        );
+    }
+
+    /// `wait_until_drained` must not report success while a batch is still
+    /// being written, otherwise teardown could close the socket mid-record.
+    #[test]
+    fn draining_waits_for_the_in_flight_batch() {
+        let queue = OutboundQueue::new();
+        queue
+            .submit(vec![1], OutboundMode::Reliable, true)
+            .expect("queue accepts a message");
+        let batch = queue.receive_batch().expect("batch available");
+        assert_eq!(batch.len(), 1);
+        assert!(
+            !queue.wait_until_drained(Duration::from_millis(50)),
+            "a batch that has left the queue but is not written yet still counts as pending"
+        );
+        queue.finish_batch();
+        assert!(queue.wait_until_drained(Duration::from_millis(50)));
+    }
 
     #[test]
     fn high_performance_profiles_do_not_advertise_a_visual_fallback() {
@@ -1941,5 +2402,151 @@ mod outbound_queue_tests {
         let metrics = queue.metrics.snapshot();
         assert_eq!(metrics.user_input_records_written, 1);
         assert!(metrics.last_user_input_completed_at.is_some());
+    }
+}
+
+#[cfg(test)]
+mod encryption_preface_tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+
+    /// Build one rectangle header plus payload as the server sends it.
+    fn rectangle(
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        encoding: i32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + payload.len());
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&encoding.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn framebuffer_update(rectangles: &[Vec<u8>]) -> Vec<u8> {
+        // type, padding, rectangle count (RFB framing).
+        let mut out = vec![0u8, 0u8];
+        out.extend_from_slice(&(rectangles.len() as u16).to_be_bytes());
+        for rectangle in rectangles {
+            out.extend_from_slice(rectangle);
+        }
+        out
+    }
+
+    fn serve(bytes: Vec<u8>) -> TcpStream {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream.write_all(&bytes).expect("write preface");
+            stream.flush().expect("flush preface");
+            // Keep the socket open so the reader never sees a premature EOF.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        TcpStream::connect(address).expect("connect loopback")
+    }
+
+    fn encryption_control_payload() -> Vec<u8> {
+        let mut payload = vec![0u8; ArdEncryptionControl::WIRE_LEN];
+        payload[..4].copy_from_slice(&ArdEncryptionControl::ENABLE_COMMAND.to_be_bytes());
+        payload
+    }
+
+    /// The encryption preface may interleave other rectangles with encoding
+    /// 1103. A live AVC session sends encoding 1010 (`MediaStreamMessage1`) and
+    /// 1105 (`DisplayInfo2`) in the same window, and the previous fixed-size
+    /// reader aborted the whole connection with
+    /// "expected encryption control, received encoding 1010".
+    ///
+    /// Regression guard: this test fails on that reader because it rejects any
+    /// rectangle that is not the 36-byte encryption control.
+    #[test]
+    fn encryption_preface_tolerates_other_control_rectangles() {
+        let mut preface = framebuffer_update(&[rectangle(
+            0,
+            0,
+            0,
+            0,
+            crate::Encoding::DesktopSize as i32,
+            &[],
+        )]);
+        preface.extend_from_slice(&framebuffer_update(&[rectangle(
+            0,
+            0,
+            0,
+            0,
+            1103,
+            &encryption_control_payload(),
+        )]));
+
+        let mut stream = serve(preface);
+        let mut decoder = Decoder::new(PixelFormat::XRGB8888).expect("decoder");
+        let mut framebuffer = Framebuffer::new(1, 1).expect("framebuffer");
+        let control = read_encryption_control(&mut stream, &mut decoder, &mut framebuffer)
+            .expect("encryption control is found after a foreign control rectangle");
+        assert_eq!(control.command, ArdEncryptionControl::ENABLE_COMMAND);
+    }
+
+    /// The control may also arrive first; behaviour must be unchanged.
+    #[test]
+    fn encryption_preface_still_returns_the_control_when_it_is_first() {
+        let preface =
+            framebuffer_update(&[rectangle(0, 0, 0, 0, 1103, &encryption_control_payload())]);
+        let mut stream = serve(preface);
+        let mut decoder = Decoder::new(PixelFormat::XRGB8888).expect("decoder");
+        let mut framebuffer = Framebuffer::new(1, 1).expect("framebuffer");
+        let control = read_encryption_control(&mut stream, &mut decoder, &mut framebuffer)
+            .expect("encryption control is returned");
+        assert_eq!(control.command, ArdEncryptionControl::ENABLE_COMMAND);
+    }
+}
+
+#[cfg(test)]
+mod media_stream_flag_tests {
+    use super::*;
+
+    /// Both paths make the server capture and encode this screen, and only one
+    /// of them should. A media stream therefore silences the RFB path, which is
+    /// what the native view does, and a session without one still gets its
+    /// updates.
+    #[test]
+    fn a_media_stream_silences_the_rfb_framebuffer_path() {
+        assert!(rfb_framebuffer_updates_allowed(false, false));
+        assert!(!rfb_framebuffer_updates_allowed(true, false));
+        assert!(!rfb_framebuffer_updates_allowed(false, true));
+        // Either way of asking is suppressed, so a viewer with automatic
+        // updates turned off cannot keep its request-per-frame loop running
+        // beside the stream.
+        assert!(!rfb_framebuffer_updates_allowed(true, true));
+    }
+
+    /// The viewer's frame-rate setting used to reach only the RFB
+    /// automatic-update path, so a 30 fps choice still asked the server's screen
+    /// encoder for 60. The offer has one bit for it and now follows the
+    /// request: auto and 60 fps keep it, 30 fps and below drop it.
+    #[test]
+    fn media_stream_flags_follow_the_requested_frame_rate() {
+        for (millis, wants_sixty) in [
+            (0u64, true),
+            (4, true),
+            (16, true),
+            (33, false),
+            (66, false),
+        ] {
+            let flags = video_flags_for_frame_interval(Duration::from_millis(millis));
+            assert_eq!(
+                flags.video1_60fps(),
+                wants_sixty,
+                "frame interval {millis} ms"
+            );
+            assert!(flags.send_cursor() && flags.viewer_app());
+        }
     }
 }

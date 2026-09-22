@@ -19,6 +19,12 @@ sha1 = { version = "0.10.6", default-features = false }
 sha2 = { version = "0.10.9", default-features = false }
 subtle = { version = "2.6.1", default-features = false }
 
+# `socket2` is only needed where the media UDP sockets set SO_REUSEADDR /
+# SO_REUSEPORT before binding. It does not build for wasm, and the media UDP
+# path is not available there either, so keep the wasm check working.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+socket2 = { version = "0.6.5", default-features = false, features = ["all"] }
+
 [dev-dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 bytemuck = "1.25.0"

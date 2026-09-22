@@ -894,13 +894,17 @@ impl HevcDepacketizer {
         let nal_type = (payload[0] >> 1) & 0x3f;
         let marker = packet.header.marker;
         let ts = packet.header.timestamp;
-        if std::env::var_os("ARD_RTP_WIRE_TRACE").is_some() && nal_type == 49 {
-            let prefix = &payload[..payload.len().min(9)];
+        if std::env::var_os("ARD_RTP_WIRE_TRACE").is_some() {
+            let prefix = &payload[..payload.len().min(12)];
+            // `single_nal` is exactly the case RFC 7798 says must NOT carry a
+            // DONL, so log it explicitly: whether the two bytes after the
+            // payload header are a DONL or H.265 header fields settles whether
+            // the unconditional DONL strip corrupts Apple's single-NAL units.
             eprintln!(
-                "HEVC FU wire: seq={} ts={ts} marker={marker} start={} end={} bytes={prefix:02x?}",
+                "HEVC wire: seq={} ts={ts} marker={marker} type={nal_type} single_nal={} donl_configured={} bytes={prefix:02x?}",
                 packet.header.sequence,
-                payload.get(2).is_some_and(|byte| byte & 0x80 != 0),
-                payload.get(2).is_some_and(|byte| byte & 0x40 != 0),
+                nal_type <= 31,
+                self.donl_present,
             );
         }
         let completed = match nal_type {

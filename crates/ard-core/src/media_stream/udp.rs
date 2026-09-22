@@ -8,28 +8,27 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::raw_stream::{RawStreamKind, RawStreamSink};
 use crate::{Error, Result};
 
 use super::MAX_RTP_PACKET;
+use super::assembler::VideoStreamAssembler;
+
+/// The four horizontal bands one desktop frame is coded as. It lives with the
+/// assembler and is re-exported here because callers of this module have always
+/// named it here.
+pub use super::assembler::AVC_VIDEO_SLICE_COUNT;
 use super::negotiation::MediaStreamCodec;
-use super::rtp::{AccessUnit, H264Depacketizer, HevcDepacketizer, RtpPacket, RtpReorderBuffer};
+use super::rtp::{AccessUnit, RtpPacket};
 use super::srtp::{SrtcpContext, SrtpContext};
 use super::wire::MediaStreamMessage1;
 
 const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(10);
-/// Bound cross-SSRC decoding-order reassembly. This is a loss detector, not a
-/// presentation timer: a sparse timestamp is released only when the following
-/// DON/DONL proves its exact boundary.
-const MAX_PENDING_FRAME_BATCHES: usize = 8;
-const MAX_TRACKED_RTP_TIMESTAMPS: usize = 64;
-/// Native AVC partitions one desktop frame into four horizontal slices. Each
-/// slice uses an adjacent SSRC with independent SRTP/RTP state, while all four
-/// share one interleaved video decoder reference chain.
-pub const AVC_VIDEO_SLICE_COUNT: usize = 4;
 /// Which media stream a UDP socket carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpStreamKind {
@@ -163,6 +162,32 @@ impl MediaUdpSession {
             IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_port),
             IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_port),
         };
+        // The native client enables both SO_REUSEADDR and SO_REUSEPORT before
+        // binding the negotiated media port. Without them a reconnect, a second
+        // stream on an overlapping port, or the sibling audio/video sockets
+        // holding the port make `bind` fail with EADDRINUSE, which surfaces as
+        // "UDP endpoint unavailable" and refuses to start the media path.
+        //
+        // `socket2` is unavailable on wasm, where this path is not used either,
+        // so fall back to a plain bind there.
+        #[cfg(not(target_arch = "wasm32"))]
+        let socket = {
+            let socket = socket2::Socket::new(
+                match endpoints.host {
+                    IpAddr::V4(_) => socket2::Domain::IPV4,
+                    IpAddr::V6(_) => socket2::Domain::IPV6,
+                },
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .map_err(io_error)?;
+            socket.set_reuse_address(true).map_err(io_error)?;
+            #[cfg(unix)]
+            socket.set_reuse_port(true).map_err(io_error)?;
+            socket.bind(&bind_addr.into()).map_err(io_error)?;
+            UdpSocket::from(socket)
+        };
+        #[cfg(target_arch = "wasm32")]
         let socket = UdpSocket::bind(bind_addr).map_err(io_error)?;
         socket
             .set_read_timeout(Some(UDP_READ_TIMEOUT))
@@ -198,16 +223,31 @@ impl MediaUdpSession {
 /// one video stream. Drives `visit` once per completed access unit.
 pub struct AvcVideoStreamReceiver {
     session: MediaUdpSession,
-    streams: Vec<InboundVideoStream>,
-    feedback: Vec<FeedbackStream>,
+    /// Optional development dump of the media stream. It records each RTP packet
+    /// after SRTP authentication and decryption and before RTP reassembly, so the
+    /// dump holds the server's own packet without the session's keys and without
+    /// the decoded picture.
+    raw_stream: Option<Arc<RawStreamSink>>,
+    raw_stream_kind: RawStreamKind,
+    /// Whether a raw-stream take was armed on the previous packet, and whether
+    /// that take has already carried a keyframe. A take that begins mid-chain
+    /// needs one requested so the file can be decoded on its own.
+    take_armed: bool,
+    take_has_keyframe: bool,
+    take_keyframe_requested: bool,
+    /// Codec of the assembled units, for recognising a keyframe.
     codec: MediaStreamCodec,
-    awaiting_sync: bool,
-    pending_sync_followers: Vec<(usize, TimedAccessUnit)>,
+    /// One SRTP context per band, in band order. Decryption stays here because
+    /// it needs the session keys; ordering and assembly do not.
+    crypto: Vec<SrtpContext>,
+    /// The ordering and assembly machine, shared with the rebuild path so both
+    /// reassemble the same packets the same way.
+    assembler: VideoStreamAssembler,
+    feedback: Vec<FeedbackStream>,
     expected_payload_type: u8,
     base_remote_ssrc: u32,
     buffer: Vec<u8>,
     decrypted_buffer: Vec<u8>,
-    frame_batcher: AccessUnitBatcher,
     ready_units: VecDeque<(usize, AccessUnit)>,
     packets_received: usize,
     decrypted_packets: usize,
@@ -218,403 +258,199 @@ pub struct AvcVideoStreamReceiver {
     last_keyframe_request: Option<Instant>,
 }
 
-/// The horizontal bands sharing one RTP sampling instant. RFC 3550 defines
-/// the RTP timestamp as the sampling instant; Apple's four adjacent SSRCs
-/// reuse it for one serial prediction chain. Unchanged bands can be omitted,
-/// so DON/DONL—not elapsed time or SSRC scan order—defines the batch boundary
-/// and decoder submission order.
-#[derive(Debug)]
-pub struct AvcFrameBatch {
-    pub timestamp: u32,
-    pub access_units: Vec<(usize, AccessUnit)>,
-    /// Local monotonic time immediately after the first UDP datagram for any
-    /// access unit in this sampling instant was received.
-    pub first_packet_received_at: Instant,
-    /// Local monotonic time at which the first complete access unit in this
-    /// sampling instant finished RTP reassembly.
-    pub first_access_unit_completed_at: Instant,
-    /// Local monotonic time at which the complete/bounded batch was released
-    /// to the platform decoder.
-    pub released_at: Instant,
-}
-
-struct PendingFrameBatch {
-    timestamp: u32,
-    first_packet_received_at: Instant,
-    first_access_unit_completed_at: Instant,
-    access_units: Vec<(usize, AccessUnit)>,
-}
-
-#[derive(Debug)]
-struct TimedAccessUnit {
-    unit: AccessUnit,
-    first_packet_received_at: Instant,
-    completed_at: Instant,
-}
-
-#[derive(Default)]
-struct AccessUnitBatcher {
-    pending: Vec<PendingFrameBatch>,
-    initial_decode_order: Option<u16>,
-    last_released_decode_order: Option<u16>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BatchInsertResult {
-    Accepted,
-    IgnoredLate,
-    MissingDecodeOrder,
-    InvalidPredictionChain,
-    PredictionChainOverflow,
-}
-
-impl AccessUnitBatcher {
-    fn begin_prediction_chain(&mut self, decode_order: u16) {
-        self.pending.clear();
-        self.initial_decode_order = Some(decode_order);
-        self.last_released_decode_order = None;
-    }
-
-    fn insert(&mut self, stream_index: usize, timed: TimedAccessUnit) -> BatchInsertResult {
-        let TimedAccessUnit {
-            unit,
-            first_packet_received_at,
-            completed_at,
-        } = timed;
-        let Some(decode_order) = unit.decode_order_number else {
-            return BatchInsertResult::MissingDecodeOrder;
-        };
-        if self
-            .last_released_decode_order
-            .is_some_and(|released| !decode_order_is_newer(decode_order, released))
-            || self.pending.iter().any(|batch| {
-                batch
-                    .access_units
-                    .iter()
-                    .any(|(_, pending)| pending.decode_order_number == Some(decode_order))
-            })
-        {
-            return BatchInsertResult::IgnoredLate;
-        }
-        if let Some(batch) = self
-            .pending
-            .iter_mut()
-            .find(|batch| batch.timestamp == unit.timestamp)
-        {
-            if batch
-                .access_units
-                .iter()
-                .any(|(index, _)| *index == stream_index)
-                || batch.access_units.len() >= AVC_VIDEO_SLICE_COUNT
-            {
-                return BatchInsertResult::InvalidPredictionChain;
-            }
-            batch.first_packet_received_at =
-                batch.first_packet_received_at.min(first_packet_received_at);
-            batch.first_access_unit_completed_at =
-                batch.first_access_unit_completed_at.min(completed_at);
-            batch.access_units.push((stream_index, unit));
-            return BatchInsertResult::Accepted;
-        }
-
-        if self.pending.len() >= MAX_PENDING_FRAME_BATCHES {
-            // A missing DON has held more than the bounded number of sampling
-            // instants. Drop the dependent chain and wait for an explicit
-            // codec sync frame after requesting PLI.
-            if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
-                let layout = self
-                    .pending
-                    .iter()
-                    .map(|batch| {
-                        (
-                            batch.timestamp,
-                            batch
-                                .access_units
-                                .iter()
-                                .map(|(index, unit)| (*index, unit.decode_order_number))
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                eprintln!(
-                    "RTP pending prediction chain overflow before stream={stream_index} timestamp={}: {layout:?}",
-                    unit.timestamp,
-                );
-            }
-            self.pending.clear();
-            self.initial_decode_order = None;
-            self.last_released_decode_order = None;
-            return BatchInsertResult::PredictionChainOverflow;
-        }
-        let position = self
-            .pending
-            .iter()
-            .position(|batch| timestamp_precedes(unit.timestamp, batch.timestamp))
-            .unwrap_or(self.pending.len());
-        self.pending.insert(
-            position,
-            PendingFrameBatch {
-                timestamp: unit.timestamp,
-                first_packet_received_at,
-                first_access_unit_completed_at: completed_at,
-                access_units: vec![(stream_index, unit)],
-            },
-        );
-        BatchInsertResult::Accepted
-    }
-
-    fn take_ready(&mut self, now: Instant) -> Option<AvcFrameBatch> {
-        let (batch_index, first_decode_order) =
-            if let Some(last_decode_order) = self.last_released_decode_order {
-                let expected = last_decode_order.wrapping_add(1);
-                let batch_index = self.pending.iter().position(|batch| {
-                    batch
-                        .access_units
-                        .iter()
-                        .any(|(_, unit)| unit.decode_order_number == Some(expected))
-                })?;
-                let batch = &self.pending[batch_index];
-                let mut offsets = batch
-                    .access_units
-                    .iter()
-                    .map(|(_, unit)| {
-                        unit.decode_order_number
-                            .expect("batcher accepts only access units carrying DON/DONL")
-                            .wrapping_sub(expected)
-                    })
-                    .collect::<Vec<_>>();
-                offsets.sort_unstable();
-                if !offsets
-                    .iter()
-                    .enumerate()
-                    .all(|(index, offset)| usize::from(*offset) == index)
-                {
-                    return None;
-                }
-                let following_decode_order = expected.wrapping_add(batch.access_units.len() as u16);
-                let boundary_proven = batch.access_units.len() == AVC_VIDEO_SLICE_COUNT
-                    || self.pending.iter().enumerate().any(|(index, following)| {
-                        index != batch_index
-                            && following.access_units.iter().any(|(_, unit)| {
-                                unit.decode_order_number == Some(following_decode_order)
-                            })
-                    });
-                if !boundary_proven {
-                    return None;
-                }
-                (batch_index, expected)
-            } else {
-                // A clean native AVC chain begins with one full four-band sync
-                // timestamp. Do not infer an initial sparse boundary without
-                // a preceding decoding-order number.
-                let expected = self.initial_decode_order?;
-                let batch_index = self.pending.iter().position(|batch| {
-                    batch
-                        .access_units
-                        .iter()
-                        .any(|(_, unit)| unit.decode_order_number == Some(expected))
-                })?;
-                let batch = &self.pending[batch_index];
-                if batch.access_units.len() != AVC_VIDEO_SLICE_COUNT
-                    || !decode_orders_are_contiguous(&batch.access_units, expected)
-                {
-                    return None;
-                }
-                (batch_index, expected)
-            };
-
-        let mut batch = self.pending.remove(batch_index);
-        batch.access_units.sort_by_key(|(_, unit)| {
-            unit.decode_order_number
-                .expect("batcher accepts only access units carrying DON/DONL")
-                .wrapping_sub(first_decode_order)
-        });
-        self.last_released_decode_order = batch
-            .access_units
-            .last()
-            .and_then(|(_, unit)| unit.decode_order_number);
-        Some(AvcFrameBatch {
-            timestamp: batch.timestamp,
-            access_units: batch.access_units,
-            first_packet_received_at: batch.first_packet_received_at,
-            first_access_unit_completed_at: batch.first_access_unit_completed_at,
-            released_at: now,
-        })
-    }
-
-    fn reset(&mut self) {
-        self.pending.clear();
-        self.initial_decode_order = None;
-        self.last_released_decode_order = None;
-    }
-}
-
-fn decode_orders_are_contiguous(access_units: &[(usize, AccessUnit)], start: u16) -> bool {
-    (0..access_units.len()).all(|offset| {
-        access_units
-            .iter()
-            .any(|(_, unit)| unit.decode_order_number == Some(start.wrapping_add(offset as u16)))
-    })
-}
-
-fn decode_order_is_newer(candidate: u16, reference: u16) -> bool {
-    candidate != reference && candidate.wrapping_sub(reference) < 0x8000
-}
-
-enum VideoDepacketizer {
-    H264(H264Depacketizer),
-    Hevc(HevcDepacketizer),
-}
-
-impl VideoDepacketizer {
-    fn new(codec: MediaStreamCodec) -> Self {
-        match codec {
-            MediaStreamCodec::H264 => Self::H264(H264Depacketizer::new()),
-            MediaStreamCodec::Hevc => Self::Hevc(HevcDepacketizer::new_with_donl()),
-        }
-    }
-
-    fn push(&mut self, packet: &RtpPacket<'_>) -> Result<Option<AccessUnit>> {
-        match self {
-            Self::H264(depacketizer) => depacketizer.push(packet),
-            Self::Hevc(depacketizer) => depacketizer.push(packet),
-        }
-    }
-
-    fn reset(&mut self) {
-        match self {
-            Self::H264(depacketizer) => depacketizer.reset(),
-            Self::Hevc(depacketizer) => depacketizer.reset(),
-        }
-    }
-}
-
-struct InboundVideoStream {
-    srtp: SrtpContext,
-    reorder: RtpReorderBuffer,
-    depacketizer: VideoDepacketizer,
-    completed: VecDeque<TimedAccessUnit>,
-    first_packet_arrivals: VecDeque<(u32, Instant)>,
-    next_sequence: Option<u16>,
-    damaged_timestamp: Option<u32>,
-}
-
-impl InboundVideoStream {
-    fn new(key_blob: &[u8], ssrc: u32, codec: MediaStreamCodec) -> Result<Self> {
-        Ok(Self {
-            srtp: SrtpContext::from_key_blob_with_derived_ssrc(key_blob, ssrc)?,
-            reorder: RtpReorderBuffer::with_codec(codec),
-            depacketizer: VideoDepacketizer::new(codec),
-            completed: VecDeque::new(),
-            first_packet_arrivals: VecDeque::new(),
-            next_sequence: None,
-            damaged_timestamp: None,
-        })
-    }
-
-    fn push_decrypted_packet(&mut self, packet: &[u8], received_at: Instant) -> Result<usize> {
-        let packet_timestamp = RtpPacket::parse(packet)?.header.timestamp;
-        if !self
-            .first_packet_arrivals
-            .iter()
-            .any(|(timestamp, _)| *timestamp == packet_timestamp)
-        {
-            if self.first_packet_arrivals.len() >= MAX_TRACKED_RTP_TIMESTAMPS {
-                return Err(Error::LimitExceeded("RTP timestamp timing tracker"));
-            }
-            self.first_packet_arrivals
-                .push_back((packet_timestamp, received_at));
-        }
-        let ready_packets = self.reorder.push(packet)?;
-        let mut losses = self.reorder.take_dropped_access_units();
-        if losses != 0 {
-            self.depacketizer.reset();
-            self.damaged_timestamp = None;
-            // The reorder buffer discarded whole stale timestamps. Resume at
-            // the first packet of the intact newer burst instead of counting
-            // that already-accounted gap a second time and discarding the
-            // recovery frame as well.
-            self.next_sequence = ready_packets.first().and_then(|packet| {
-                RtpPacket::parse(packet)
-                    .ok()
-                    .map(|packet| packet.header.sequence)
-            });
-        }
-        for packet in ready_packets {
-            let packet = RtpPacket::parse(&packet)?;
-            if self
-                .next_sequence
-                .is_some_and(|expected| expected != packet.header.sequence)
-            {
-                losses = losses.saturating_add(1);
-                self.depacketizer.reset();
-                self.damaged_timestamp = Some(packet.header.timestamp);
-            }
-            self.next_sequence = Some(packet.header.sequence.wrapping_add(1));
-            if self.damaged_timestamp == Some(packet.header.timestamp) {
-                continue;
-            }
-            self.damaged_timestamp = None;
-            if let Some(unit) = self.depacketizer.push(&packet)? {
-                let Some(position) = self
-                    .first_packet_arrivals
-                    .iter()
-                    .position(|(timestamp, _)| *timestamp == unit.timestamp)
-                else {
-                    return Err(Error::Invalid(
-                        "completed RTP access unit has no first-packet timestamp",
-                    ));
-                };
-                let (_, first_packet_received_at) = self
-                    .first_packet_arrivals
-                    .remove(position)
-                    .expect("timing tracker position was found");
-                self.completed.push_back(TimedAccessUnit {
-                    unit,
-                    first_packet_received_at,
-                    completed_at: Instant::now(),
-                });
-            }
-        }
-        Ok(losses)
-    }
-}
-
 struct FeedbackStream {
     remote_ssrc: u32,
     srtcp: SrtcpContext,
+    /// Decrypted payload bytes and the instant the window opened. The
+    /// rate-control feedback carries what this receiver measured, so the window
+    /// is closed and reopened every time a feedback packet is sent.
+    window: ReceiveWindow,
+    /// Loss and jitter for this stream's receiver report.
+    stats: ReceptionStats,
 }
 
-/// Scan interleaved streams in index order, collect every completed AU, then
-/// sort the scheduled items before the four-subframe timestamp barrier.
-fn process_completed_frames(
-    streams: &mut [InboundVideoStream],
-) -> VecDeque<(usize, TimedAccessUnit)> {
-    let mut scheduled = Vec::new();
-    for (stream_index, stream) in streams.iter_mut().enumerate() {
-        while let Some(unit) = stream.completed.pop_front() {
-            insert_scheduled_item(&mut scheduled, stream_index, unit);
+/// One stream's receive counters for the feedback interval.
+///
+/// The rate-control feedback reports what this receiver measured *since the last
+/// report*, because that is the shape the peer's reader compares: the native
+/// builder takes its two per-interval figures from statistics the collector
+/// clears as soon as they have been reported.
+#[derive(Clone, Copy)]
+struct ReceiveWindow {
+    bytes: u64,
+    datagrams: u32,
+    opened_at: Instant,
+}
+
+/// One interval's measurement, taken and then reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReceiveInterval {
+    bits_per_second: u32,
+    datagrams: u32,
+}
+
+impl ReceiveWindow {
+    fn new(opened_at: Instant) -> Self {
+        Self {
+            bytes: 0,
+            datagrams: 0,
+            opened_at,
         }
     }
-    scheduled.into()
+
+    fn record(&mut self, payload_bytes: usize) {
+        self.bytes = self.bytes.saturating_add(payload_bytes as u64);
+        self.datagrams = self.datagrams.saturating_add(1);
+    }
+
+    /// The window's rates, then restart it. A window that has not advanced
+    /// reports zeros rather than dividing by a zero interval.
+    fn close(&mut self, now: Instant) -> ReceiveInterval {
+        let elapsed = now.saturating_duration_since(self.opened_at);
+        let bytes = std::mem::replace(&mut self.bytes, 0);
+        let datagrams = std::mem::replace(&mut self.datagrams, 0);
+        self.opened_at = now;
+        let micros = elapsed.as_micros();
+        if micros == 0 {
+            return ReceiveInterval {
+                bits_per_second: 0,
+                datagrams,
+            };
+        }
+        let bits_per_second = (bytes as u128 * 8 * 1_000_000) / micros;
+        ReceiveInterval {
+            bits_per_second: u32::try_from(bits_per_second).unwrap_or(u32::MAX),
+            datagrams,
+        }
+    }
 }
 
-fn insert_scheduled_item(
-    scheduled: &mut Vec<(usize, TimedAccessUnit)>,
-    stream_index: usize,
-    unit: TimedAccessUnit,
-) {
-    let position = scheduled
-        .iter()
-        .position(|(_, current)| timestamp_precedes(unit.unit.timestamp, current.unit.timestamp))
-        .unwrap_or(scheduled.len());
-    // Equal timestamps insert after existing items, preserving the stream
-    // scan order above.
-    scheduled.insert(position, (stream_index, unit));
+/// One stream's RTCP reception statistics (RFC 3550 section 6.4.1).
+///
+/// The viewer's only channel for loss and jitter feedback is the receiver
+/// report, so this tracks the same quantities the native receiver reports: the
+/// extended highest sequence number, the packets received and expected since the
+/// session began, and the interarrival jitter estimate of RFC 3550 A.8.
+#[derive(Clone, Copy)]
+struct ReceptionStats {
+    started: bool,
+    /// Wraps of the 16-bit sequence number, and its latest value.
+    cycles: u32,
+    highest: u16,
+    /// The extended sequence the stream started at, so "expected" counts from
+    /// the first packet rather than from the sequence counter's own origin.
+    base: u32,
+    received: u64,
+    expected_prior: u64,
+    received_prior: u64,
+    jitter: f64,
+    last_timestamp: u32,
+    last_arrival: Instant,
 }
 
-fn timestamp_precedes(candidate: u32, reference: u32) -> bool {
-    (candidate.wrapping_sub(reference) as i32).is_negative()
+/// One receiver report's counters, taken over the interval since the previous
+/// report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReceptionReportValues {
+    fraction_lost: u8,
+    cumulative_lost: i32,
+    highest_sequence: u32,
+    jitter: u32,
+}
+
+/// The media stream's RTP clock, from `rtpmap ... HEVC/90000`.
+const RTP_CLOCK_RATE: f64 = 90_000.0;
+
+impl ReceptionStats {
+    fn new() -> Self {
+        Self {
+            started: false,
+            cycles: 0,
+            highest: 0,
+            base: 0,
+            received: 0,
+            expected_prior: 0,
+            received_prior: 0,
+            jitter: 0.0,
+            last_timestamp: 0,
+            last_arrival: Instant::now(),
+        }
+    }
+
+    /// The RFC 3550 extended sequence number: cycles times 65536 plus the
+    /// 16-bit sequence, which is the value a report carries.
+    fn extended(&self) -> u32 {
+        self.cycles
+            .wrapping_mul(1 << 16)
+            .wrapping_add(u32::from(self.highest))
+    }
+
+    fn record(&mut self, sequence: u16, timestamp: u32, arrival: Instant) {
+        if !self.started {
+            self.started = true;
+            self.highest = sequence;
+            self.base = self.extended();
+            self.last_timestamp = timestamp;
+            self.last_arrival = arrival;
+            self.received = 1;
+            return;
+        }
+        // A forward 16-bit delta advances the sequence; a forward delta that
+        // moves the 16-bit value backwards means the counter wrapped.
+        let delta = sequence.wrapping_sub(self.highest) as i16;
+        if delta > 0 {
+            if sequence < self.highest {
+                self.cycles = self.cycles.wrapping_add(1);
+            }
+            self.highest = sequence;
+        }
+        self.received = self.received.saturating_add(1);
+
+        let arrival_delta = arrival
+            .saturating_duration_since(self.last_arrival)
+            .as_secs_f64();
+        let timestamp_delta = timestamp.wrapping_sub(self.last_timestamp) as i32 as f64;
+        let transit = timestamp_delta - arrival_delta * RTP_CLOCK_RATE;
+        self.jitter += (transit.abs() - self.jitter) / 16.0;
+        self.last_timestamp = timestamp;
+        self.last_arrival = arrival;
+    }
+
+    /// This interval's counters, then roll the interval forward.
+    fn report(&mut self) -> ReceptionReportValues {
+        let highest_sequence = self.extended();
+        let expected = u64::from(highest_sequence.wrapping_sub(self.base)).saturating_add(1);
+        let expected_interval = expected.saturating_sub(self.expected_prior);
+        let received_interval = self.received.saturating_sub(self.received_prior);
+        self.expected_prior = expected;
+        self.received_prior = self.received;
+
+        let lost_interval = expected_interval.saturating_sub(received_interval);
+        let fraction_lost = (lost_interval * 256)
+            .checked_div(expected_interval)
+            .map_or(0, |value| {
+                u8::try_from(value.min(255)).expect("fraction lost fits a byte")
+            });
+        let cumulative = i64::try_from(expected).unwrap_or(i64::MAX)
+            - i64::try_from(self.received).unwrap_or(i64::MAX);
+        ReceptionReportValues {
+            fraction_lost,
+            cumulative_lost: cumulative.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            highest_sequence,
+            jitter: self.jitter.clamp(0.0, f64::from(u32::MAX)) as u32,
+        }
+    }
+}
+
+/// Whether the development switch that silences the viewer's feedback packets
+/// is set (`ARD_MEDIA_FEEDBACK=off`). A take can then be compared with and
+/// without them, which is the only way to see what the server's rate control
+/// does about them.
+fn feedback_disabled() -> bool {
+    matches!(
+        std::env::var("ARD_MEDIA_FEEDBACK").ok().as_deref(),
+        Some("off") | Some("0") | Some("false")
+    )
 }
 
 /// Borrowed session credentials for one bidirectional AVC media stream.
@@ -625,6 +461,23 @@ pub struct AvcStreamCrypto<'a> {
     pub local_ssrc: u32,
 }
 
+/// The horizontal bands sharing one RTP sampling instant, as a live receiver
+/// reports them. Ordering is the assembler's; this is the shaped result the
+/// decoder pipeline consumes.
+#[derive(Debug)]
+pub struct AvcFrameBatch {
+    pub timestamp: u32,
+    pub access_units: Vec<(usize, AccessUnit)>,
+    /// Local monotonic time immediately after the first UDP datagram for any
+    /// access unit in this sampling instant was received.
+    pub first_packet_received_at: Instant,
+    /// Local monotonic time at which the first complete access unit finished
+    /// RTP reassembly.
+    pub first_access_unit_completed_at: Instant,
+    /// Local monotonic time at which the batch was released to the decoder.
+    pub released_at: Instant,
+}
+
 impl AvcVideoStreamReceiver {
     pub fn new(
         endpoints: &MediaUdpEndpoints,
@@ -632,17 +485,17 @@ impl AvcVideoStreamReceiver {
         crypto: AvcStreamCrypto<'_>,
         codec: MediaStreamCodec,
         payload_type: u8,
+        raw_stream: Option<Arc<RawStreamSink>>,
     ) -> Result<Self> {
         let session = MediaUdpSession::connect(endpoints, kind)?;
-        let mut streams = Vec::with_capacity(AVC_VIDEO_SLICE_COUNT);
+        let mut crypto_contexts = Vec::with_capacity(AVC_VIDEO_SLICE_COUNT);
         let mut feedback = Vec::with_capacity(AVC_VIDEO_SLICE_COUNT);
         for layer in 0..AVC_VIDEO_SLICE_COUNT as u32 {
             let remote_ssrc = crypto.remote_ssrc.wrapping_add(layer);
             let local_ssrc = crypto.local_ssrc.wrapping_add(layer);
-            streams.push(InboundVideoStream::new(
+            crypto_contexts.push(SrtpContext::from_key_blob_with_derived_ssrc(
                 crypto.server_to_viewer_key_blob,
                 remote_ssrc,
-                codec,
             )?);
             feedback.push(FeedbackStream {
                 remote_ssrc,
@@ -650,20 +503,37 @@ impl AvcVideoStreamReceiver {
                     crypto.viewer_to_server_key_blob,
                     local_ssrc,
                 )?,
+                window: ReceiveWindow::new(Instant::now()),
+                stats: ReceptionStats::new(),
             });
         }
+        // The assembler is told the band order up front, so a batch's decode
+        // order maps onto the decoder's slice indices the same way a rebuild's
+        // does.
+        let mut assembler = VideoStreamAssembler::new(codec);
+        for layer in 0..AVC_VIDEO_SLICE_COUNT as u32 {
+            assembler.expect_stream(crypto.remote_ssrc.wrapping_add(layer));
+        }
+        let raw_stream_kind = match kind {
+            UdpStreamKind::Video1 => RawStreamKind::Video,
+            UdpStreamKind::Video2 => RawStreamKind::Video2,
+            UdpStreamKind::Audio => RawStreamKind::Audio,
+        };
         let mut receiver = Self {
             session,
-            streams,
-            feedback,
+            raw_stream,
+            raw_stream_kind,
+            take_armed: false,
+            take_has_keyframe: false,
+            take_keyframe_requested: false,
             codec,
-            awaiting_sync: true,
-            pending_sync_followers: Vec::with_capacity(AVC_VIDEO_SLICE_COUNT - 1),
+            crypto: crypto_contexts,
+            assembler,
+            feedback,
             expected_payload_type: payload_type,
             base_remote_ssrc: crypto.remote_ssrc,
             buffer: vec![0u8; MAX_RTP_PACKET],
             decrypted_buffer: Vec::with_capacity(MAX_RTP_PACKET),
-            frame_batcher: AccessUnitBatcher::default(),
             ready_units: VecDeque::new(),
             packets_received: 0,
             decrypted_packets: 0,
@@ -718,9 +588,7 @@ impl AvcVideoStreamReceiver {
     /// fresh codec sync frame.
     pub fn receive_frame(&mut self) -> Result<Option<AvcFrameBatch>> {
         self.send_feedback_if_due()?;
-        let now = Instant::now();
-        if let Some(batch) = self.frame_batcher.take_ready(now) {
-            self.frames = self.frames.saturating_add(1);
+        if let Some(batch) = self.take_ready_frame() {
             return Ok(Some(batch));
         }
         let len = match self.session.recv(&mut self.buffer) {
@@ -729,9 +597,7 @@ impl AvcVideoStreamReceiver {
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut =>
             {
-                let batch = self.frame_batcher.take_ready(Instant::now());
-                self.frames = self.frames.saturating_add(usize::from(batch.is_some()));
-                return Ok(batch);
+                return Ok(self.take_ready_frame());
             }
             Err(_) => return Err(Error::Invalid("RTP receive failed")),
         };
@@ -762,9 +628,9 @@ impl AvcVideoStreamReceiver {
         // desktop slices, each with independent sequence/replay state and a
         // matching local feedback SSRC.
         let stream_index = ssrc.wrapping_sub(self.base_remote_ssrc) as usize;
-        if stream_index >= self.streams.len() {
+        let Some(context) = self.crypto.get_mut(stream_index) else {
             return Ok(None);
-        }
+        };
         self.packets_received += 1;
         if payload_type != self.expected_payload_type {
             return Err(Error::Invalid("unexpected negotiated RTP payload type"));
@@ -772,112 +638,130 @@ impl AvcVideoStreamReceiver {
         self.decrypted_buffer.clear();
         self.decrypted_buffer
             .extend_from_slice(&self.buffer[..body_len]);
-        let stream = &mut self.streams[stream_index];
-        stream.srtp.decrypt_authenticated_rtp_packet_in_place(
+        context.decrypt_authenticated_rtp_packet_in_place(
             &mut self.decrypted_buffer,
             &authentication_tag,
             sequence,
             payload_offset,
         )?;
         self.decrypted_packets += 1;
-        let losses = stream.push_decrypted_packet(&self.decrypted_buffer, packet_received_at)?;
-        if losses != 0 {
-            self.packet_losses = self.packet_losses.saturating_add(losses);
-            self.enter_sync_recovery();
+        // Both feedback channels report what this receiver measured: the
+        // rate-control packet carries the interval's datagrams and bytes, and
+        // the receiver report carries the loss and jitter counters.
+        if let Some(feedback) = self.feedback.get_mut(stream_index) {
+            feedback.window.record(self.decrypted_buffer.len());
+            feedback
+                .stats
+                .record(sequence, timestamp, packet_received_at);
+        }
+        // The dump is taken here: the packet has cleared SRTP authentication and
+        // its payload is decrypted, and the RTP assembler has not touched it.
+        // A rebuild can therefore replay the same packet without the session's
+        // SRTP keys, which are never written anywhere. A control datagram never
+        // reaches this point, so the dump holds RTP packets and nothing else.
+        if let Some(sink) = self.raw_stream.as_ref() {
+            sink.record_udp(
+                self.raw_stream_kind,
+                self.packets_received.saturating_sub(1) as u32,
+                &self.decrypted_buffer,
+                sequence,
+                ssrc,
+            );
+        }
+        // A take that starts mid-session captures a chain whose keyframe is
+        // already behind it, and the recording can then never be replayed on its
+        // own: the assembler waits for an origin that is not in the file. While
+        // a take is armed and has not carried a keyframe yet, ask the server for
+        // one. The request is rate limited with the recovery path's own
+        // interval, and a take that begins on the session's first keyframe needs
+        // no request at all.
+        let armed = self
+            .raw_stream
+            .as_ref()
+            .is_some_and(|sink| sink.writes_a_take());
+        if armed != self.take_armed {
+            self.take_armed = armed;
+            self.take_has_keyframe = false;
+            self.take_keyframe_requested = false;
+        }
+        if armed && !self.take_has_keyframe && !self.take_keyframe_requested {
+            // Ask once per take. The request goes out without dropping the
+            // live chain: the recording needs a keyframe among its packets,
+            // while the picture on screen is already decoding fine.
+            self.take_keyframe_requested = true;
+            self.send_keyframe_request()?;
+        }
+        // Ordering, batching and sync recovery are the assembler's, so a rebuild
+        // that replays these same packets reassembles them identically.
+        let pushed =
+            self.assembler
+                .push_packet(ssrc, &self.decrypted_buffer, packet_received_at)?;
+        if pushed.losses != 0 {
+            self.packet_losses = self.packet_losses.saturating_add(pushed.losses);
             if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
                 eprintln!(
-                    "RTP loss: stream={stream_index} timestamp={timestamp} sequence={sequence} dropped_access_units={losses} total={}",
-                    self.packet_losses,
+                    "RTP loss: stream={stream_index} timestamp={timestamp} sequence={sequence} dropped_access_units={} total={}",
+                    pushed.losses, self.packet_losses,
                 );
             }
-            self.send_picture_loss_indications()?;
+            self.send_keyframe_request()?;
         }
-        let completed = process_completed_frames(&mut self.streams);
-        let now = Instant::now();
-        let mut late_units = 0usize;
-        let mut prediction_chain_failure = None;
-        'completed: for (slice_index, timed) in completed {
-            if timed.unit.decode_order_number.is_none() {
-                self.enter_sync_recovery();
-                self.send_picture_loss_indications()?;
-                return Err(Error::Invalid(
-                    "native AVC access unit is missing its DON/DONL decode order",
-                ));
-            }
-            let mut candidates = Vec::with_capacity(AVC_VIDEO_SLICE_COUNT);
-            if self.awaiting_sync {
-                if !timed.unit.is_sync(self.codec) {
-                    self.hold_possible_sync_follower(slice_index, timed);
-                    continue;
-                }
-                // The first IRAP/IDR after startup or PLI is an authoritative
-                // new decoding-order origin. UDP may complete a following
-                // predictive band first, so retain only same-timestamp DONs
-                // immediately following this sync unit.
-                let decode_order = timed
-                    .unit
-                    .decode_order_number
-                    .expect("missing DON/DONL was rejected above");
-                let timestamp = timed.unit.timestamp;
-                self.frame_batcher.begin_prediction_chain(decode_order);
-                self.ready_units.clear();
-                self.awaiting_sync = false;
-                if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
-                    eprintln!(
-                        "RTP codec sync acquired: stream={slice_index} timestamp={} DON={:?}",
-                        timed.unit.timestamp, timed.unit.decode_order_number,
-                    );
-                }
-                candidates.push((slice_index, timed));
-                candidates.extend(self.take_sync_followers(slice_index, timestamp, decode_order));
-                candidates.sort_by_key(|(_, candidate)| {
-                    candidate
-                        .unit
-                        .decode_order_number
-                        .expect("sync followers carry DON/DONL")
-                        .wrapping_sub(decode_order)
-                });
-            } else {
-                candidates.push((slice_index, timed));
-            }
-
-            for (candidate_index, candidate) in candidates {
-                match self.frame_batcher.insert(candidate_index, candidate) {
-                    BatchInsertResult::Accepted => {}
-                    BatchInsertResult::IgnoredLate => {
-                        late_units = late_units.saturating_add(1);
-                    }
-                    BatchInsertResult::MissingDecodeOrder => {
-                        unreachable!("receiver validates DON/DONL before inserting access units")
-                    }
-                    BatchInsertResult::InvalidPredictionChain => {
-                        prediction_chain_failure = Some("duplicate stream in one RTP timestamp");
-                        break 'completed;
-                    }
-                    BatchInsertResult::PredictionChainOverflow => {
-                        prediction_chain_failure = Some("pending DON/DONL sequence overflow");
-                        break 'completed;
-                    }
-                }
-            }
-        }
-        if late_units != 0 && std::env::var_os("ARD_MEDIA_TRACE").is_some() {
-            eprintln!("RTP ignored completed late/duplicate access units: count={late_units}");
-        }
-        if let Some(reason) = prediction_chain_failure {
+        let assembled = self.assembler.receive()?;
+        if assembled.chain_reset {
             self.packet_losses = self.packet_losses.saturating_add(1);
-            self.enter_sync_recovery();
-            if std::env::var_os("ARD_MEDIA_TRACE").is_some() {
-                eprintln!(
-                    "RTP cross-stream prediction chain reset ({reason}); max_pending_timestamps={MAX_PENDING_FRAME_BATCHES} total_losses={}",
-                    self.packet_losses,
-                );
-            }
-            self.send_picture_loss_indications()?;
+            self.send_keyframe_request()?;
         }
-        let batch = self.frame_batcher.take_ready(now);
-        self.frames = self.frames.saturating_add(usize::from(batch.is_some()));
-        Ok(batch)
+        if assembled.ignored_units != 0 && std::env::var_os("ARD_MEDIA_TRACE").is_some() {
+            eprintln!(
+                "RTP ignored completed late/duplicate access units: count={}",
+                assembled.ignored_units,
+            );
+        }
+        let codec = self.codec;
+        if let Some(frame) = assembled.frame.as_ref()
+            && self.take_armed
+            && frame
+                .access_units
+                .iter()
+                .any(|(_, unit)| unit.is_sync(codec))
+        {
+            self.take_has_keyframe = true;
+        }
+        Ok(assembled.frame.map(|frame| {
+            self.frames = self.frames.saturating_add(1);
+            AvcFrameBatch {
+                timestamp: frame.timestamp,
+                access_units: frame.access_units,
+                first_packet_received_at: frame.first_packet_received_at,
+                first_access_unit_completed_at: frame.first_access_unit_completed_at,
+                released_at: Instant::now(),
+            }
+        }))
+    }
+
+    /// Release a frame the assembler already has ready without reading a packet.
+    fn take_ready_frame(&mut self) -> Option<AvcFrameBatch> {
+        let assembled = self.assembler.receive().ok()?;
+        let codec = self.codec;
+        if let Some(frame) = assembled.frame.as_ref()
+            && self.take_armed
+            && frame
+                .access_units
+                .iter()
+                .any(|(_, unit)| unit.is_sync(codec))
+        {
+            self.take_has_keyframe = true;
+        }
+        assembled.frame.map(|frame| {
+            self.frames = self.frames.saturating_add(1);
+            AvcFrameBatch {
+                timestamp: frame.timestamp,
+                access_units: frame.access_units,
+                first_packet_received_at: frame.first_packet_received_at,
+                first_access_unit_completed_at: frame.first_access_unit_completed_at,
+                released_at: Instant::now(),
+            }
+        })
     }
 
     fn send_feedback_if_due(&mut self) -> Result<()> {
@@ -897,90 +781,60 @@ impl AvcVideoStreamReceiver {
         Ok(())
     }
 
+    /// One rate-control feedback packet per received stream.
+    ///
+    /// The server's adaptive rate control runs on what the viewer echoes back,
+    /// so the packet carries the interval this receiver actually measured — the
+    /// datagrams and payload bytes since the previous report (see
+    /// `protect_rate_control_feedback` for the packet's shape and why its width
+    /// matters).
     fn send_receiver_reports(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if feedback_disabled() {
+            // A/B switch for a take that has to run without the viewer's
+            // feedback: the windows still roll so the counters stay honest if
+            // the next report sends them.
+            for feedback in &mut self.feedback {
+                let _ = feedback.window.close(now);
+                let _ = feedback.stats.report();
+            }
+            self.last_feedback = now;
+            return Ok(());
+        }
         for feedback in &mut self.feedback {
-            let report = feedback
-                .srtcp
-                .protect_receiver_report(feedback.remote_ssrc)?;
+            let interval = feedback.window.close(now);
+            let rate_control = feedback.srtcp.protect_rate_control_feedback(
+                feedback.remote_ssrc,
+                interval.bits_per_second,
+                interval.datagrams,
+            )?;
+            self.session.send(&rate_control).map_err(io_error)?;
+            self.heartbeats_sent += 1;
+
+            let values = feedback.stats.report();
+            let report = feedback.srtcp.protect_receiver_report(
+                feedback.remote_ssrc,
+                values.fraction_lost,
+                values.cumulative_lost,
+                values.highest_sequence,
+                values.jitter,
+            )?;
             self.session.send(&report).map_err(io_error)?;
             self.heartbeats_sent += 1;
         }
-        self.last_feedback = Instant::now();
+        self.last_feedback = now;
         Ok(())
     }
 
     pub fn request_keyframe(&mut self) -> Result<()> {
-        self.enter_sync_recovery();
-        self.send_picture_loss_indications()
-    }
-
-    fn hold_possible_sync_follower(&mut self, stream_index: usize, timed: TimedAccessUnit) {
-        let timestamp = timed.unit.timestamp;
-        if let Some(current_timestamp) = self
-            .pending_sync_followers
-            .first()
-            .map(|(_, candidate)| candidate.unit.timestamp)
-            && current_timestamp != timestamp
-        {
-            if timestamp_precedes(current_timestamp, timestamp) {
-                self.pending_sync_followers.clear();
-            } else {
-                return;
-            }
-        }
-        if self
-            .pending_sync_followers
-            .iter()
-            .any(|(index, candidate)| {
-                *index == stream_index
-                    || candidate.unit.decode_order_number == timed.unit.decode_order_number
-            })
-        {
-            return;
-        }
-        if self.pending_sync_followers.len() < AVC_VIDEO_SLICE_COUNT {
-            self.pending_sync_followers.push((stream_index, timed));
-        }
-    }
-
-    fn take_sync_followers(
-        &mut self,
-        sync_stream_index: usize,
-        timestamp: u32,
-        decode_order: u16,
-    ) -> Vec<(usize, TimedAccessUnit)> {
-        std::mem::take(&mut self.pending_sync_followers)
-            .into_iter()
-            .filter(|(stream_index, candidate)| {
-                if *stream_index == sync_stream_index || candidate.unit.timestamp != timestamp {
-                    return false;
-                }
-                candidate
-                    .unit
-                    .decode_order_number
-                    .is_some_and(|candidate_order| {
-                        let offset = candidate_order.wrapping_sub(decode_order);
-                        (1..AVC_VIDEO_SLICE_COUNT as u16).contains(&offset)
-                    })
-            })
-            .collect()
-    }
-
-    fn enter_sync_recovery(&mut self) {
-        self.frame_batcher.reset();
+        self.assembler.enter_sync_recovery();
         self.ready_units.clear();
-        self.awaiting_sync = true;
-        self.pending_sync_followers.clear();
-        for stream in &mut self.streams {
-            stream.depacketizer.reset();
-            stream.reorder.reset_pending();
-            stream.completed.clear();
-            stream.first_packet_arrivals.clear();
-            stream.damaged_timestamp = None;
-        }
+        self.send_keyframe_request()
     }
 
-    fn send_picture_loss_indications(&mut self) -> Result<()> {
+    /// Send picture-loss indications for every received stream, rate limited to
+    /// one request per `KEYFRAME_REQUEST_INTERVAL`.
+    pub fn send_keyframe_request(&mut self) -> Result<()> {
         if self
             .last_keyframe_request
             .is_some_and(|last| last.elapsed() < KEYFRAME_REQUEST_INTERVAL)
@@ -1014,14 +868,121 @@ fn io_error(error: std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::{
-        AVC_VIDEO_SLICE_COUNT, AccessUnitBatcher, BatchInsertResult, MAX_PENDING_FRAME_BATCHES,
-        MediaUdpEndpoints, MediaUdpPortOverrides, MediaUdpSession, TimedAccessUnit, UdpStreamKind,
-        insert_scheduled_item, is_rtcp,
+        AVC_VIDEO_SLICE_COUNT, MediaUdpEndpoints, MediaUdpPortOverrides, MediaUdpSession,
+        ReceiveInterval, ReceiveWindow, ReceptionStats, UdpStreamKind, is_rtcp,
     };
-    use crate::media_stream::{AccessUnit, ENCODING_AVC_MEDIA_STREAM, MediaStreamMessage1};
+    use crate::media_stream::{ENCODING_AVC_MEDIA_STREAM, MediaStreamMessage1};
+
+    /// The feedback the server's rate control consumes is this receiver's own
+    /// measurement, so the window has to report the interval it measured and
+    /// then start over: the peer compares consecutive reports, and a stale or
+    /// repeated figure would describe a rate the viewer never saw.
+    #[test]
+    fn receive_window_reports_and_resets_the_interval_counters() {
+        let opened = std::time::Instant::now();
+        let mut window = ReceiveWindow::new(opened);
+        for _ in 0..1_000 {
+            window.record(2_000);
+        }
+        // 2 MB in one second is 16 Mbit/s, over 1000 datagrams.
+        assert_eq!(
+            window.close(opened + Duration::from_secs(1)),
+            ReceiveInterval {
+                bits_per_second: 16_000_000,
+                datagrams: 1_000,
+            }
+        );
+
+        // The next interval starts empty, so a stream that stops arriving
+        // reports zero instead of repeating the last figures.
+        assert_eq!(
+            window.close(opened + Duration::from_secs(2)),
+            ReceiveInterval {
+                bits_per_second: 0,
+                datagrams: 0,
+            }
+        );
+
+        // A window that has not advanced cannot divide by a zero interval, but
+        // the datagrams it did see are still reported.
+        window.record(1_000);
+        assert_eq!(
+            window.close(opened + Duration::from_secs(2)),
+            ReceiveInterval {
+                bits_per_second: 0,
+                datagrams: 1,
+            }
+        );
+    }
+
+    /// The receiver report is the only loss and jitter feedback the viewer
+    /// sends, so its counters have to describe the interval since the previous
+    /// report: a missing sequence is one lost packet, and a stream that then
+    /// goes quiet must not repeat the earlier fraction.
+    #[test]
+    fn reception_stats_report_loss_over_the_interval() {
+        let start = std::time::Instant::now();
+        let mut stats = ReceptionStats::new();
+        // Sequences 1 and 2 arrive, 3 is lost, 4 arrives.
+        for (index, sequence) in [(0u64, 1u16), (1, 2), (3, 4)] {
+            stats.record(
+                sequence,
+                90_000 * index as u32,
+                start + Duration::from_millis(index),
+            );
+        }
+        let first = stats.report();
+        assert_eq!(
+            first.highest_sequence, 4,
+            "the extended sequence is reported"
+        );
+        assert_eq!(
+            first.cumulative_lost, 1,
+            "one of four expected packets is lost"
+        );
+        // One lost of four expected is 64/256.
+        assert_eq!(first.fraction_lost, 64);
+
+        // A quiet interval adds nothing expected and nothing received.
+        let second = stats.report();
+        assert_eq!(second.fraction_lost, 0);
+        assert_eq!(second.cumulative_lost, 1);
+        assert_eq!(second.highest_sequence, 4);
+
+        // The sequence counter wrapping is a cycle, not a jump backwards: the
+        // extended number keeps counting and a contiguous wrap loses nothing.
+        let mut wrapping = ReceptionStats::new();
+        wrapping.record(65_535, 0, start);
+        wrapping.record(0, 90_000, start + Duration::from_millis(1));
+        let values = wrapping.report();
+        assert_eq!(values.highest_sequence, 65_536);
+        assert_eq!(values.cumulative_lost, 0);
+    }
+
+    /// A steady stream with a constant transit time has no jitter, and a stream
+    /// whose arrival swings away from its timestamps reports the swing.
+    #[test]
+    fn reception_stats_track_interarrival_jitter() {
+        let start = std::time::Instant::now();
+        let mut steady = ReceptionStats::new();
+        for index in 0..20u64 {
+            steady.record(
+                index as u16,
+                (90_000 * index / 10) as u32,
+                start + Duration::from_millis(index * 100),
+            );
+        }
+        assert_eq!(steady.report().jitter, 0);
+
+        let mut swinging = ReceptionStats::new();
+        swinging.record(0, 0, start);
+        // 10 ms late for a 10 ms step, so the estimated variation is 900 units.
+        swinging.record(1, 900, start + Duration::from_millis(20));
+        assert!(swinging.report().jitter > 0);
+    }
 
     #[test]
     fn distinguishes_rtcp_from_rtp() {
@@ -1095,321 +1056,5 @@ mod tests {
             .validate()
             .is_err()
         );
-    }
-
-    fn unit(timestamp: u32, decode_order: u16) -> AccessUnit {
-        AccessUnit {
-            timestamp,
-            decode_order_number: Some(decode_order),
-            nal_units: vec![vec![decode_order as u8]],
-        }
-    }
-
-    fn timed_unit(timestamp: u32, decode_order: u16, at: Instant) -> TimedAccessUnit {
-        TimedAccessUnit {
-            unit: unit(timestamp, decode_order),
-            first_packet_received_at: at,
-            completed_at: at,
-        }
-    }
-
-    #[test]
-    fn completed_slices_are_stably_sorted_in_stream_scan_order() {
-        let now = Instant::now();
-        let mut ready = Vec::new();
-        for index in 0..AVC_VIDEO_SLICE_COUNT {
-            insert_scheduled_item(&mut ready, index, timed_unit(100, index as u16, now));
-        }
-        assert_eq!(
-            ready
-                .iter()
-                .map(|(index, timed)| (*index, timed.unit.nal_units[0][0]))
-                .collect::<Vec<_>>(),
-            vec![(0, 0), (1, 1), (2, 2), (3, 3)]
-        );
-    }
-
-    #[test]
-    fn sparse_updates_are_sorted_without_waiting_for_four_slices() {
-        let now = Instant::now();
-        let mut ready = Vec::new();
-        insert_scheduled_item(&mut ready, 1, timed_unit(200, 1, now));
-        insert_scheduled_item(&mut ready, 0, timed_unit(100, 0, now));
-        insert_scheduled_item(&mut ready, 2, timed_unit(100, 2, now));
-        assert_eq!(
-            ready
-                .iter()
-                .map(|(index, timed)| (*index, timed.unit.timestamp))
-                .collect::<Vec<_>>(),
-            vec![(0, 100), (2, 100), (1, 200)]
-        );
-    }
-
-    #[test]
-    fn timestamp_sort_is_wrap_aware() {
-        let now = Instant::now();
-        let mut ready = Vec::new();
-        insert_scheduled_item(&mut ready, 2, timed_unit(1, 2, now));
-        insert_scheduled_item(&mut ready, 0, timed_unit(u32::MAX - 1, 0, now));
-        insert_scheduled_item(&mut ready, 1, timed_unit(u32::MAX, 1, now));
-        assert_eq!(
-            ready
-                .iter()
-                .map(|(index, timed)| (*index, timed.unit.timestamp))
-                .collect::<Vec<_>>(),
-            vec![(0, u32::MAX - 1), (1, u32::MAX), (2, 1)]
-        );
-    }
-
-    #[test]
-    fn complete_four_slice_timestamp_is_released_immediately() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        batcher.begin_prediction_chain(100);
-        for (slice, decode_order) in [(0, 102), (1, 100), (2, 103), (3, 101)] {
-            assert_eq!(
-                batcher.insert(slice, timed_unit(800, decode_order, now)),
-                BatchInsertResult::Accepted
-            );
-        }
-        let batch = batcher.take_ready(now).expect("complete timestamp");
-        assert_eq!(batch.timestamp, 800);
-        assert_eq!(batch.access_units.len(), AVC_VIDEO_SLICE_COUNT);
-        assert_eq!(
-            batch
-                .access_units
-                .iter()
-                .map(|(slice, unit)| (*slice, unit.decode_order_number.unwrap()))
-                .collect::<Vec<_>>(),
-            vec![(1, 100), (3, 101), (0, 102), (2, 103)]
-        );
-    }
-
-    #[test]
-    fn batch_timing_separates_first_packet_from_first_completed_access_unit() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        batcher.begin_prediction_chain(20);
-        for (slice, packet_ms, completed_ms) in [(0, 3, 7), (1, 1, 5), (2, 2, 4), (3, 4, 8)] {
-            assert_eq!(
-                batcher.insert(
-                    slice,
-                    TimedAccessUnit {
-                        unit: unit(900, 20 + slice as u16),
-                        first_packet_received_at: now + Duration::from_millis(packet_ms),
-                        completed_at: now + Duration::from_millis(completed_ms),
-                    },
-                ),
-                BatchInsertResult::Accepted
-            );
-        }
-        let batch = batcher
-            .take_ready(now + Duration::from_millis(9))
-            .expect("complete timestamp");
-        assert_eq!(
-            batch.first_packet_received_at,
-            now + Duration::from_millis(1)
-        );
-        assert_eq!(
-            batch.first_access_unit_completed_at,
-            now + Duration::from_millis(4)
-        );
-        assert_eq!(batch.released_at, now + Duration::from_millis(9));
-    }
-
-    #[test]
-    fn incomplete_timestamp_is_never_released_by_a_wall_clock_guess() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        batcher.begin_prediction_chain(40);
-        assert_eq!(
-            batcher.insert(2, timed_unit(1_600, 42, now)),
-            BatchInsertResult::Accepted
-        );
-        assert!(batcher.take_ready(now).is_none());
-        assert!(
-            batcher.take_ready(now + Duration::from_secs(1)).is_none(),
-            "elapsed time cannot prove a prediction subframe was omitted"
-        );
-        for (slice, decode_order) in [(0, 40), (1, 41), (3, 43)] {
-            assert_eq!(
-                batcher.insert(slice, timed_unit(1_600, decode_order, now)),
-                BatchInsertResult::Accepted
-            );
-        }
-        let batch = batcher.take_ready(now).expect("complete timestamp");
-        assert_eq!(batch.timestamp, 1_600);
-        assert_eq!(batch.access_units.len(), AVC_VIDEO_SLICE_COUNT);
-    }
-
-    #[test]
-    fn a_newer_full_timestamp_cannot_replace_an_incomplete_sync_origin() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        batcher.begin_prediction_chain(10);
-        assert_eq!(
-            batcher.insert(0, timed_unit(100, 10, now)),
-            BatchInsertResult::Accepted
-        );
-        for (slice, decode_order) in [(0, 14), (1, 15), (2, 16), (3, 17)] {
-            assert_eq!(
-                batcher.insert(slice, timed_unit(200, decode_order, now)),
-                BatchInsertResult::Accepted
-            );
-        }
-        assert!(
-            batcher.take_ready(now).is_none(),
-            "decoder must not skip the sync timestamp's missing DONs"
-        );
-    }
-
-    #[test]
-    fn sparse_timestamp_releases_only_when_next_don_proves_its_boundary() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        batcher.begin_prediction_chain(0);
-        for slice in 0..AVC_VIDEO_SLICE_COUNT {
-            assert_eq!(
-                batcher.insert(slice, timed_unit(100, slice as u16, now)),
-                BatchInsertResult::Accepted
-            );
-        }
-        batcher.take_ready(now).expect("initial sync batch");
-
-        assert_eq!(
-            batcher.insert(3, timed_unit(200, 5, now)),
-            BatchInsertResult::Accepted
-        );
-        assert_eq!(
-            batcher.insert(0, timed_unit(200, 4, now)),
-            BatchInsertResult::Accepted
-        );
-        assert!(batcher.take_ready(now + Duration::from_secs(1)).is_none());
-
-        assert_eq!(
-            batcher.insert(1, timed_unit(300, 6, now)),
-            BatchInsertResult::Accepted
-        );
-        let sparse = batcher
-            .take_ready(now)
-            .expect("DON boundary proves sparse batch");
-        assert_eq!(sparse.timestamp, 200);
-        assert_eq!(
-            sparse
-                .access_units
-                .iter()
-                .map(|(slice, unit)| (*slice, unit.decode_order_number.unwrap()))
-                .collect::<Vec<_>>(),
-            vec![(0, 4), (3, 5)]
-        );
-    }
-
-    #[test]
-    fn a_decode_order_gap_blocks_newer_timestamps_until_the_missing_unit_arrives() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        batcher.begin_prediction_chain(0);
-        for slice in 0..AVC_VIDEO_SLICE_COUNT {
-            batcher.insert(slice, timed_unit(100, slice as u16, now));
-        }
-        batcher.take_ready(now).expect("initial sync batch");
-
-        assert_eq!(
-            batcher.insert(3, timed_unit(200, 5, now)),
-            BatchInsertResult::Accepted
-        );
-        assert_eq!(
-            batcher.insert(0, timed_unit(300, 6, now)),
-            BatchInsertResult::Accepted
-        );
-        assert!(batcher.take_ready(now).is_none(), "DON 4 is still missing");
-        assert_eq!(
-            batcher.insert(1, timed_unit(200, 4, now)),
-            BatchInsertResult::Accepted
-        );
-        let recovered = batcher.take_ready(now).expect("contiguous DON chain");
-        assert_eq!(recovered.timestamp, 200);
-        assert_eq!(
-            recovered
-                .access_units
-                .iter()
-                .map(|(_, unit)| unit.decode_order_number.unwrap())
-                .collect::<Vec<_>>(),
-            vec![4, 5]
-        );
-    }
-
-    #[test]
-    fn decode_order_wrap_is_contiguous_and_late_units_are_rejected() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        batcher.begin_prediction_chain(u16::MAX - 1);
-        for (slice, decode_order) in [(0, u16::MAX), (1, 1), (2, u16::MAX - 1), (3, 0)] {
-            assert_eq!(
-                batcher.insert(slice, timed_unit(u32::MAX, decode_order, now)),
-                BatchInsertResult::Accepted
-            );
-        }
-        let first = batcher.take_ready(now).expect("wrapped initial batch");
-        assert_eq!(
-            first
-                .access_units
-                .iter()
-                .map(|(_, unit)| unit.decode_order_number.unwrap())
-                .collect::<Vec<_>>(),
-            vec![u16::MAX - 1, u16::MAX, 0, 1]
-        );
-        assert_eq!(
-            batcher.insert(3, timed_unit(1, u16::MAX, now)),
-            BatchInsertResult::IgnoredLate
-        );
-        assert_eq!(
-            batcher.insert(0, timed_unit(1, 2, now)),
-            BatchInsertResult::Accepted
-        );
-        assert_eq!(
-            batcher.insert(1, timed_unit(2, 3, now)),
-            BatchInsertResult::Accepted
-        );
-        let sparse = batcher.take_ready(now).expect("post-wrap sparse batch");
-        assert_eq!(sparse.access_units[0].1.decode_order_number, Some(2));
-    }
-
-    #[test]
-    fn missing_decode_order_and_duplicate_stream_are_explicit_errors() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        let mut missing = timed_unit(100, 0, now);
-        missing.unit.decode_order_number = None;
-        assert_eq!(
-            batcher.insert(0, missing),
-            BatchInsertResult::MissingDecodeOrder
-        );
-        assert_eq!(
-            batcher.insert(0, timed_unit(100, 0, now)),
-            BatchInsertResult::Accepted
-        );
-        assert_eq!(
-            batcher.insert(0, timed_unit(100, 1, now)),
-            BatchInsertResult::InvalidPredictionChain
-        );
-    }
-
-    #[test]
-    fn incomplete_prediction_chain_is_bounded_and_reset() {
-        let now = Instant::now();
-        let mut batcher = AccessUnitBatcher::default();
-        for frame in 0..MAX_PENDING_FRAME_BATCHES {
-            assert_eq!(
-                batcher.insert(0, timed_unit(100 + frame as u32, 10 + frame as u16, now),),
-                BatchInsertResult::Accepted
-            );
-        }
-        assert_eq!(
-            batcher.insert(0, timed_unit(200, 30, now)),
-            BatchInsertResult::PredictionChainOverflow
-        );
-        assert!(batcher.pending.is_empty());
-        assert_eq!(batcher.last_released_decode_order, None);
     }
 }

@@ -37,7 +37,6 @@ impl Language {
             return value;
         }
         match value {
-            "可连接" => "Available",
             "历史记录" => "History",
             "最近连接" => "Recently connected",
             "历史连接" => "Connection history",
@@ -99,6 +98,31 @@ impl Language {
             "当前使用深色外观" => "Dark appearance is currently active",
             "当前使用浅色外观" => "Light appearance is currently active",
             "配置应用的通用行为。" => "Configure general application behavior.",
+            "录制" => "Recording",
+            "录制目录" => "Recording folder",
+            "留空时保存到系统影片目录下的 ARD Viewer 文件夹。" => {
+                "Leave blank to save into an ARD Viewer folder in your movies directory."
+            }
+            "录制画质" => "Recording quality",
+            "录制写入 MP4（H.264），画面与远程会话一致。" => {
+                "Recordings are written as MP4 (H.264) and match the remote session frame for frame."
+            }
+            "高画质" => "High",
+            "标准" => "Balanced",
+            "小体积" => "Compact",
+            "已开始录制远程画面" => "Recording the remote session",
+            "录制已保存" => "Recording saved",
+            "正在保存录制文件…" => "Saving the recording…",
+            "硬件编码" => "hardware encoder",
+            "软件编码" => "software encoder",
+            "录制失败" => "Recording failed",
+            "录制没有捕获到任何画面" => "The recording captured no frames",
+            "请先连接远程会话，再开始录制" => {
+                "Connect to a remote session before recording"
+            }
+            "当前平台没有系统 H.264 编码器，无法录制会话" => {
+                "This platform has no system H.264 encoder, so recording is unavailable"
+            }
             "外观" => "Appearance",
             "主题模式" => "Theme",
             "语言" => "Language",

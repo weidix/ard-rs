@@ -1,6 +1,14 @@
 use crate::wire::Cursor;
 use crate::{Decoder, Error, Framebuffer, Result};
 
+/// Smallest Diffie-Hellman modulus width in bytes accepted by the native
+/// Screen Sharing client for Apple security type 30.
+pub const MIN_AUTH_KEY_BYTES: usize = 64;
+
+/// Largest Diffie-Hellman modulus width in bytes accepted by the native
+/// Screen Sharing client for Apple security type 30.
+pub const MAX_AUTH_KEY_BYTES: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolVersion {
     pub major: u16,
@@ -95,6 +103,10 @@ pub struct ArdAuthChallenge {
 /// The wire message is a two-byte generator, a two-byte key length, then a
 /// prime modulus and server public key of that length. This is a distinct ARD
 /// authentication exchange, not VNC challenge-response authentication.
+///
+/// The native client accepts `key_length` in `[64, 1024]`; shorter moduli are
+/// rejected here as well so a malformed offer cannot be carried into the
+/// Diffie-Hellman computation.
 pub fn parse_ard_auth_challenge(
     bytes: &[u8],
     max_key_bytes: usize,
@@ -102,8 +114,8 @@ pub fn parse_ard_auth_challenge(
     let mut cursor = Cursor::new(bytes);
     let generator = cursor.u16()?;
     let key_length = usize::from(cursor.u16()?);
-    if key_length == 0 {
-        return Err(Error::Invalid("empty ARD authentication key"));
+    if key_length < MIN_AUTH_KEY_BYTES {
+        return Err(Error::Invalid("ARD authentication key is too short"));
     }
     if key_length > max_key_bytes {
         return Err(Error::LimitExceeded("ARD authentication key"));
@@ -1615,6 +1627,46 @@ mod display_info2_tests {
             parse_ard_display_info2(&payload),
             Err(Error::NeedMore { .. })
         ));
+    }
+
+    /// Exact DisplayInfo2 payload captured from a real Screen Sharing server
+    /// (`ARD_TRACE_DISPLAY_INFO2`, macOS 26, logical 1710x1112 / backing
+    /// 3420x2224). It settles the axis-order question that the disassembly
+    /// alone could not: each bounds rectangle is four big-endian u16 in
+    /// `(top, left, bottom, right)` order, so the logical display is encoded
+    /// as `(0, 0, 1112, 1710)`. Reading them as `(left, top, right, bottom)`
+    /// would report a 1112x1710 display and quietly transpose the framebuffer.
+    ///
+    /// The fixture is protocol metadata only; it contains no screen content.
+    #[test]
+    fn parses_real_server_display_info2_with_top_left_bottom_right_bounds() {
+        const REAL: [u8; 78] = [
+            0x00, 0x4c, 0x00, 0x05, 0x06, 0xae, 0x04, 0x58, 0x0d, 0x5c, 0x08, 0xb0, 0xff, 0xff,
+            0xff, 0xff, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x01, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x04, 0x58, 0x06, 0xae, 0x00, 0x00, 0x00, 0x00, 0x08, 0xb0,
+            0x0d, 0x5c, 0x00, 0x00, 0x00, 0x01, 0x20, 0x20, 0x00, 0x01, 0x00, 0xff, 0x00, 0xff,
+            0x00, 0xff, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let (layout, consumed) = parse_ard_display_info2(&REAL).expect("real payload parses");
+        assert_eq!(consumed, REAL.len());
+        assert_eq!(layout.version, 5);
+        assert_eq!((layout.scaled_width, layout.scaled_height), (1710, 1112));
+        assert_eq!(
+            (layout.framebuffer_width, layout.framebuffer_height),
+            (3420, 2224)
+        );
+        assert_eq!(layout.current_display, None);
+        assert_eq!(layout.displays.len(), 1);
+        let display = &layout.displays[0];
+        assert_eq!(display.id, 1);
+        assert_eq!(display.horizontal_scale(), 2.0);
+        assert_eq!(display.vertical_scale(), 1.0);
+        let logical = display.logical_bounds;
+        assert_eq!((logical.x, logical.y), (0, 0));
+        assert_eq!((logical.width, logical.height), (1710, 1112));
+        let backing = display.framebuffer_bounds;
+        assert_eq!((backing.width, backing.height), (3420, 2224));
     }
 
     #[test]

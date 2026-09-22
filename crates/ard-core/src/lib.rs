@@ -17,13 +17,15 @@ pub mod media_stream;
 mod mvs;
 mod oracle;
 mod protocol;
+mod raw_stream;
 mod transport;
 mod wire;
 
 pub use auth::{ArdType30ClientExchange, build_ard_type30_client_exchange};
 pub use client::{
     ArdClient, ArdClientConfig, ArdClientError, ArdClientEvent, ArdClientInput, ArdFrameInfo,
-    ArdFrameOutput, ArdInputMetrics, ArdMediaStream, ArdReconnectPolicy, ArdVideoQuality,
+    ArdFrameOutput, ArdInputMetrics, ArdMediaStream, ArdReconnectPolicy, ArdShutdownHandle,
+    ArdVideoQuality,
 };
 pub use decoder::{DecodeLimits, Decoder};
 pub use dispatcher::{ArdMessageDispatcher, ArdServerMessage};
@@ -59,15 +61,20 @@ pub use protocol::{
     ArdAuthChallenge, ArdAuthResponse, ArdClientInit, ArdDisplay, ArdDisplayConfiguration,
     ArdDisplayLayout, ArdDisplayRect, ArdDisplaySelection, ArdEncryptionControl,
     ArdScrollWheelEvent, ArdServerInitExtension, ArdSessionOptions, ArdSetEncryptionLevel,
-    ArdViewerInformation, ArdVirtualDisplay, Encoding, PixelFormat, ProtocolVersion, Rectangle,
-    SecurityType, ServerInit, build_ard_auto_frame_update, build_ard_encryption_activation,
-    build_ard_scroll_wheel_event, build_ard_server_init, build_ard_set_display,
-    build_ard_set_display_configuration, build_ard_set_encryption_level, build_client_cut_text,
-    build_clipboard_text, build_framebuffer_update_request, build_key_event, build_pointer_event,
-    build_set_encodings, build_set_pixel_format, parse_ard_auth_challenge, parse_ard_auth_response,
-    parse_ard_client_init, parse_ard_display_info2, parse_ard_encryption_control,
-    parse_ard_session_options, parse_ard_set_encryption_level, parse_ard_viewer_information,
-    parse_framebuffer_update, parse_security_types, parse_server_init,
+    ArdViewerInformation, ArdVirtualDisplay, Encoding, MAX_AUTH_KEY_BYTES, MIN_AUTH_KEY_BYTES,
+    PixelFormat, ProtocolVersion, Rectangle, SecurityType, ServerInit, build_ard_auto_frame_update,
+    build_ard_encryption_activation, build_ard_scroll_wheel_event, build_ard_server_init,
+    build_ard_set_display, build_ard_set_display_configuration, build_ard_set_encryption_level,
+    build_client_cut_text, build_clipboard_text, build_framebuffer_update_request, build_key_event,
+    build_pointer_event, build_set_encodings, build_set_pixel_format, parse_ard_auth_challenge,
+    parse_ard_auth_response, parse_ard_client_init, parse_ard_display_info2,
+    parse_ard_encryption_control, parse_ard_session_options, parse_ard_set_encryption_level,
+    parse_ard_viewer_information, parse_framebuffer_update, parse_security_types,
+    parse_server_init,
+};
+pub use raw_stream::{
+    ENVIRONMENT as RAW_STREAM_ENVIRONMENT, MediaDetails, RawStreamDump, RawStreamError,
+    RawStreamIndex, RawStreamKind, RawStreamRecord, RawStreamSink, RecordFraming, TakeOrigin,
 };
 pub use transport::{
     ArdEncryptedRecordFramer, ArdSessionMaterial, ArdSessionRecordDecoder, ArdSessionRecordEncoder,

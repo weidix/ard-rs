@@ -72,7 +72,6 @@ fn device_sidebar(app: &ArdViewer, maximized: bool) -> Element<'_, Message> {
         };
         let selection = selection * selection * (3.0 - 2.0 * selection);
         let state = match device.state {
-            crate::state::DeviceState::Online => app.language.tr("可连接"),
             crate::state::DeviceState::Saved => app.language.tr("历史记录"),
             crate::state::DeviceState::RecentlyUsed => app.language.tr("最近连接"),
         };

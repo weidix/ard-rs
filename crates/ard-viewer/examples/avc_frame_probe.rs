@@ -17,6 +17,125 @@ use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufRead};
+
+/// How many band-0 access units `ARD_PROBE_DUMP_ES` writes.
+const ES_DUMP_FRAMES: usize = 90;
+
+/// Development-only capture of one media stream at two points at once: the
+/// compressed access units exactly as the decoder receives them, and the NV12
+/// planes the decoder produced for each one.
+///
+/// `ARD_PROBE_DUMP_STREAM=<prefix>` writes `<prefix>.es` (Annex-B, access units
+/// in decode order), `<prefix>.es.idx` (one line per submitted access unit),
+/// `<prefix>.planes` (the decoder's own planes, luma then interleaved chroma,
+/// tightly packed) and `<prefix>.planes.idx` (one line per decoded plane set).
+/// The two indexes share the decoder's submission number, so an independent
+/// decoder can be compared picture by picture against this client at exactly
+/// the point where the artifact is claimable. Nothing is written without the
+/// variable; `ARD_PROBE_NO_PLANES=1` keeps only the encoded stream and its
+/// index, which is what a long take needs.
+struct StreamDump {
+    access_units: std::fs::File,
+    access_index: std::io::BufWriter<std::fs::File>,
+    /// Present unless `ARD_PROBE_NO_PLANES` is set: the planes run about a
+    /// gigabyte per ten seconds of 4K, and a take that only needs the encoded
+    /// stream and its index should not have to write them.
+    planes: Option<std::fs::File>,
+    plane_index: Option<std::io::BufWriter<std::fs::File>>,
+    access_offset: u64,
+    plane_offset: u64,
+}
+
+impl StreamDump {
+    fn from_environment() -> io::Result<Option<Self>> {
+        let Some(prefix) = env::var_os("ARD_PROBE_DUMP_STREAM").map(std::path::PathBuf::from)
+        else {
+            return Ok(None);
+        };
+        let open = |suffix: &str| -> io::Result<std::fs::File> {
+            let mut path = prefix.clone().into_os_string();
+            path.push(suffix);
+            std::fs::File::create(std::path::PathBuf::from(path))
+        };
+        // The planes are about a gigabyte per ten seconds of 4K, so a long take
+        // that only needs the encoded stream and its index can leave them out.
+        let want_planes = env::var_os("ARD_PROBE_NO_PLANES").is_none();
+        let planes = want_planes.then(|| open(".planes")).transpose()?;
+        let plane_index = want_planes
+            .then(|| open(".planes.idx").map(std::io::BufWriter::new))
+            .transpose()?;
+        Ok(Some(Self {
+            access_units: open(".es")?,
+            access_index: std::io::BufWriter::new(open(".es.idx")?),
+            planes,
+            plane_index,
+            access_offset: 0,
+            plane_offset: 0,
+        }))
+    }
+
+    /// Record one access unit in submission order and return its ordinal, which
+    /// is the decoder's submission number for this sample.
+    fn push_access_unit(
+        &mut self,
+        ordinal: u64,
+        slice_index: usize,
+        timestamp: u32,
+        unit: &ard_rs::media_stream::AccessUnit,
+    ) -> io::Result<()> {
+        use std::io::Write as _;
+        let annex_b = unit.to_annex_b();
+        self.access_units.write_all(&annex_b)?;
+        writeln!(
+            self.access_index,
+            "{ordinal} {slice_index} {timestamp} {} {}",
+            self.access_offset,
+            annex_b.len(),
+        )?;
+        self.access_offset += annex_b.len() as u64;
+        Ok(())
+    }
+
+    /// Record the planes the decoder produced for one submission.
+    fn push_planes(&mut self, output: &media::DecodedOutput) -> io::Result<()> {
+        use std::io::Write as _;
+        let (width, height) = output
+            .frame
+            .as_ref()
+            .map(|frame| (frame.width, frame.height))
+            .unwrap_or((0, 0));
+        let (Some(planes), Some(plane_index)) = (self.planes.as_mut(), self.plane_index.as_mut())
+        else {
+            return Ok(());
+        };
+        let mut length = 0_u64;
+        if let Some(frame) = output.frame.as_ref() {
+            planes.write_all(&frame.y_plane)?;
+            planes.write_all(&frame.uv_plane)?;
+            length = (frame.y_plane.len() + frame.uv_plane.len()) as u64;
+        }
+        writeln!(
+            plane_index,
+            "{} {} {} {width} {height} {} {length} {}",
+            output.submission,
+            output.stream_index,
+            output.timestamp,
+            self.plane_offset,
+            output.status,
+        )?;
+        self.plane_offset += length;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        use std::io::Write as _;
+        self.access_index.flush()?;
+        if let Some(plane_index) = self.plane_index.as_mut() {
+            plane_index.flush()?;
+        }
+        Ok(())
+    }
+}
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread;
@@ -28,6 +147,7 @@ use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdDisplayConfiguration, ArdVideoQuality,
     ArdVirtualDisplay, Framebuffer,
 };
+use ard_rs::{RawStreamKind, RawStreamSink, TakeOrigin};
 #[cfg(target_os = "windows")]
 use media::mft::MftDecoder as PlatformVideoDecoder;
 use media::pipeline::{AvcReceiveEvent, AvcReceivePump, SliceCompositor};
@@ -36,6 +156,16 @@ use media::vt::VideoToolboxDecoder as PlatformVideoDecoder;
 use sha2::{Digest, Sha256};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // A remote Mac left at its lock screen turns the display off after a short
+    // idle period, after which the encoder streams an all-black framebuffer. A
+    // modifier key press is harmless on the lock screen and resets the idle
+    // timer, so a sequential native-then-viewer capture can still record a
+    // meaningful reference. Set ARD_PROBE_NO_WAKE=1 to disable it.
+    let wake_disabled = env::var_os("ARD_PROBE_NO_WAKE").is_some();
+    // A pure observation run must not disturb the remote picture: the default
+    // verification path clicks the remote desktop to measure input latency, and
+    // a capture that has to keep the content bit-identical sets this instead.
+    let input_disabled = env::var_os("ARD_PROBE_NO_INPUT").is_some();
     let address = env::args().nth(1).ok_or_else(|| {
         io::Error::other(
             "usage: avc_nv12_frame_probe ADDRESS USERNAME OUTPUT.png [MAX_SECONDS] [hevc|avc|full] [FRAME_COUNT] [FIXED_SIZE]",
@@ -59,6 +189,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let quality = match env::args().nth(5).as_deref() {
         None | Some("hevc") => ArdVideoQuality::HighPerformanceHevc,
         Some("avc") => ArdVideoQuality::HighPerformanceAvc,
+        // The remaining profiles all run over the TCP/RFB path, which is the
+        // only way to exercise MVS (encoding 1011) against a real server.
+        // MVS (encoding 1011) is the first entry of the Adaptive profile; the
+        // 1002 in the High profile is Apple's "thousands of colours", not MVS.
+        Some("mvs") | Some("adaptive") => ArdVideoQuality::Adaptive,
+        Some("high") => ArdVideoQuality::High,
+        Some("medium") => ArdVideoQuality::Medium,
+        Some("low") => ArdVideoQuality::Low,
         Some("full") => ArdVideoQuality::Full,
         Some(codec) => return Err(io::Error::other(format!("unsupported codec: {codec}")).into()),
     };
@@ -101,7 +239,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into_bytes();
     }
 
-    let mut config = ArdClientConfig::new(address, username.into_bytes(), password.clone());
+    let mut config = ArdClientConfig::new(address.clone(), username.into_bytes(), password.clone());
+    // The installed client keeps the RFB automatic-update loop running beside
+    // the media stream. A take that has to see the media stream on its own
+    // turns that loop off, which is what the native client does once its media
+    // stream is up.
+    if env::var_os("ARD_PROBE_NO_AUTO_UPDATES").is_some() {
+        config.automatic_updates = false;
+    }
+    // The media-stream offer carries one frame-rate bit, so a take that has to
+    // ask the server for something other than 60 fps sets the interval here.
+    if let Some(millis) = env::var("ARD_PROBE_FRAME_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        config.frame_interval = std::time::Duration::from_millis(millis);
+    }
     password.fill(0);
     config.video_quality = quality;
     config.timeout = Duration::from_secs(10);
@@ -124,8 +277,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
         });
 
-    let deadline = Instant::now() + Duration::from_secs(max_seconds);
-    if quality == ArdVideoQuality::Full {
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(max_seconds);
+    if !quality.is_high_performance() {
         return probe_full_framebuffer(
             &mut client,
             deadline,
@@ -145,6 +299,30 @@ fn main() -> Result<(), Box<dyn Error>> {
                 remote_ssrc,
                 local_ssrc,
             ) = (*media).into_video_pipeline_parts();
+            // A development switch that arms a raw-stream take for this
+            // session, so the "take starts without a keyframe" path can be
+            // exercised: `ARD_PROBE_RAW_DIR` plus `ARD_RECORD_RAW_STREAM=1`.
+            let probe_sink = env::var_os("ARD_PROBE_RAW_DIR").and_then(|dir| {
+                RawStreamSink::from_environment(std::path::PathBuf::from(dir), address.clone())
+            });
+            // Describe the stream before any take starts, exactly as the
+            // viewer's pipeline does: a dump whose header does not name the
+            // codec and frame size cannot be replayed.
+            if let Some(sink) = probe_sink.as_ref() {
+                sink.describe_stream(
+                    RawStreamKind::Video,
+                    ard_rs::MediaDetails {
+                        codec: Some(match codec {
+                            ard_rs::MediaStreamCodec::Hevc => "HEVC".to_owned(),
+                            ard_rs::MediaStreamCodec::H264 => "H264".to_owned(),
+                        }),
+                        payload_type: Some(payload_type),
+                        codec_type: None,
+                        width: fixed_size.map(|(width, _)| width),
+                        height: fixed_size.map(|(_, height)| height),
+                    },
+                );
+            }
             let receiver = AvcVideoStreamReceiver::new(
                 &endpoints,
                 UdpStreamKind::Video1,
@@ -156,11 +334,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
                 codec,
                 payload_type,
+                probe_sink.clone(),
             )?;
             key_blob.fill(0);
             feedback_key_blob.fill(0);
             let receive_pump = AvcReceivePump::spawn(receiver, Arc::new(AtomicBool::new(false)))
                 .map_err(io::Error::other)?;
+            // A remote Mac that is left at its lock screen turns the display off
+            // after a short idle period. Software ARD sessions keep streaming the
+            // resulting all-black framebuffer, so a sequential native-then-viewer
+            // capture would otherwise record a black reference. A modifier
+            // key press is harmless on the lock screen and resets the idle timer.
+            let mut last_wake_at = None;
+            if !wake_disabled {
+                let _ = input.send_key_event(true, ard_rs::XK_SHIFT_LEFT);
+                let _ = input.send_key_event(false, ard_rs::XK_SHIFT_LEFT);
+                last_wake_at = Some(Instant::now());
+                std::thread::sleep(Duration::from_millis(400));
+            }
             let mut decoder = PlatformVideoDecoder::new(codec);
             let mut compositor = SliceCompositor::new(target_dimensions);
             let mut access_units = 0usize;
@@ -181,14 +372,69 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut input_write_completed_at = None;
             let mut response_first_packet_at = None;
             let mut response_decoded_at = None;
+            // The receive pump drops its queue and asks for a fresh IRAP when the
+            // consumer falls behind. Creating the VideoToolbox session can take
+            // longer than the pump's 16-batch startup window, so one or more
+            // resets right after the stream starts are expected and recoverable:
+            // the next sync frame rebuilds the chain. Report them (they are a
+            // latency/robustness data point) and keep going instead of failing
+            // the whole capture.
+            let mut resets: Vec<String> = Vec::new();
+            // Optional Annex-B dump of band 0 for an independent decoder
+            // cross-check. Analysis artifact only, written outside the repo.
+            let es_dump = std::env::var_os("ARD_PROBE_DUMP_ES").map(std::path::PathBuf::from);
+            let mut es_dump_frames = 0_usize;
+            let mut stream_dump = StreamDump::from_environment()?;
+            let mut stream_dump_ordinal = 0_u64;
+            // Development switch: ask for a fresh keyframe N milliseconds in, so
+            // a take can show whether the server answers a picture-loss
+            // indication at all (`ARD_PROBE_KEYFRAME_AT_MS`).
+            let keyframe_deadline = env::var("ARD_PROBE_KEYFRAME_AT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|after| started_at + Duration::from_millis(after));
+            let mut keyframe_requested = false;
+            let arm_deadline = env::var("ARD_PROBE_ARM_TAKE_AT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|after| started_at + Duration::from_millis(after));
+            let mut take_armed = false;
             while Instant::now() < deadline {
+                if let Some(when) = arm_deadline
+                    && !take_armed
+                    && Instant::now() >= when
+                    && let Some(sink) = probe_sink.as_ref()
+                {
+                    take_armed = true;
+                    let origin = TakeOrigin::new();
+                    origin.set(Instant::now());
+                    sink.start_recording(origin);
+                    eprintln!(
+                        "armed a raw-stream take {when:?} into the session: {}",
+                        sink.raw_path(RawStreamKind::Server).display()
+                    );
+                }
+                if let Some(when) = keyframe_deadline
+                    && !keyframe_requested
+                    && Instant::now() >= when
+                {
+                    keyframe_requested = true;
+                    match receive_pump.request_keyframe() {
+                        Ok(()) => println!("requested a keyframe {when:?} into the take"),
+                        Err(error) => println!("keyframe request failed: {error}"),
+                    }
+                }
                 let batch = match receive_pump.receive_timeout(Duration::from_millis(20)) {
                     Some(AvcReceiveEvent::Frame(batch)) => batch,
                     Some(AvcReceiveEvent::Reset(reason)) => {
-                        return Err(io::Error::other(format!(
-                            "live verification prediction chain reset: {reason:?}"
-                        ))
-                        .into());
+                        resets.push(format!("{reason:?}"));
+                        if resets.len() > 32 {
+                            return Err(io::Error::other(format!(
+                                "live verification prediction chain kept resetting: {resets:?}"
+                            ))
+                            .into());
+                        }
+                        continue;
                     }
                     Some(AvcReceiveEvent::Error(error)) => {
                         return Err(io::Error::other(error).into());
@@ -209,6 +455,36 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mut outputs = Vec::with_capacity(batch.access_units.len());
                 for (slice_index, unit) in batch.access_units {
                     access_units += 1;
+                    if let Some(dump) = stream_dump.as_mut() {
+                        dump.push_access_unit(
+                            stream_dump_ordinal,
+                            slice_index,
+                            unit.timestamp,
+                            &unit,
+                        )?;
+                        stream_dump_ordinal += 1;
+                    }
+                    if let Some(path) = es_dump.as_ref()
+                        && es_dump_frames < ES_DUMP_FRAMES
+                    {
+                        // Annex-B dump of every band in the order the decoder
+                        // receives them, for an independent decoder cross-check
+                        // (ffmpeg). The four bands are one serial prediction
+                        // chain, so only the interleaved order is decodable.
+                        // Analysis artifact only: it is written outside the
+                        // repository and never committed.
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            use std::io::Write as _;
+                            let _ = file.write_all(&unit.to_annex_b());
+                        }
+                        if slice_index == 0 {
+                            es_dump_frames += 1;
+                        }
+                    }
                     let decoded = decoder.decode(slice_index, &unit);
                     if decoded.is_empty() && access_units <= 8 {
                         let nal_types = unit
@@ -254,6 +530,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
                 for output_frame in &outputs {
+                    if let Some(dump) = stream_dump.as_mut() {
+                        dump.push_planes(output_frame)?;
+                    }
                     if output_frame.status != 0 {
                         return Err(io::Error::other(format!(
                             "platform decoder callback failed: status={} flags={:#x}",
@@ -309,10 +588,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                     frame_accumulator
                         .apply(composite)
                         .map_err(io::Error::other)?;
+                    if composite_frames == 1 {
+                        frame_accumulator.report_sample_range();
+                    }
+                    // Track this unconditionally: it used to be updated only on
+                    // the verification path, so a long run that never reached its
+                    // frame target always reported `max_non_black=0` and could
+                    // not tell a black screen from a working one.
+                    max_non_black = max_non_black.max(frame_accumulator.non_black_pixels());
+                    // The remote display turns off again after a few idle
+                    // minutes, and the stream then carries black frames. A long
+                    // stability run that only wakes once would spend most of its
+                    // time measuring a black screen, so re-wake (rate limited)
+                    // whenever the picture goes black.
+                    if !wake_disabled
+                        && frame_accumulator.non_black_pixels()
+                            < frame_accumulator.pixel_count() / 100
+                        && last_wake_at
+                            .is_none_or(|at: Instant| at.elapsed() >= Duration::from_secs(20))
+                    {
+                        let _ = input.send_key_event(true, ard_rs::XK_SHIFT_LEFT);
+                        let _ = input.send_key_event(false, ard_rs::XK_SHIFT_LEFT);
+                        last_wake_at = Some(Instant::now());
+                    }
                     let composite_hash = frame_accumulator.signature().ok_or_else(|| {
                         io::Error::other("full four-band frame is not initialized")
                     })?;
-                    if !input_injected && media_age >= Duration::from_secs(2) {
+                    if !input_disabled && !input_injected && media_age >= Duration::from_secs(2) {
                         let click_x = u16::try_from(composite.width * 3 / 4).unwrap_or(u16::MAX);
                         let click_y = u16::try_from(composite.height / 2).unwrap_or(u16::MAX);
                         input_record_before = input.metrics().user_input_records_written;
@@ -356,7 +658,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     && let Some(frame) = composite
                 {
                     let non_black_y = frame_accumulator.non_black_pixels();
-                    max_non_black = max_non_black.max(non_black_y);
                     if non_black_y < frame_accumulator.pixel_count() / 100 {
                         continue;
                     }
@@ -397,7 +698,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .into());
                     }
                     println!(
-                        "verified: codec={codec:?} frames={decoded_frames} composites={composite_frames} changed={changed_frames} dimensions={}x{} RTP_reassembly_p50/p95_ms={:.3}/{:.3} DON_reorder_p50/p95_ms={:.3}/{:.3} release_to_decode_p50/p95_ms={:.3}/{:.3} {response} non_black={non_black} green_dominant={green_dominant} packets={} decrypted={} feedback={} output={output}",
+                        "verified: codec={codec:?} frames={decoded_frames} composites={composite_frames} changed={changed_frames} dimensions={}x{} RTP_reassembly_p50/p95_ms={:.3}/{:.3} DON_reorder_p50/p95_ms={:.3}/{:.3} release_to_decode_p50/p95_ms={:.3}/{:.3} {response} non_black={non_black} green_dominant={green_dominant} packets={} decrypted={} feedback={} resets={resets:?} output={output}",
                         frame.width,
                         frame.height,
                         reassembly.0,
@@ -465,16 +766,44 @@ struct ProbeFrameAccumulator {
     uv_plane: Vec<u8>,
     range: Option<media::YuvRange>,
     matrix: Option<media::YuvMatrix>,
+    primaries: Option<media::YuvPrimaries>,
     slice_versions: [Option<u64>; 4],
     next_version: u64,
 }
 
 impl ProbeFrameAccumulator {
+    /// Report the sample range actually present in the decoded planes.
+    ///
+    /// This settles the limited-vs-full range question with evidence rather
+    /// than from the pixel-format fourcc alone: a limited-range (studio-swing)
+    /// stream keeps luma inside roughly 16..235 and chroma inside 16..240,
+    /// while a full-range stream reaches 0 and 255.
+    fn report_sample_range(&self) {
+        if self.y_plane.is_empty() {
+            return;
+        }
+        let luma_min = *self.y_plane.iter().min().expect("non-empty luma plane");
+        let luma_max = *self.y_plane.iter().max().expect("non-empty luma plane");
+        let luma_mean = self.y_plane.iter().map(|v| u64::from(*v)).sum::<u64>() as f64
+            / self.y_plane.len() as f64;
+        let chroma_min = *self.uv_plane.iter().min().expect("non-empty chroma plane");
+        let chroma_max = *self.uv_plane.iter().max().expect("non-empty chroma plane");
+        let chroma_mean = self.uv_plane.iter().map(|v| u64::from(*v)).sum::<u64>() as f64
+            / self.uv_plane.len() as f64;
+        println!(
+            "sample range: luma min={luma_min} max={luma_max} mean={luma_mean:.1}  \
+             chroma min={chroma_min} max={chroma_max} mean={chroma_mean:.1}  \
+             declared_range={:?} matrix={:?} primaries={:?}",
+            self.range, self.matrix, self.primaries,
+        );
+    }
+
     fn apply(&mut self, frame: &media::DecodedFrame) -> Result<(), String> {
         if self.width != frame.width
             || self.height != frame.height
             || self.range != Some(frame.range)
             || self.matrix != Some(frame.matrix)
+            || self.primaries != Some(frame.primaries)
         {
             self.width = frame.width;
             self.height = frame.height;
@@ -486,6 +815,7 @@ impl ProbeFrameAccumulator {
                 vec![128; uv_row_bytes.saturating_mul(frame.height.div_ceil(2) as usize)];
             self.range = Some(frame.range);
             self.matrix = Some(frame.matrix);
+            self.primaries = Some(frame.primaries);
             self.slice_versions = [None; 4];
             self.next_version = 0;
         }
@@ -614,14 +944,38 @@ fn probe_full_framebuffer(
     let mut input_injected = false;
     let mut rgba = Vec::new();
     let mut max_non_black = 0usize;
+    let mut metadata_only_frames = 0usize;
+    // The remote display sleeps after a few idle minutes and the resulting
+    // framebuffer is black; wake it the same way the media-stream path does.
+    if std::env::var_os("ARD_PROBE_NO_WAKE").is_none() {
+        let _ = client.send_key_event(true, ard_rs::XK_SHIFT_LEFT);
+        let _ = client.send_key_event(false, ard_rs::XK_SHIFT_LEFT);
+        thread::sleep(Duration::from_millis(400));
+    }
     while Instant::now() < deadline {
-        if !matches!(client.next_event()?, ArdClientEvent::Frame(_)) {
+        let event = client.next_event()?;
+        if !matches!(event, ArdClientEvent::Frame(_)) {
+            if frames == 0 && changed < 8 {
+                changed += 1;
+                eprintln!("conventional probe: server event before any frame: {event:?}");
+            }
             continue;
         }
-        if !framebuffer_to_rgba(client.framebuffer(), &mut rgba) {
-            return Err(io::Error::other("unsupported conventional framebuffer format").into());
-        }
         frames += 1;
+        if !framebuffer_to_rgba(client.framebuffer(), &mut rgba) {
+            // The GPU MVS profiles keep pixels as tiles rather than in the CPU
+            // framebuffer, so this diagnostic cannot render them. Counting the
+            // frame is still the answer to "does the server deliver image
+            // rectangles at all", which is what debugging the RFB path needs.
+            if frames == 1 {
+                println!(
+                    "conventional probe: frame 1 arrived but has no CPU framebuffer \
+                     (GPU tile path); counting frames only"
+                );
+            }
+            metadata_only_frames += 1;
+            continue;
+        }
         let hash: [u8; 32] = Sha256::digest(&rgba).into();
         let non_black = rgba
             .chunks_exact(4)
@@ -652,6 +1006,13 @@ fn probe_full_framebuffer(
             );
             return Ok(());
         }
+    }
+    if metadata_only_frames != 0 {
+        println!(
+            "conventional probe: {metadata_only_frames} image frame(s) arrived but the framebuffer \
+             is GPU-tile backed, so no pixels could be checked"
+        );
+        return Ok(());
     }
     Err(io::Error::other(format!(
         "conventional probe timed out: frames={frames} changed={changed} input_injected={input_injected} max_non_black={max_non_black}"

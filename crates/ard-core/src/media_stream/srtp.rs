@@ -111,13 +111,106 @@ impl SrtcpContext {
         self.protect_rtcp(packet)
     }
 
-    /// Create the native 26-byte receiver report for one simulcast SSRC.
-    /// The remote SSRC is the four-byte encrypted RTCP payload.
-    pub fn protect_receiver_report(&mut self, remote_ssrc: u32) -> Result<Vec<u8>> {
-        let mut packet = Vec::with_capacity(12);
-        packet.extend_from_slice(&[0x80, 0xc0, 0x00, 0x02]);
+    /// Create the 28-byte Apple rate-control feedback packet for one received
+    /// stream.
+    ///
+    /// This is the shape `-[VCVideoStreamRateAdaptationFeedbackOnly
+    /// sendRateControlFeedback]` produces and the shape the peer's
+    /// `__RTCPTransport_ParsePacket` reader expects: an RTCP header, then one
+    /// 24-byte record of `four-byte source SSRC` followed by a 20-byte
+    /// `VCMediaControlInfo` payload, with the packet sized `28 + 24 * RC`.
+    ///
+    /// The width is not cosmetic. The reader consumes a fixed 20-byte payload
+    /// from whichever packet arrives, so the 12-byte packet this client used to
+    /// send every second left it reading sixteen bytes from outside the packet —
+    /// whatever followed in its receive buffer — and feeding those bytes to the
+    /// rate controller every second.
+    ///
+    /// The payload fields follow what the native builder puts where, which
+    /// `__AVCStatisticsCollector_GetVCStatisticsWithType` types 7 and 10 fill:
+    ///
+    /// | payload | native source                          | here |
+    /// |---------|----------------------------------------|------|
+    /// | `+0x00` | rate-control state, packed pair        | `0` |
+    /// | `+0x02` | `[collector+0x54] / 1000`, i.e. kbit/s | measured receive rate in kbit/s |
+    /// | `+0x04` | `[collector+0x60]`, reset after report | datagrams received in the interval |
+    /// | `+0x06` | rate-control state                     | `0` |
+    /// | `+0x08`, `+0x0c` | never written by the builder  | `0` |
+    /// | `+0x10` | `stats+0x40 * 1000`, and no statistics type writes `+0x40` | `0` |
+    ///
+    /// `+0x02` and `+0x04` are the two the feedback loop runs on, and the reason
+    /// this packet reports the interval's own counters rather than a running
+    /// total: the native reader compares consecutive reports, and the collector
+    /// clears `[collector+0x60]` the moment it has been reported.
+    pub fn protect_rate_control_feedback(
+        &mut self,
+        remote_ssrc: u32,
+        receive_bits_per_second: u32,
+        received_datagrams: u32,
+    ) -> Result<Vec<u8>> {
+        /// The payload the native builder fills from `VCRateControlGetStatistics`.
+        const PAYLOAD_LEN: usize = 20;
+        /// The record's own SSRC field followed by that payload.
+        const RECORD_LEN: usize = 4 + PAYLOAD_LEN;
+        /// RTCP header plus one record: `28 + 24 * RC` for RC = 0.
+        const PACKET_LEN: usize = 4 + RECORD_LEN;
+        /// The payload's kbit/s field, relative to the payload start.
+        const RATE_OFFSET: usize = 0x02;
+        /// The payload's per-interval datagram counter.
+        const COUNT_OFFSET: usize = 0x04;
+
+        let mut packet = Vec::with_capacity(PACKET_LEN);
+        // V=2, RC=0 (one record), PT=192, length in 32-bit words minus one.
+        packet.extend_from_slice(&[0x80, 0xc0, 0x00, (PACKET_LEN / 4 - 1) as u8]);
+        packet.extend_from_slice(&remote_ssrc.to_be_bytes());
+        packet.resize(PACKET_LEN, 0);
+
+        let payload = 8;
+        let kbit_per_second = u16::try_from(receive_bits_per_second / 1000).unwrap_or(u16::MAX);
+        packet[payload + RATE_OFFSET..payload + RATE_OFFSET + 2]
+            .copy_from_slice(&kbit_per_second.to_be_bytes());
+        let datagrams = u16::try_from(received_datagrams).unwrap_or(u16::MAX);
+        packet[payload + COUNT_OFFSET..payload + COUNT_OFFSET + 2]
+            .copy_from_slice(&datagrams.to_be_bytes());
+        self.protect_rtcp(packet)
+    }
+
+    /// Create an RFC 3550 receiver report carrying one report block.
+    ///
+    /// `__VideoReceiver_SendRTCP` reaches `_RTPSendRTCP`, which adds these
+    /// blocks through `__RTCPAddReportPacket` and byte-swaps 24-byte blocks for
+    /// PT 201 packets; this client's stream keys are per band, so it sends one
+    /// packet per received stream, each with a single block naming that stream's
+    /// source SSRC.
+    ///
+    /// The viewer sends no sender reports, so `LSR` and `DLSR` — the echo of the
+    /// peer's last sender report and the delay since it — stay zero, which
+    /// RFC 3550 defines as "no report received yet".
+    pub fn protect_receiver_report(
+        &mut self,
+        remote_ssrc: u32,
+        fraction_lost: u8,
+        cumulative_lost: i32,
+        highest_sequence: u32,
+        jitter: u32,
+    ) -> Result<Vec<u8>> {
+        /// Header plus the packet sender's SSRC plus one 24-byte report block.
+        const PACKET_LEN: usize = 4 + 4 + 24;
+
+        let mut packet = Vec::with_capacity(PACKET_LEN);
+        // V=2, RC=1 (one report block), PT=201, length in 32-bit words minus one.
+        packet.extend_from_slice(&[0x81, 0xc9, 0x00, (PACKET_LEN / 4 - 1) as u8]);
         packet.extend_from_slice(&self.sender_ssrc.to_be_bytes());
         packet.extend_from_slice(&remote_ssrc.to_be_bytes());
+        // Fraction lost is 0..=255; cumulative lost is a signed 24-bit count.
+        packet.push(fraction_lost);
+        packet.extend_from_slice(&(cumulative_lost as u32).to_be_bytes()[1..]);
+        packet.extend_from_slice(&highest_sequence.to_be_bytes());
+        packet.extend_from_slice(&jitter.to_be_bytes());
+        // LSR and DLSR: no sender report has been received from the peer.
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        debug_assert_eq!(packet.len(), PACKET_LEN);
         self.protect_rtcp(packet)
     }
 
@@ -804,30 +897,113 @@ mod tests {
         assert_eq!(&first[12..], &expected[..AUTH_TAG_LEN]);
     }
 
+    /// The feedback packet has to be the full 28 bytes the peer's reader
+    /// consumes, with the source SSRC in the record's own field, the receive
+    /// rate in the payload's kbit/s field and the interval's datagram count in
+    /// the counter field the native builder fills from statistics the collector
+    /// clears after every report. A shorter packet leaves that reader reading
+    /// bytes from outside the packet.
     #[test]
-    fn encrypts_native_srtcp_receiver_report_payload() {
+    fn protects_the_full_rate_control_feedback_record() {
         let blob = [0x5au8; MEDIA_STREAM_KEY_LEN];
         let local_ssrc = 0xb5ff_003e;
         let remote_ssrc = 0x6405_c090;
+        let receive_bps = 18_000_000;
+        let datagrams = 4_242;
         let mut context =
             SrtcpContext::from_key_blob_with_sender_ssrc(&blob, local_ssrc).expect("context");
         let packet = context
-            .protect_receiver_report(remote_ssrc)
-            .expect("receiver report");
+            .protect_rate_control_feedback(remote_ssrc, receive_bps, datagrams)
+            .expect("feedback");
 
-        assert_eq!(packet.len(), 26);
-        assert_eq!(&packet[..8], &[0x80, 0xc0, 0, 2, 0xb5, 0xff, 0, 0x3e]);
-        assert_ne!(&packet[8..12], &remote_ssrc.to_be_bytes());
-        let keystream = context.keystream(1, 4);
-        let decrypted: Vec<_> = packet[8..12]
+        // 28 bytes of packet plus the SRTCP index and authentication tag.
+        assert_eq!(packet.len(), 28 + 4 + AUTH_TAG_LEN);
+        assert_eq!(&packet[..4], &[0x80, 0xc0, 0, 6]);
+        // SRTCP leaves the header and the record's source SSRC in the clear and
+        // encrypts the 20-byte payload that follows.
+        assert_eq!(&packet[4..8], &remote_ssrc.to_be_bytes());
+
+        let keystream = context.keystream(1, 20);
+        let decrypted: Vec<_> = packet[8..28]
             .iter()
             .zip(keystream)
             .map(|(byte, key)| byte ^ key)
             .collect();
-        assert_eq!(decrypted, remote_ssrc.to_be_bytes());
-        assert_eq!(&packet[12..16], &0x8000_0001u32.to_be_bytes());
-        let expected = hmac_sha1(&context.material.authentication_key, &packet[..16]);
-        assert_eq!(&packet[16..], &expected[..AUTH_TAG_LEN]);
+        assert_eq!(
+            u16::from_be_bytes([decrypted[0x02], decrypted[0x03]]),
+            18_000,
+            "the payload's kbit/s field carries the measured receive rate",
+        );
+        assert_eq!(
+            u16::from_be_bytes([decrypted[0x04], decrypted[0x05]]),
+            datagrams as u16,
+            "the payload's counter field carries this interval's datagrams",
+        );
+        for offset in [
+            0x00, 0x01, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        ] {
+            assert_eq!(
+                decrypted[offset], 0,
+                "offset {offset:#x} is a field this client does not fill",
+            );
+        }
+        assert_eq!(
+            &decrypted[0x10..0x14],
+            &[0, 0, 0, 0],
+            "the native builder leaves this field zero, so this client does too",
+        );
+
+        assert_eq!(&packet[28..32], &0x8000_0001u32.to_be_bytes());
+        let expected = hmac_sha1(&context.material.authentication_key, &packet[..32]);
+        assert_eq!(&packet[32..], &expected[..AUTH_TAG_LEN]);
+    }
+
+    /// The receiver report is the standard loss and jitter feedback the peer's
+    /// `_RTPSendRTCP` path builds and its 24-byte report-block reader expects:
+    /// one block naming the source SSRC, the interval's fraction lost, the
+    /// cumulative count, the extended highest sequence and the jitter estimate.
+    #[test]
+    fn protects_a_one_block_receiver_report() {
+        let blob = [0x77u8; MEDIA_STREAM_KEY_LEN];
+        let local_ssrc = 0x1111_2222;
+        let remote_ssrc = 0x6405_c090;
+        let mut context =
+            SrtcpContext::from_key_blob_with_sender_ssrc(&blob, local_ssrc).expect("context");
+        let packet = context
+            .protect_receiver_report(remote_ssrc, 12, -3, 40_000, 7)
+            .expect("report");
+
+        // 32 bytes of packet plus the SRTCP index and authentication tag.
+        assert_eq!(packet.len(), 32 + 4 + AUTH_TAG_LEN);
+        assert_eq!(&packet[..4], &[0x81, 0xc9, 0x00, 0x07]);
+        // SRTCP leaves the 8-byte header in the clear: header, then the packet
+        // sender's SSRC.
+        assert_eq!(&packet[4..8], &local_ssrc.to_be_bytes());
+
+        let keystream = context.keystream(1, 24);
+        let decrypted: Vec<_> = packet[8..32]
+            .iter()
+            .zip(keystream)
+            .map(|(byte, key)| byte ^ key)
+            .collect();
+        assert_eq!(&decrypted[0..4], &remote_ssrc.to_be_bytes());
+        assert_eq!(decrypted[4], 12, "fraction lost");
+        assert_eq!(
+            &decrypted[5..8],
+            &(-3i32 as u32).to_be_bytes()[1..],
+            "cumulative lost is a signed 24-bit count",
+        );
+        assert_eq!(&decrypted[8..12], &40_000u32.to_be_bytes());
+        assert_eq!(&decrypted[12..16], &7u32.to_be_bytes());
+        assert_eq!(
+            &decrypted[16..24],
+            &[0u8; 8],
+            "no sender report has arrived, so LSR and DLSR stay zero",
+        );
+
+        assert_eq!(&packet[32..36], &0x8000_0001u32.to_be_bytes());
+        let expected = hmac_sha1(&context.material.authentication_key, &packet[..36]);
+        assert_eq!(&packet[36..], &expected[..AUTH_TAG_LEN]);
     }
 
     #[test]

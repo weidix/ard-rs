@@ -170,21 +170,24 @@ fn full_mvs_packet(header: [u8; 2], fields: &[(u32, u8)]) -> Vec<u8> {
 
 #[test]
 fn parses_apple_type_30_authentication_messages() {
-    let mut challenge = vec![0, 2, 0, 4];
-    challenge.extend_from_slice(&[0xf1, 0x23, 0x45, 0x67]);
-    challenge.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+    // The native client accepts a modulus width of 64..=1024 bytes, so use the
+    // smallest realistic width rather than a toy one the native code rejects.
+    let key = [0xf1_u8; 64];
+    let mut challenge = vec![0, 2, 0, 64];
+    challenge.extend_from_slice(&key);
+    challenge.extend_from_slice(&[0x01; 64]);
     let (challenge, consumed) = parse_ard_auth_challenge(&challenge, 512).unwrap();
-    assert_eq!(consumed, 12);
+    assert_eq!(consumed, 132);
     assert_eq!(challenge.generator, 2);
-    assert_eq!(challenge.prime, [0xf1, 0x23, 0x45, 0x67]);
-    assert_eq!(challenge.server_public_key, [1, 2, 3, 4]);
+    assert_eq!(challenge.prime, key);
+    assert_eq!(challenge.server_public_key, [0x01; 64]);
 
     let mut response = vec![0xa5; 128];
-    response.extend_from_slice(&[5, 6, 7, 8]);
-    let (response, consumed) = parse_ard_auth_response(&response, 4, 512).unwrap();
-    assert_eq!(consumed, 132);
+    response.extend_from_slice(&key);
+    let (response, consumed) = parse_ard_auth_response(&response, 64, 512).unwrap();
+    assert_eq!(consumed, 192);
     assert_eq!(response.encrypted_credentials, [0xa5; 128]);
-    assert_eq!(response.client_public_key, [5, 6, 7, 8]);
+    assert_eq!(response.client_public_key, key);
 }
 
 #[test]
@@ -201,6 +204,12 @@ fn parses_live_apple_client_initialization_extensions() {
 
 #[test]
 fn bounds_apple_type_30_authentication_keys() {
+    // Below the native floor of 64 bytes.
+    assert_eq!(
+        parse_ard_auth_challenge(&[0, 2, 0, 63], 128).unwrap_err(),
+        Error::Invalid("ARD authentication key is too short")
+    );
+    // Above the caller-supplied ceiling.
     assert_eq!(
         parse_ard_auth_challenge(&[0, 2, 2, 0], 128).unwrap_err(),
         Error::LimitExceeded("ARD authentication key")
@@ -1104,7 +1113,12 @@ fn decodes_zero_limit_mvs_differential_baseline() {
         &[
             (1, 2),
             (0, 6), // new compact length one
-            (0, 4), // refine the baseline coefficient at scan one (discarded)
+            // The native expansion writes the differential range as
+            // `old_count..new_count`, so with an empty baseline it refines scan
+            // 0 (the DC) rather than scan 1. An empty baseline coefficient is
+            // coded as a Rice DC record, and a zero Rice DC is the two-bit
+            // prefix/suffix pair `00`.
+            (0, 2), // zero Rice DC baseline for scan zero
             (0, 1), // unchanged Cr DC
             (0, 1), // unchanged Cb DC
         ],
@@ -1695,6 +1709,26 @@ fn apple_metadata_and_cursor_pseudo_encodings_are_bounded_noops() {
             .unwrap(),
         8
     );
+
+    // A system-defined cursor (id <= 999) is only four bytes: the native client
+    // resolves it locally and reads no length or image data. Requiring an
+    // eight-byte payload reported "need more" for bytes that never arrive, which
+    // stalled the stream.
+    let system_cursor = decoder
+        .decode_rectangle(cached_cursor, &7_u32.to_be_bytes(), &mut framebuffer)
+        .unwrap();
+    assert_eq!(system_cursor, 4);
+    assert_eq!(
+        decoder
+            .decode_rectangle(cached_cursor, &999_u32.to_be_bytes(), &mut framebuffer)
+            .unwrap(),
+        4
+    );
+    // A truncated id is still a genuine truncation.
+    assert!(matches!(
+        decoder.decode_rectangle(cached_cursor, &[0, 0, 1], &mut framebuffer),
+        Err(Error::NeedMore { needed: 4, .. })
+    ));
 
     for encoding in [
         Encoding::ArdVendorKeysyms,

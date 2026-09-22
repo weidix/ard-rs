@@ -10,11 +10,11 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use ard_rs::ArdMediaStream;
-use ard_rs::media_stream::UdpStreamKind;
 use ard_rs::media_stream::udp::{
     AVC_VIDEO_SLICE_COUNT, AvcFrameBatch, AvcStreamCrypto, AvcVideoStreamReceiver,
 };
+use ard_rs::media_stream::{MediaStreamCodec, UdpStreamKind};
+use ard_rs::{ArdMediaStream, MediaDetails, RawStreamKind, RawStreamSink};
 
 #[cfg(target_os = "windows")]
 use super::mft::MftDecoder as PlatformVideoDecoder;
@@ -22,7 +22,7 @@ use super::mft::MftDecoder as PlatformVideoDecoder;
 use super::vt::VideoToolboxDecoder as PlatformVideoDecoder;
 use super::{
     AvcFrameTiming, DecodedFrame, DecodedOutput, DecodedSlice, DecodedSliceUpdate, YuvMatrix,
-    YuvRange,
+    YuvPrimaries, YuvRange,
 };
 
 /// Allows VideoToolbox/MFT one bounded startup window to create its hardware
@@ -266,7 +266,12 @@ impl AvcReceivePump {
         self.queue.pop_timeout(timeout)
     }
 
-    pub(crate) fn request_keyframe(&self) -> Result<(), String> {
+    /// Ask the server for a fresh IRAP.
+    ///
+    /// The receive pump already does this when the decoder falls behind; a
+    /// caller that starts a recording does it so the take begins at a keyframe
+    /// and its raw dump can be decoded on its own.
+    pub fn request_keyframe(&self) -> Result<(), String> {
         self.queue.reset(AvcReceiveResetReason::DecoderRequested);
         self.commands
             .send(())
@@ -297,6 +302,7 @@ pub fn spawn_avc_video_pipeline(
     media: ArdMediaStream,
     target_dimensions: (u32, u32),
     stop: Arc<AtomicBool>,
+    raw_stream: Option<Arc<RawStreamSink>>,
     mut on_frame: impl FnMut(Result<DecodedFrame, String>) + Send + 'static,
 ) -> JoinHandle<()> {
     thread::Builder::new()
@@ -319,6 +325,23 @@ pub fn spawn_avc_video_pipeline(
                 return;
             };
             let negotiated_dimensions = codec_config.width.zip(codec_config.height);
+            // The codec and payload type are agreed once and never repeated in a
+            // packet, so the dump records them for a rebuild.
+            if let Some(sink) = raw_stream.as_ref() {
+                // The compositor's frame size is what a rebuild needs: the
+                // negotiated size is often absent from the answer, and the bands
+                // only make sense against the frame they tile.
+                sink.describe_stream(
+                    RawStreamKind::Video,
+                    MediaDetails {
+                        codec: codec_config.encoding_name.clone(),
+                        payload_type: Some(payload_type),
+                        codec_type: codec_config.codec_type,
+                        width: Some(target_dimensions.0),
+                        height: Some(target_dimensions.1),
+                    },
+                );
+            }
             let receiver = match AvcVideoStreamReceiver::new(
                 &endpoints,
                 UdpStreamKind::Video1,
@@ -330,6 +353,7 @@ pub fn spawn_avc_video_pipeline(
                 },
                 codec,
                 payload_type,
+                raw_stream.clone(),
             ) {
                 Ok(receiver) => receiver,
                 Err(error) => {
@@ -458,10 +482,10 @@ pub fn spawn_avc_video_pipeline(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PendingFrameTiming {
-    first_packet_received_at: Instant,
-    first_access_unit_completed_at: Instant,
-    batch_released_at: Instant,
+pub(crate) struct PendingFrameTiming {
+    pub(crate) first_packet_received_at: Instant,
+    pub(crate) first_access_unit_completed_at: Instant,
+    pub(crate) batch_released_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -470,7 +494,7 @@ struct PendingDecodeBatch {
     timing: PendingFrameTiming,
 }
 
-struct DecoderOutputAssembler {
+pub(crate) struct DecoderOutputAssembler {
     compositor: SliceCompositor,
     pending: HashMap<u32, PendingDecodeBatch>,
     active_timestamp: Option<u32>,
@@ -479,7 +503,10 @@ struct DecoderOutputAssembler {
 }
 
 impl DecoderOutputAssembler {
-    fn new(target_dimensions: (u32, u32), negotiated_dimensions: Option<(u32, u32)>) -> Self {
+    pub(crate) fn new(
+        target_dimensions: (u32, u32),
+        negotiated_dimensions: Option<(u32, u32)>,
+    ) -> Self {
         Self {
             compositor: SliceCompositor::new(target_dimensions),
             pending: HashMap::new(),
@@ -489,7 +516,7 @@ impl DecoderOutputAssembler {
         }
     }
 
-    fn register_batch(
+    pub(crate) fn register_batch(
         &mut self,
         timestamp: u32,
         expected_outputs: usize,
@@ -517,7 +544,10 @@ impl DecoderOutputAssembler {
         Ok(())
     }
 
-    fn push(&mut self, outputs: Vec<DecodedOutput>) -> Result<Vec<DecodedFrame>, String> {
+    pub(crate) fn push(
+        &mut self,
+        outputs: Vec<DecodedOutput>,
+    ) -> Result<Vec<DecodedFrame>, String> {
         let mut frames = Vec::new();
         for output in outputs {
             if let Some(error) = output.conversion_error {
@@ -597,6 +627,13 @@ impl DecoderOutputAssembler {
     }
 }
 
+/// The platform video decoder, for a caller that decodes outside the live
+/// socket loop — the rebuild path, which has to turn dumped packets back into
+/// the same pictures the live pipeline produced.
+pub(crate) fn platform_decoder(codec: MediaStreamCodec) -> PlatformVideoDecoder {
+    PlatformVideoDecoder::new(codec)
+}
+
 pub(crate) struct SliceCompositor {
     metadata: [Option<SliceMetadata>; AVC_VIDEO_SLICE_COUNT],
     pending: [Option<DecodedSlice>; AVC_VIDEO_SLICE_COUNT],
@@ -611,6 +648,7 @@ struct SliceMetadata {
     height: u32,
     range: YuvRange,
     matrix: YuvMatrix,
+    primaries: YuvPrimaries,
 }
 
 impl From<&DecodedSlice> for SliceMetadata {
@@ -620,6 +658,7 @@ impl From<&DecodedSlice> for SliceMetadata {
             height: frame.height,
             range: frame.range,
             matrix: frame.matrix,
+            primaries: frame.primaries,
         }
     }
 }
@@ -699,6 +738,7 @@ impl SliceCompositor {
                 || metadata.height != first.height
                 || metadata.range != first.range
                 || metadata.matrix != first.matrix
+                || metadata.primaries != first.primaries
             {
                 return Err(format!("AVC 分片 {index} 的 NV12 布局或色彩矩阵不一致"));
             }
@@ -743,6 +783,7 @@ impl SliceCompositor {
         let mut layouts = [(0, 0, 0, 0); AVC_VIDEO_SLICE_COUNT];
         let range = first.range;
         let matrix = first.matrix;
+        let primaries = first.primaries;
         for (index, metadata) in self.metadata.iter().enumerate() {
             let metadata = metadata.as_ref().expect("all slice metadata validated");
             let rows = metadata.height.min(remaining_y_rows);
@@ -786,6 +827,7 @@ impl SliceCompositor {
             encoded_bytes: std::mem::take(&mut self.pending_encoded_bytes),
             range,
             matrix,
+            primaries,
             updates,
             timing: None,
         }))
@@ -853,6 +895,7 @@ mod tests {
             uv_plane: vec![128; 2],
             range: super::super::YuvRange::Video,
             matrix: super::super::YuvMatrix::Bt709,
+            primaries: super::super::YuvPrimaries::Bt709,
         }
     }
 
@@ -864,6 +907,7 @@ mod tests {
             uv_plane: vec![128; 2],
             range: super::super::YuvRange::Video,
             matrix: super::super::YuvMatrix::Bt709,
+            primaries: super::super::YuvPrimaries::Bt709,
         }
     }
 
@@ -1000,6 +1044,7 @@ mod tests {
                 uv_plane: vec![128; 16],
                 range: YuvRange::Video,
                 matrix: YuvMatrix::Bt709,
+                primaries: YuvPrimaries::Bt709,
             };
             if index == 3 {
                 frame.y_plane[24..].fill(255);
@@ -1043,6 +1088,7 @@ mod tests {
                 uv_plane: vec![128; 14],
                 range: YuvRange::Video,
                 matrix: YuvMatrix::Bt709,
+                primaries: YuvPrimaries::Bt709,
             };
             compositor
                 .push(index, 1, Some(frame))

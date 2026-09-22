@@ -279,7 +279,13 @@ impl MvsState {
             .ok_or(Error::LimitExceeded("ARD MVS tile count"))?;
         let mut tile_index = 0_usize;
         let mut first_color = MvsPixel::Rgba([255, 255, 255, 255]);
-        let mut second_color = MvsPixel::Rgba([254, 213, 181, 255]);
+        // The native default second colour is the word 0x00B5D5FE. The native
+        // tile buffer is BGRA in memory (`_ycc_xrgb_convert32to32` builds
+        // `(B << 24) | (G << 16) | (R << 8) | 0xff` and `_PerformInverseDCT8By8`
+        // byte-swaps every pixel), matching `PixelFormat::XRGB8888` on a
+        // little-endian host. The memory bytes are therefore B=0xFE, G=0xD5,
+        // R=0xB5, i.e. RGB (181, 213, 254) — not the byte-reversed triplet.
+        let mut second_color = MvsPixel::Rgba([0xB5, 0xD5, 0xFE, 255]);
         let mut solid_color = MvsPixel::Rgba([0, 0, 0, 255]);
         // ExpandBlockRice's previous-block pointer is initialized to null for
         // each partial update and advances only within this rectangle.
@@ -690,24 +696,23 @@ fn decode_full_differential_tile(
                 signed_delta(old, bits.read(3)? as u8)
             };
         }
-        // Scan 0 is the luma DC value copied above. The native coefficient
-        // expansion continues from the shared range (position 1 when the
-        // previous block is empty), so its loop covers new_count - old_count
-        // records. When the previous block has zero active coefficients this
-        // extends one position past new_count; that extra record is still
-        // consumed from the stream even though it falls outside the block.
-        let start = old_count.max(1);
-        let end = start + new_count - old_count;
-        for scan in start..end {
-            let old = old_scan_values[scan.min(63)];
+        // Coefficient expansion continues from the shared range. The native
+        // loop uses the baseline count itself as both the destination scan index
+        // (`w27`, written through `natural_order[w27]`) and, because the
+        // baseline pointer advances only by the coefficients loop 1 consumed,
+        // the baseline read index. Both therefore run `old_count..new_count`.
+        //
+        // Starting at `old_count.max(1)` instead skipped scan 0 and consumed one
+        // extra record whenever the baseline was empty, which both misplaced
+        // every coefficient and desynchronised the bitstream.
+        for scan in old_count..new_count {
+            let old = old_scan_values[scan];
             let value = if old == 0 {
                 decode_dc_rice(bits)? as i8
             } else {
                 signed_delta(old, bits.read(4)? as u8)
             };
-            if scan < 64 {
-                scan_values[scan] = value;
-            }
+            scan_values[scan] = value;
         }
     } else {
         for scan in 1..shared_end {

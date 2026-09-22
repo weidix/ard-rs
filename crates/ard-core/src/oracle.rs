@@ -163,7 +163,6 @@ pub struct Oracle {
     pub server_clipboard_text: Option<Vec<u8>>,
     pub allowed_peer: Option<IpAddr>,
     pub require_encryption: bool,
-    pub expect_security_selection: bool,
     pub max_client_messages: usize,
     pub close_after_frames: Option<usize>,
     pub mode: OracleMode,
@@ -187,7 +186,6 @@ impl Default for Oracle {
             server_clipboard_text: None,
             allowed_peer: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             require_encryption: true,
-            expect_security_selection: true,
             max_client_messages: 64,
             close_after_frames: None,
             mode: OracleMode::Auto,
@@ -355,7 +353,103 @@ impl Oracle {
                 &mut report.server_to_client_records,
             )?;
         }
+        // Encrypted records arrive as `u16 length` followed by `length` bytes.
+        //
+        // The wire bytes are accumulated in `wire` and only consumed once a
+        // whole record is present. Framing must never read straight into a
+        // fixed-size buffer with `read_exact` and a read timeout: when the
+        // deadline expires after some bytes have already been consumed,
+        // `read_exact` reports `WouldBlock` and those bytes are lost, which
+        // desynchronises every later record. That is what made the input tests
+        // fail intermittently under load (a whole message, usually the
+        // clipboard, silently disappeared from the report).
+        let mut wire: Vec<u8> = Vec::new();
+        let mut scratch = [0_u8; 8192];
         loop {
+            // Framing runs *before* the automatic frame pump so a client message
+            // that has already arrived is always handled before another frame is
+            // written. Pumping frames first let a busy server starve the
+            // client->server direction, which is another way the input tests
+            // lost their final message under load.
+            if wire.len() >= 2 {
+                let cipher_len = usize::from(u16::from_be_bytes([wire[0], wire[1]]));
+                if cipher_len == 0 || !cipher_len.is_multiple_of(16) {
+                    return Err(io::Error::other("invalid encrypted-record length"));
+                }
+                if wire.len() >= 2 + cipher_len {
+                    let record: Vec<u8> = wire.drain(..2 + cipher_len).skip(2).collect();
+                    plaintext
+                        .extend_from_slice(&decoder.decode(&record).map_err(io::Error::other)?);
+                    report.client_to_server_records += 1;
+
+                    while let Some(message_len) = encrypted_client_message_len(&plaintext)? {
+                        let message: Vec<_> = plaintext.drain(..message_len).collect();
+                        report.client_message_types.push(message[0]);
+                        record_client_message(&message, &mut report);
+                        match message[0] {
+                            3 if frames.is_some() => {
+                                if !self.send_next_frame(
+                                    &mut stream,
+                                    &mut encoder,
+                                    frames.as_mut().unwrap(),
+                                    &mut report,
+                                )? {
+                                    return Ok(report);
+                                }
+                            }
+                            3 if media.is_some() => {
+                                let bootstrap =
+                                    media.as_ref().unwrap().bootstrap(self.width, self.height);
+                                write_encrypted_message(
+                                    &mut stream,
+                                    &mut encoder,
+                                    &bootstrap,
+                                    &mut report.server_to_client_records,
+                                )?;
+                            }
+                            9 if frames.is_some() => {
+                                automatic = true;
+                                next_frame_at = Instant::now() + self.frame_interval;
+                            }
+                            0x1c if media.is_some() => {
+                                let configuration = MediaStreamConfiguration::parse(&message)
+                                    .map_err(io::Error::other)?
+                                    .0;
+                                let (answer, codec) = media.as_mut().unwrap().answer(
+                                    configuration,
+                                    &self.fixtures,
+                                    self.frame_interval,
+                                    self.close_after_frames,
+                                )?;
+                                report.selected_mode = Some(match codec {
+                                    MediaStreamCodec::H264 => OracleMode::H264,
+                                    MediaStreamCodec::Hevc => OracleMode::Hevc,
+                                });
+                                write_encrypted_message(
+                                    &mut stream,
+                                    &mut encoder,
+                                    &answer,
+                                    &mut report.server_to_client_records,
+                                )?;
+                                report.media_configuration_received = true;
+                            }
+                            0x1d if media.is_some() => {
+                                // A media-stream request may carry the display
+                                // configuration; the codec is chosen by the
+                                // offer handled in the 0x1c arm.
+                            }
+                            _ => {}
+                        }
+                        if report.client_message_types.len() >= self.max_client_messages {
+                            return Ok(report);
+                        }
+                    }
+                    // A single TCP read can carry several records; frame the
+                    // next one without blocking on another read.
+                    continue;
+                }
+            }
+
             if automatic && let Some(frames) = frames.as_mut() {
                 let now = Instant::now();
                 if now >= next_frame_at {
@@ -370,85 +464,21 @@ impl Oracle {
                 stream.set_read_timeout(None)?;
             }
 
-            let mut length = [0_u8; 2];
-            match stream.read_exact(&mut length) {
-                Ok(()) => {}
+            match stream.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(read) => wire.extend_from_slice(&scratch[..read]),
                 Err(error)
                     if matches!(
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
+                    // `read` either moved whole bytes into `scratch` or nothing
+                    // at all, so a timeout can never lose framed data.
                     continue;
                 }
                 Err(error) if connection_closed(&error) => break,
                 Err(error) => return Err(error),
-            }
-            let cipher_len = usize::from(u16::from_be_bytes(length));
-            eprintln!("oracle transport: next record length {cipher_len}");
-            if cipher_len == 0 || !cipher_len.is_multiple_of(16) {
-                return Err(io::Error::other("invalid encrypted-record length"));
-            }
-            let mut ciphertext = vec![0_u8; cipher_len];
-            stream.read_exact(&mut ciphertext)?;
-            plaintext.extend_from_slice(&decoder.decode(&ciphertext).map_err(io::Error::other)?);
-            report.client_to_server_records += 1;
-
-            while let Some(message_len) = encrypted_client_message_len(&plaintext)? {
-                let message: Vec<_> = plaintext.drain(..message_len).collect();
-                report.client_message_types.push(message[0]);
-                record_client_message(&message, &mut report);
-                match message[0] {
-                    3 if frames.is_some() => {
-                        if !self.send_next_frame(
-                            &mut stream,
-                            &mut encoder,
-                            frames.as_mut().unwrap(),
-                            &mut report,
-                        )? {
-                            return Ok(report);
-                        }
-                    }
-                    3 if media.is_some() => {
-                        let bootstrap = media.as_ref().unwrap().bootstrap(self.width, self.height);
-                        write_encrypted_message(
-                            &mut stream,
-                            &mut encoder,
-                            &bootstrap,
-                            &mut report.server_to_client_records,
-                        )?;
-                    }
-                    9 if frames.is_some() => {
-                        automatic = true;
-                        next_frame_at = Instant::now() + self.frame_interval;
-                    }
-                    0x1c if media.is_some() => {
-                        let configuration = MediaStreamConfiguration::parse(&message)
-                            .map_err(io::Error::other)?
-                            .0;
-                        let (answer, codec) = media.as_mut().unwrap().answer(
-                            configuration,
-                            &self.fixtures,
-                            self.frame_interval,
-                            self.close_after_frames,
-                        )?;
-                        report.selected_mode = Some(match codec {
-                            MediaStreamCodec::H264 => OracleMode::H264,
-                            MediaStreamCodec::Hevc => OracleMode::Hevc,
-                        });
-                        write_encrypted_message(
-                            &mut stream,
-                            &mut encoder,
-                            &answer,
-                            &mut report.server_to_client_records,
-                        )?;
-                        report.media_configuration_received = true;
-                    }
-                    _ => {}
-                }
-                if report.client_message_types.len() >= self.max_client_messages {
-                    return Ok(report);
-                }
             }
         }
         Ok(report)
@@ -467,16 +497,20 @@ impl Oracle {
         eprintln!("oracle handshake: ARD banner negotiated");
         stream.write_all(&[1, 30])?;
         stream.flush()?;
-        if self.expect_security_selection {
-            let mut selection = [0_u8; 1];
-            stream.read_exact(&mut selection)?;
-            eprintln!("oracle handshake: security type {} selected", selection[0]);
-            if selection[0] != 30 {
-                return Err(io::Error::other(format!(
-                    "client selected unsupported security type {}",
-                    selection[0]
-                )));
-            }
+        // The native client always writes the one-byte security-type selection
+        // (`_AuthenticateDHNamePassword` calls `WriteSocketData` with length 1
+        // before reading the challenge) and `screensharingd`'s
+        // `HandleAuthTypeMessage` always reads it. Reading it conditionally let
+        // the client skip the byte whenever a single type was advertised, which
+        // hid a real mutual-wait hang instead of failing the test.
+        let mut selection = [0_u8; 1];
+        stream.read_exact(&mut selection)?;
+        eprintln!("oracle handshake: security type {} selected", selection[0]);
+        if selection[0] != 30 {
+            return Err(io::Error::other(format!(
+                "client selected unsupported security type {}",
+                selection[0]
+            )));
         }
 
         let modulus = BigUint::parse_bytes(DH_PRIME_HEX.as_bytes(), 16)

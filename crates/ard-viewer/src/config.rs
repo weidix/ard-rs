@@ -63,6 +63,10 @@ pub struct AppConfig {
     pub capture_system_shortcuts: bool,
     pub reverse_scroll: bool,
     pub show_performance_hud: bool,
+    /// Directory recordings are written to; empty means the default movies
+    /// folder. Kept as text so a config file from an older version still loads.
+    pub recording_directory: String,
+    pub recording_quality: String,
     #[serde(default = "default_toolbar_buttons")]
     pub toolbar_buttons: Vec<String>,
     pub theme: String,
@@ -98,6 +102,8 @@ impl Default for AppConfig {
             capture_system_shortcuts: false,
             reverse_scroll: false,
             show_performance_hud: true,
+            recording_directory: String::new(),
+            recording_quality: "balanced".into(),
             toolbar_buttons: default_toolbar_buttons(),
             theme: "system".into(),
             language: "zh-CN".into(),
@@ -329,26 +335,34 @@ pub fn language_from_cache(value: &str) -> Language {
 }
 
 pub fn toolbar_buttons_from_cache(config: &AppConfig) -> Vec<ToolbarButton> {
-    config
-        .toolbar_buttons
-        .iter()
-        .filter_map(|name| match name.as_str() {
-            "screenshot" => Some(ToolbarButton::Screenshot),
-            "app-switcher" => Some(ToolbarButton::AppSwitcher),
-            "mission-control" => Some(ToolbarButton::MissionControl),
-            "desktop" => Some(ToolbarButton::Desktop),
-            "zoom-out" => Some(ToolbarButton::ZoomOut),
-            "zoom-in" => Some(ToolbarButton::ZoomIn),
-            "actual-size" => Some(ToolbarButton::ActualSize),
-            "fit-to-window" => Some(ToolbarButton::FitToWindow),
-            "remote-keyboard" => Some(ToolbarButton::RemoteKeyboard),
-            "pointer" => Some(ToolbarButton::Pointer),
-            "clipboard" => Some(ToolbarButton::Clipboard),
-            "system-shortcut" => Some(ToolbarButton::SystemShortcut),
-            "undo" => Some(ToolbarButton::Undo),
-            _ => None,
-        })
-        .collect()
+    let mut buttons: Vec<ToolbarButton> = Vec::new();
+    for name in &config.toolbar_buttons {
+        let button = match name.as_str() {
+            "screenshot" => ToolbarButton::Screenshot,
+            "app-switcher" => ToolbarButton::AppSwitcher,
+            "mission-control" => ToolbarButton::MissionControl,
+            "desktop" => ToolbarButton::Desktop,
+            "zoom-out" => ToolbarButton::ZoomOut,
+            "zoom-in" => ToolbarButton::ZoomIn,
+            "actual-size" => ToolbarButton::ActualSize,
+            "fit-to-window" => ToolbarButton::FitToWindow,
+            "remote-keyboard" => ToolbarButton::RemoteKeyboard,
+            "pointer" => ToolbarButton::Pointer,
+            "clipboard" => ToolbarButton::Clipboard,
+            "system-shortcut" => ToolbarButton::SystemShortcut,
+            "undo" => ToolbarButton::Undo,
+            _ => continue,
+        };
+        // A config file can contain a repeated entry. Keeping duplicates made
+        // the settings checkbox look broken: unchecking a button removed only
+        // the first entry, so the toolbar button stayed and the box re-checked
+        // itself. One entry per button is the invariant the rest of the UI
+        // assumes.
+        if !buttons.contains(&button) {
+            buttons.push(button);
+        }
+    }
+    buttons
 }
 
 pub fn toolbar_buttons_to_cache(buttons: &[ToolbarButton]) -> Vec<String> {
@@ -442,6 +456,25 @@ mod tests {
         assert_eq!(restored.media_audio_port, "15900");
         assert_eq!(restored.media_video1_port, "15901");
         assert_eq!(restored.media_video2_port, "15902");
+    }
+
+    #[test]
+    fn recording_preferences_are_backward_compatible_and_round_trip() {
+        let legacy: AppConfig = serde_json::from_str("{}").expect("legacy config parses");
+        assert!(legacy.recording_directory.is_empty());
+        assert_eq!(legacy.recording_quality, "balanced");
+
+        let configured = AppConfig {
+            recording_directory: "/tmp/ard".into(),
+            recording_quality: "high".into(),
+            ..AppConfig::default()
+        };
+        let restored: AppConfig = serde_json::from_slice(
+            &serde_json::to_vec(&configured).expect("recording preferences serialize"),
+        )
+        .expect("recording preferences parse");
+        assert_eq!(restored.recording_directory, "/tmp/ard");
+        assert_eq!(restored.recording_quality, "high");
     }
 
     #[test]

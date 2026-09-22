@@ -19,14 +19,19 @@
 //! into the framebuffer and never touches the VNC encodings.
 //!
 //! Wire findings were derived from macOS 26.6 (build 25G72) Screen Sharing
-//! 6.1 (760.4); see `docs/SCREENSHARING_RE.md` for the reverse-engineering
-//! notes.
+//! 6.1 (760.4).
 
+mod assembler;
 pub mod negotiation;
+pub mod pixel_format;
 pub mod rtp;
 pub mod srtp;
 pub mod udp;
 pub mod wire;
+
+pub use assembler::{
+    AVC_VIDEO_SLICE_COUNT, AssembleOutcome, AssembledFrame, PushOutcome, VideoStreamAssembler,
+};
 
 pub use negotiation::{
     MediaStreamCodec, MediaStreamOffer, VideoCodecConfig, VideoFormatParameters,
@@ -34,6 +39,7 @@ pub use negotiation::{
     build_media_stream_offer_with_ssrc_and_codec, build_remote_endpoint_info, media_stream_ssrc,
     parse_negotiation_payload,
 };
+pub use pixel_format::{MediaPixelFormat, MediaPixelFormats};
 pub use rtp::{AccessUnit, H264Depacketizer, HevcDepacketizer, RtpHeader, RtpPacket};
 pub use udp::{MediaUdpEndpoints, MediaUdpPortOverrides, MediaUdpSession, UdpStreamKind};
 pub use wire::{

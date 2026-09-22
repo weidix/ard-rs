@@ -5,33 +5,40 @@ use ard_rs::{
     parse_framebuffer_update, unwrap_ard_session_material,
 };
 
-fn viewer_information_vector() -> [u8; ArdViewerInformation::WIRE_LEN] {
-    let mut message = [0; ArdViewerInformation::WIRE_LEN];
-    message[0] = ArdViewerInformation::MESSAGE_TYPE;
-    message[2..4].copy_from_slice(&(ArdViewerInformation::PAYLOAD_LEN as u16).to_be_bytes());
-    message[4..6].copy_from_slice(&ArdViewerInformation::VERSION.to_be_bytes());
-    for (index, component) in [2_u32, 6, 1, 0].into_iter().enumerate() {
-        let offset = 6 + index * 4;
-        message[offset..offset + 4].copy_from_slice(&component.to_be_bytes());
-    }
-    for (index, component) in [26_u32, 5, 2].into_iter().enumerate() {
-        let offset = 22 + index * 4;
-        message[offset..offset + 4].copy_from_slice(&component.to_be_bytes());
-    }
-    message[34] = 0xb0;
-    message[36] = 0x0c;
-    message[37] = 0x03;
-    message[38] = 0x90;
-    message[44] = 0x40;
-    message
-}
+/// The exact 66-byte `RFBViewerInformation` message the installed Screen
+/// Sharing client writes, transcribed field by field from
+/// `_RFBViewerInformation` in ScreenSharing.framework (macOS 26.6.2, Screen
+/// Sharing 6.1 (764.2)).
+///
+/// This literal is the point of the test: it is deliberately NOT derived from
+/// `ArdViewerInformation`'s own constants, so it still fails if the layout, the
+/// length field, the version, or any capability byte is wrong. An earlier
+/// version of this test rebuilt the "expected" bytes from the same constants the
+/// parser used, so it could not detect a wrong constant at all.
+const NATIVE_VIEWER_INFORMATION: [u8; 66] = [
+    0x21, 0x00, // message type, padding
+    0x00, 0x3e, // payload length 62
+    0x00, 0x01, // version 1
+    0x00, 0x00, 0x00, 0x02, // viewer component 0
+    0x00, 0x00, 0x00, 0x06, // viewer component 1
+    0x00, 0x00, 0x00, 0x01, // viewer component 2
+    0x00, 0x00, 0x00, 0x00, // viewer component 3
+    0x00, 0x00, 0x00, 0x1a, // system version major 26
+    0x00, 0x00, 0x00, 0x05, // system version minor 5
+    0x00, 0x00, 0x00, 0x02, // system version patch 2
+    0xb0, 0x00, 0x0c, 0x03, 0x90, 0x00, 0x00, 0x00, // capability block
+    0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, // capability block
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
+];
 
 #[test]
-fn parses_live_rfb_viewer_information_structure() {
-    let message = viewer_information_vector();
+fn parses_native_rfb_viewer_information_layout() {
     let (information, consumed) =
-        parse_ard_viewer_information(&message, ArdViewerInformation::WIRE_LEN).unwrap();
-    assert_eq!(consumed, message.len());
+        parse_ard_viewer_information(&NATIVE_VIEWER_INFORMATION, ArdViewerInformation::WIRE_LEN)
+            .unwrap();
+    assert_eq!(consumed, NATIVE_VIEWER_INFORMATION.len());
+    assert_eq!(consumed, 66);
     assert_eq!(information.version, 1);
     assert_eq!(information.viewer_components, [2, 6, 1, 0]);
     assert_eq!(information.system_version, [26, 5, 2]);
@@ -42,7 +49,7 @@ fn parses_live_rfb_viewer_information_structure() {
 
 #[test]
 fn rejects_truncated_rfb_viewer_information() {
-    let message = viewer_information_vector();
+    let message = NATIVE_VIEWER_INFORMATION;
     for length in 0..message.len() {
         assert!(
             matches!(
@@ -56,7 +63,7 @@ fn rejects_truncated_rfb_viewer_information() {
 
 #[test]
 fn bounds_and_validates_rfb_viewer_information() {
-    let message = viewer_information_vector();
+    let message = NATIVE_VIEWER_INFORMATION;
     assert_eq!(
         parse_ard_viewer_information(&message, message.len() - 1).unwrap_err(),
         Error::LimitExceeded("RFBViewerInformation message")
@@ -77,7 +84,7 @@ fn bounds_and_validates_rfb_viewer_information() {
         Error::Invalid("invalid RFBViewerInformation padding")
     );
 
-    let mut invalid_version = viewer_information_vector();
+    let mut invalid_version = NATIVE_VIEWER_INFORMATION;
     invalid_version[4..6].copy_from_slice(&2_u16.to_be_bytes());
     assert_eq!(
         parse_ard_viewer_information(&invalid_version, invalid_version.len()).unwrap_err(),

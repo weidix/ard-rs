@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ard_rs::media_stream::{AccessUnit, MediaStreamCodec};
 
-use super::{DecodedOutput, DecodedSlice, YuvMatrix, YuvRange};
+use super::{DecodedOutput, DecodedSlice, YuvMatrix, YuvPrimaries, YuvRange};
 
 type OSStatus = i32;
 type CFIndex = isize;
@@ -147,8 +147,6 @@ unsafe extern "C" {
     fn CVPixelBufferGetPixelFormatType(pixel_buffer: CVPixelBufferRef) -> u32;
     fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
-    fn CVPixelBufferGetBytesPerRow(pixel_buffer: CVPixelBufferRef) -> usize;
-    fn CVPixelBufferGetBaseAddress(pixel_buffer: CVPixelBufferRef) -> *mut c_void;
     fn CVPixelBufferGetPlaneCount(pixel_buffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferGetWidthOfPlane(pixel_buffer: CVPixelBufferRef, plane_index: usize) -> usize;
     fn CVPixelBufferGetHeightOfPlane(pixel_buffer: CVPixelBufferRef, plane_index: usize) -> usize;
@@ -174,6 +172,9 @@ unsafe extern "C" {
     static kCVImageBufferYCbCrMatrix_ITU_R_601_4: CFStringRef;
     static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
     static kCVImageBufferYCbCrMatrix_ITU_R_2020: CFStringRef;
+    static kCVImageBufferColorPrimariesKey: CFStringRef;
+    static kCVImageBufferColorPrimaries_P3_D65: CFStringRef;
+    static kCVImageBufferColorPrimaries_ITU_R_2020: CFStringRef;
 
     fn dlopen(path: *const u8, mode: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const u8) -> *mut c_void;
@@ -211,8 +212,13 @@ struct CGRect {
 const kCFNumberSInt32Type: i32 = 3;
 #[allow(non_upper_case_globals)]
 const kCFStringEncodingUTF8: u32 = 0x08000100;
-const PIXEL_FORMAT_NV12_VIDEO_RANGE: u32 = 0x3432_3076; // '420v'
-const PIXEL_FORMAT_NV12_FULL_RANGE: u32 = 0x3432_3066; // '420f'
+/// The decoder's destination format, named by the same typed set the offer's
+/// `pixelFormats` menu is built from: this client *claims* every format in that
+/// menu but currently asks VideoProcessing for 8-bit 4:2:0 here, which is where
+/// the stream's chroma is dropped.
+const PIXEL_FORMAT_NV12_VIDEO_RANGE: u32 =
+    ard_rs::media_stream::MediaPixelFormat::Nv12Video.fourcc();
+const PIXEL_FORMAT_NV12_FULL_RANGE: u32 = ard_rs::media_stream::MediaPixelFormat::Nv12Full.fourcc();
 #[allow(non_upper_case_globals)]
 const kCVPixelBufferLock_ReadOnly: u32 = 1;
 const VCP_FRAMEWORK: &[u8] =
@@ -362,8 +368,15 @@ struct NativeDecoder {
     session: VTDecompressionSessionRef,
     api: &'static VcpApi,
     output_state: Arc<CallbackState>,
-    encoded_dimensions: (u32, u32),
     visible_rect: PixelRect,
+    /// Destination image buffer attributes handed to
+    /// `VCPDecompressionSessionCreate`.
+    ///
+    /// The private entry point publishes no retention contract. Keeping the
+    /// dictionary alive for the session's lifetime is what a client may rely on
+    /// with the public `VTDecompressionSessionCreate`, and it costs nothing
+    /// here, so the session can never read a freed dictionary.
+    _destination_attributes: DestinationAttributes,
 }
 
 impl NativeDecoder {
@@ -398,7 +411,6 @@ pub struct VideoToolboxDecoder {
     codec: MediaStreamCodec,
     native: Option<NativeDecoder>,
     parameter_sets: Vec<Vec<u8>>,
-    frames_decoded: u64,
     next_submission: u64,
     needs_sync: bool,
     errors: VecDeque<String>,
@@ -410,15 +422,10 @@ impl VideoToolboxDecoder {
             codec,
             native: None,
             parameter_sets: Vec::new(),
-            frames_decoded: 0,
             next_submission: 0,
             needs_sync: false,
             errors: VecDeque::new(),
         }
-    }
-
-    pub fn frames_decoded(&self) -> u64 {
-        self.frames_decoded
     }
 
     /// Resolution configured on the active VideoToolbox session. When the
@@ -543,10 +550,6 @@ impl VideoToolboxDecoder {
         // races deterministic without waiting for callbacks that will never
         // exist.
         outputs.sort_by_key(|output| output.submission);
-        self.frames_decoded += outputs
-            .iter()
-            .filter(|output| output.frame.is_some())
-            .count() as u64;
         outputs
     }
 
@@ -731,7 +734,6 @@ impl VideoToolboxDecoder {
             )
         };
         unsafe { CFRelease(decoder_specification) };
-        drop(destination_attributes);
         if status != 0 || session.is_null() {
             unsafe { CFRelease(format_description as *const c_void) };
             return Err(format!("VCP session creation failed with status {status}"));
@@ -741,8 +743,8 @@ impl VideoToolboxDecoder {
             session,
             api,
             output_state,
-            encoded_dimensions: (dimensions.width as u32, dimensions.height as u32),
             visible_rect,
+            _destination_attributes: destination_attributes,
         })
     }
 }
@@ -762,9 +764,23 @@ impl DestinationAttributes {
             return None;
         }
         let attributes = [
+            // Apple's media-stream encoders emit full-range (0..255) planes:
+            // every real-device elementary stream captured so far declares
+            // `color_range=pc`. Asking VideoProcessing for a video-range buffer
+            // makes it compress that range into 16..235, which collapses 256
+            // levels into 220 and leaves every decoded frame a couple of levels
+            // away from the bitstream (measured: +2 on luma everywhere). Request
+            // the plane range the encoder actually produced and let the
+            // conversion matrix carry it: `pixel_buffer_to_nv12` reports
+            // `YuvRange::Full` for `420f`, and the renderer passes full-range
+            // values through unchanged.
+            //
+            // This is a correctness fix for the decoded planes only. It is NOT
+            // the cause of the H.265 banding, which is still open; do not treat
+            // it as that fix.
             (
                 c"PixelFormatType".as_ptr(),
-                PIXEL_FORMAT_NV12_VIDEO_RANGE as c_int,
+                PIXEL_FORMAT_NV12_FULL_RANGE as c_int,
             ),
             (c"Width".as_ptr(), width),
             (c"Height".as_ptr(), height),
@@ -1094,6 +1110,7 @@ unsafe fn pixel_buffer_to_nv12(
         ));
     }
     let matrix = ycbcr_matrix(buffer, visible_rect.width, visible_rect.height);
+    let primaries = ycbcr_primaries(buffer);
     Ok(DecodedSlice {
         width: visible_rect.width as u32,
         height: visible_rect.height as u32,
@@ -1101,6 +1118,7 @@ unsafe fn pixel_buffer_to_nv12(
         uv_plane,
         range,
         matrix,
+        primaries,
     })
 }
 
@@ -1156,6 +1174,36 @@ unsafe fn ycbcr_matrix(buffer: CVPixelBufferRef, width: usize, height: usize) ->
     } else {
         YuvMatrix::Bt709
     }
+}
+
+/// Colour primaries the decoder tagged the picture with.
+///
+/// The HEVC VUI of Apple's media stream carries a full colour description and
+/// VideoProcessing copies it onto the output buffer. Only the primary set is
+/// consumed here: the transfer function of a Mac screen is sRGB, which the
+/// presentation shader already linearises, while the primaries are what the
+/// shader has to convert away from (Display P3 planes presented as sRGB move
+/// the whole picture). An unknown or absent tag keeps the historical
+/// assumption that the planes are already sRGB.
+unsafe fn ycbcr_primaries(buffer: CVPixelBufferRef) -> YuvPrimaries {
+    let value = CVBufferGetAttachment(
+        buffer,
+        kCVImageBufferColorPrimariesKey,
+        std::ptr::null_mut(),
+    );
+    if !value.is_null() {
+        if CFEqual(value, kCVImageBufferColorPrimaries_P3_D65 as *const c_void) != 0 {
+            return YuvPrimaries::P3D65;
+        }
+        if CFEqual(
+            value,
+            kCVImageBufferColorPrimaries_ITU_R_2020 as *const c_void,
+        ) != 0
+        {
+            return YuvPrimaries::Bt2020;
+        }
+    }
+    YuvPrimaries::Bt709
 }
 
 #[cfg(test)]
@@ -1454,9 +1502,17 @@ mod tests {
     fn benchmarks_realtime_four_slice_frame_boundaries() {
         use std::time::Instant;
 
-        let path = std::env::var("ARD_VCP_BENCH_SAMPLE")
-            .expect("ARD_VCP_BENCH_SAMPLE must name an Annex-B HEVC stream");
-        let bytes = std::fs::read(path).expect("benchmark sample must be readable");
+        // An absent sample must skip, not panic: this is an opt-in benchmark,
+        // and a panic made `--ignored` runs look like a broken suite even
+        // though nothing was being tested.
+        let Ok(path) = std::env::var("ARD_VCP_BENCH_SAMPLE") else {
+            eprintln!("skipping: ARD_VCP_BENCH_SAMPLE is not set");
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skipping: benchmark sample {path} is not readable");
+            return;
+        };
         let mut units = annex_b_to_access_units(&bytes, MediaStreamCodec::Hevc);
         assert!(
             units.len() >= 8 && units.len().is_multiple_of(4),
@@ -1511,5 +1567,266 @@ mod tests {
             percentile(99, 100).as_secs_f64() * 1_000.0,
         );
         assert_eq!(decoded_images, units.len());
+    }
+
+    /// Compare one decoded band plane against the independent reference.
+    ///
+    /// The comparison is exact except for the plane-range expansion both sides
+    /// perform, which can round a level by one.
+    fn assert_band_matches(reference: &[u8], ours: &[u8], plane: &str, band: usize) {
+        assert_eq!(reference.len(), ours.len(), "band {band} {plane} size");
+        let mut worst = 0_i16;
+        let mut total = 0_i64;
+        for (reference, ours) in reference.iter().zip(ours) {
+            let delta = (*ours as i16 - *reference as i16).abs();
+            worst = worst.max(delta);
+            total += i64::from(delta);
+        }
+        let mean = total as f64 / reference.len() as f64;
+        // Luma is the plane that exposes a displaced, duplicated or
+        // re-quantised band, so it is held to one level. VideoProcessing's own
+        // plane-range conversion rounds chroma harder (a few percent of samples
+        // land one level away), so chroma is bounded by its mean instead: a band
+        // assembled from the wrong picture moves that mean by orders of
+        // magnitude, not by one level.
+        let (max_delta, max_mean) = match plane {
+            "luma" => (1_i16, 0.05_f64),
+            _ => (64_i16, 2.0_f64),
+        };
+        assert!(
+            worst <= max_delta && mean <= max_mean,
+            "band {band} {plane} diverges from the independent decode: max={worst} mean={mean:.4}"
+        );
+    }
+
+    /// A real device stream is tagged Display P3 (`colour_primaries = 12`,
+    /// reported as `smpte432`) with the sRGB transfer function, so the decoded
+    /// planes are P3-encoded even though the luma/chroma matrix is BT.709. A
+    /// renderer that presents those numbers as sRGB moves the whole picture —
+    /// measured on a real capture, the red channel of a flat desktop background
+    /// shifts by ~48 of 255.
+    ///
+    /// The decoder is responsible for handing that tag on, because it reads it
+    /// off the output buffer. This retags the in-repo fixture's VUI instead of
+    /// capturing a device: the planes are untouched, only the attachment moves,
+    /// so the assertion is about the tag being read at all.
+    #[test]
+    fn reads_the_display_p3_primaries_the_codec_attaches() {
+        use std::process::{Command, Stdio};
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture =
+            root.join("../ard-core/examples/fixtures/oracle-diagonal-frames-1920x1080-4x272.h265");
+        let Ok(bytes) = std::fs::read(&fixture) else {
+            eprintln!("skipping: {} is not readable", fixture.display());
+            return;
+        };
+        assert_eq!(
+            decode_primaries(&bytes),
+            vec![YuvPrimaries::Bt709],
+            "the untagged fixture must keep the historical sRGB/Rec.709 reading"
+        );
+
+        let tagged = std::env::temp_dir().join("ard-viewer-p3-primaries.h265");
+        let output = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&fixture)
+            .args([
+                "-c",
+                "copy",
+                // Table E-3 value 12 is SMPTE EG 432-1, i.e. Display P3 D65.
+                "-bsf:v",
+                "hevc_metadata=colour_primaries=12",
+                "-f",
+                "hevc",
+            ])
+            .arg(&tagged)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match output {
+            Ok(status) if status.success() => {}
+            _ => {
+                eprintln!("skipping: ffmpeg could not retag the fixture");
+                return;
+            }
+        }
+        let tagged_bytes = std::fs::read(&tagged).expect("tagged fixture is readable");
+        assert_eq!(
+            decode_primaries(&tagged_bytes),
+            vec![YuvPrimaries::P3D65],
+            "a Display P3 tag must reach the renderer as P3, not as sRGB"
+        );
+        let _ = std::fs::remove_file(&tagged);
+    }
+
+    /// Decode an Annex-B HEVC stream and report the distinct plane colour
+    /// descriptions the decoder produced, in order of first appearance.
+    fn decode_primaries(bytes: &[u8]) -> Vec<YuvPrimaries> {
+        let units = annex_b_to_access_units(bytes, MediaStreamCodec::Hevc);
+        let mut decoder = VideoToolboxDecoder::new(MediaStreamCodec::Hevc);
+        let mut seen: Vec<YuvPrimaries> = Vec::new();
+        let collect = |outputs: Vec<super::DecodedOutput>, seen: &mut Vec<YuvPrimaries>| {
+            for output in outputs {
+                let Some(frame) = output.frame else { continue };
+                if !seen.contains(&frame.primaries) {
+                    seen.push(frame.primaries);
+                }
+            }
+        };
+        for (index, unit) in units.iter().enumerate() {
+            collect(decoder.decode(index % 4, unit), &mut seen);
+        }
+        collect(decoder.flush(), &mut seen);
+        assert!(decoder.take_errors().is_empty());
+        seen
+    }
+
+    /// The four native bands Apple's media stream carries are separate coded
+    /// pictures in one serial prediction chain. They must reach the frame
+    /// buffer byte-for-byte as the decoder produced them: a decoder or
+    /// compositor that displaces, duplicates or re-quantises a band shows up
+    /// as a seam on the band grid.
+    ///
+    /// This pins the band assembly geometry only. It does not reproduce or
+    /// explain the H.265 banding, which is still open.
+    ///
+    /// The check decodes the first desktop frames of the in-repo oracle
+    /// fixture through the production decoder and compositor and compares the
+    /// composed frame against an independent decode of the same elementary
+    /// stream. `ffmpeg` is used only as the reference decoder; without it the
+    /// test skips exactly like the other sample-driven tests in this module.
+    #[test]
+    fn oracle_band_composite_matches_an_independent_decode() {
+        use crate::media::pipeline::SliceCompositor;
+        use std::process::{Command, Stdio};
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture =
+            root.join("../ard-core/examples/fixtures/oracle-diagonal-frames-1920x1080-4x272.h265");
+        let Ok(bytes) = std::fs::read(&fixture) else {
+            eprintln!("skipping: {} is not readable", fixture.display());
+            return;
+        };
+        let units = annex_b_to_access_units(&bytes, MediaStreamCodec::Hevc);
+        assert!(
+            units.len() >= 20,
+            "fixture must hold at least five desktop frames"
+        );
+
+        // Reference: 1200 codec-aligned 1920x272 pictures in decode order.
+        let output = Command::new("ffmpeg")
+            .args(["-v", "error", "-vsync", "0", "-i"])
+            .arg(&fixture)
+            .args([
+                "-frames:v",
+                "20",
+                // Match the decoder's requested plane range: the production
+                // session asks VideoProcessing for `420f`, so a video-range
+                // fixture reaches the client in full range. The reference must
+                // be expanded the same way before the pixels are compared.
+                "-vf",
+                "scale=out_range=full",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let Ok(output) = output else {
+            eprintln!("skipping: ffmpeg is not available");
+            return;
+        };
+        if !output.status.success() {
+            eprintln!("skipping: ffmpeg could not decode the fixture");
+            return;
+        }
+        const BAND: usize = 1920 * 272;
+        const BAND_CHROMA: usize = 960 * 136;
+        let picture = BAND + 2 * BAND_CHROMA;
+        assert_eq!(
+            output.stdout.len(),
+            20 * picture,
+            "ffmpeg reference must hold twenty band pictures"
+        );
+
+        let mut decoder = VideoToolboxDecoder::new(MediaStreamCodec::Hevc);
+        let mut compositor = SliceCompositor::new((1920, 1080));
+        let mut ours = vec![0_u8; 1920 * 1080 + 2 * 960 * 540];
+        let mut compared = 0_usize;
+
+        for (index, unit) in units.iter().enumerate().take(20) {
+            let mut outputs = decoder.decode(index % 4, unit);
+            if index % 4 == 3 {
+                outputs.extend(decoder.finish_frame());
+            }
+            for output in outputs {
+                let Some(frame) = output.frame else { continue };
+                compositor
+                    .push(output.stream_index, output.encoded_bytes, Some(frame))
+                    .expect("native band geometry");
+            }
+            if index % 4 != 3 {
+                continue;
+            }
+            let errors = decoder.take_errors();
+            assert!(errors.is_empty(), "fixture decode errors: {errors:?}");
+            let Some(frame) = compositor.finish_frame().expect("native band layout") else {
+                continue;
+            };
+            for update in &frame.updates {
+                let width = frame.width as usize;
+                for row in 0..update.y_rows as usize {
+                    let source = row * width;
+                    let destination = (update.y_origin as usize + row) * width;
+                    ours[destination..destination + width]
+                        .copy_from_slice(&update.pixels.y_plane[source..source + width]);
+                }
+                let uv_base = 1920 * 1080;
+                for row in 0..update.uv_rows as usize {
+                    let source = row * width;
+                    let destination = uv_base + (update.uv_origin as usize + row) * width;
+                    ours[destination..destination + width]
+                        .copy_from_slice(&update.pixels.uv_plane[source..source + width]);
+                }
+            }
+            compared += 1;
+        }
+        assert_eq!(compared, 5, "five desktop frames must compose");
+
+        // The reference desktop frame is the four band pictures stacked, with
+        // the codec padding of the last band cropped away exactly like the
+        // compositor crops it.
+        let desktop = 4_usize;
+        let base = desktop * 4 * picture;
+        let mut y_offset = 0_usize;
+        let mut uv_offset = 0_usize;
+        for band in 0..4 {
+            let rows = if band == 3 { 264 } else { 272 };
+            let chroma_rows = rows / 2;
+            let picture_base = base + band * picture;
+            let y_source = &output.stdout[picture_base..picture_base + rows * 1920];
+            let y_target = &ours[y_offset..y_offset + rows * 1920];
+            assert_band_matches(y_source, y_target, "luma", band);
+            let u_source =
+                &output.stdout[picture_base + BAND..picture_base + BAND + chroma_rows * 960];
+            let v_source = &output.stdout[picture_base + BAND + BAND_CHROMA
+                ..picture_base + BAND + BAND_CHROMA + chroma_rows * 960];
+            let mut u_target = Vec::with_capacity(chroma_rows * 960);
+            let mut v_target = Vec::with_capacity(chroma_rows * 960);
+            for row in 0..chroma_rows {
+                let start = 1920 * 1080 + (uv_offset + row) * 1920;
+                let line = &ours[start..start + 1920];
+                u_target.extend(line.iter().step_by(2).copied());
+                v_target.extend(line.iter().skip(1).step_by(2).copied());
+            }
+            assert_band_matches(u_source, &u_target, "U", band);
+            assert_band_matches(v_source, &v_target, "V", band);
+            y_offset += rows * 1920;
+            uv_offset += chroma_rows;
+        }
     }
 }

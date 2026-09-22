@@ -208,6 +208,19 @@ impl ArdSessionRecordDecoder {
         self.sequence
     }
 
+    /// Replaces the cipher and chaining value without disturbing the sequence.
+    ///
+    /// A second mid-session encryption-control rectangle re-keys both
+    /// directions, but the native sequence counters are only ever incremented
+    /// (the `1103` handler releases and re-creates the CBC cryptors and never
+    /// touches `session+0xe44`/`session+0xe48`). Restarting the sequence at zero
+    /// would make the first re-keyed record fail its SHA-1 check and tear the
+    /// session down.
+    pub fn rekey(&mut self, session_value: [u8; 16], initial_chaining_value: [u8; 16]) {
+        self.cipher = Aes128::new(GenericArray::from_slice(&session_value));
+        self.chaining_value = initial_chaining_value;
+    }
+
     pub fn decode(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let mut plaintext = ciphertext.to_vec();
         self.decode_in_place(&mut plaintext)?;
@@ -309,6 +322,13 @@ impl ArdSessionRecordEncoder {
 
     pub fn sequence(&self) -> u32 {
         self.sequence
+    }
+
+    /// Encoder-side counterpart of [`ArdSessionRecordDecoder::rekey`]: the
+    /// cipher and chaining value change while the sequence continues.
+    pub fn rekey(&mut self, session_value: [u8; 16], initial_chaining_value: [u8; 16]) {
+        self.cipher = Aes128::new(GenericArray::from_slice(&session_value));
+        self.chaining_value = initial_chaining_value;
     }
 
     pub fn encode_wire(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
@@ -475,6 +495,35 @@ mod tests {
             expected[16..]
         );
         assert_eq!(encrypted, plaintext);
+    }
+
+    #[test]
+    fn rekey_preserves_the_sequence_in_both_directions() {
+        // A second mid-session encryption control re-keys both directions, but
+        // the native sequence counters only ever advance. The re-keyed stream
+        // must continue at the current sequence, not restart at zero: a restart
+        // makes the first re-keyed record fail its SHA-1 check.
+        let mut encoder =
+            ArdSessionRecordEncoder::new_with_initial_chaining_value([0x11; 16], [0x22; 16], 4096)
+                .unwrap();
+        let mut decoder =
+            ArdSessionRecordDecoder::new_with_initial_chaining_value([0x11; 16], [0x22; 16], 4096)
+                .unwrap();
+
+        for index in 0..3_u8 {
+            let wire = encoder.encode_wire(&[index; 8]).unwrap();
+            decoder.decode(&wire[2..]).unwrap();
+        }
+        assert_eq!(encoder.sequence(), 3);
+        assert_eq!(decoder.sequence(), 3);
+
+        encoder.rekey([0x33; 16], [0x44; 16]);
+        decoder.rekey([0x33; 16], [0x44; 16]);
+        assert_eq!(encoder.sequence(), 3, "rekey must not reset the sequence");
+
+        let wire = encoder.encode_wire(b"after rekey").unwrap();
+        assert_eq!(decoder.decode(&wire[2..]).unwrap(), b"after rekey");
+        assert_eq!(decoder.sequence(), 4);
     }
 
     #[test]

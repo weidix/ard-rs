@@ -1,9 +1,12 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ard_rs::{MvsGpuTile, MvsGpuTileUpdate};
 use iced::widget::shader::{self, Program};
 use iced::{Element, Fill, Rectangle, Size};
 
+use crate::recording::{PresentationSource, RecordingControl, RecordingTap};
 use crate::session_runtime::{FramePacket, SessionEvent, SharedMailbox, TileSet, fitted_viewport};
 
 #[derive(Debug, Clone)]
@@ -13,6 +16,7 @@ pub struct RemoteProgram {
     actual_size: bool,
     should_interpolate: bool,
     sharp_sampling: bool,
+    recording: Arc<RecordingControl>,
 }
 
 impl RemoteProgram {
@@ -22,6 +26,7 @@ impl RemoteProgram {
         actual_size: bool,
         should_interpolate: bool,
         sharp_sampling: bool,
+        recording: Arc<RecordingControl>,
     ) -> Self {
         Self {
             mailbox,
@@ -29,6 +34,7 @@ impl RemoteProgram {
             actual_size,
             should_interpolate,
             sharp_sampling,
+            recording,
         }
     }
 }
@@ -50,6 +56,7 @@ impl<Message> Program<Message> for RemoteProgram {
             actual_size: self.actual_size,
             should_interpolate: self.should_interpolate,
             sharp_sampling: self.sharp_sampling,
+            recording: Arc::clone(&self.recording),
         }
     }
 }
@@ -60,6 +67,7 @@ pub fn remote_display<Message: 'static>(
     actual_size: bool,
     should_interpolate: bool,
     sharp_sampling: bool,
+    recording: Arc<RecordingControl>,
 ) -> Element<'static, Message> {
     shader::Shader::new(RemoteProgram::new(
         mailbox,
@@ -67,6 +75,7 @@ pub fn remote_display<Message: 'static>(
         actual_size,
         should_interpolate,
         sharp_sampling,
+        recording,
     ))
     .width(Fill)
     .height(Fill)
@@ -81,6 +90,7 @@ pub struct RemotePrimitive {
     actual_size: bool,
     should_interpolate: bool,
     sharp_sampling: bool,
+    recording: Arc<RecordingControl>,
 }
 
 impl shader::Primitive for RemotePrimitive {
@@ -102,6 +112,7 @@ impl shader::Primitive for RemotePrimitive {
             pipeline.reset_session();
         }
         pipeline.mailbox = Some(Arc::clone(&self.mailbox));
+        pipeline.recording = Some(Arc::clone(&self.recording));
         pipeline.zoom = self.zoom;
         pipeline.actual_size = self.actual_size;
         pipeline.should_interpolate = self.should_interpolate;
@@ -115,24 +126,46 @@ impl shader::Primitive for RemotePrimitive {
             .ok()
             .and_then(|mut mailbox| mailbox.latest.take());
         let Some(mut frame) = frame else { return };
-        let native_upload = frame.nv12.is_some();
+        // The RGBA pool must be fed back even when the upload below is skipped.
         let avc_timing = frame.nv12.as_ref().and_then(|frame| frame.timing);
-        let uploaded = pipeline.upload(&mut frame);
-        if let Ok(mut pending) = pipeline.pending_avc_timing.lock() {
-            *pending = uploaded.then_some(avc_timing).flatten();
-        }
-        if native_upload
-            && !uploaded
-            && let Ok(mut mailbox) = self.mailbox.lock()
-        {
-            mailbox.push_event(SessionEvent::RenderFailed(
-                "原生 NV12 帧未通过 GPU 纹理布局校验".into(),
-            ));
+        let outcome = pipeline.upload(&mut frame);
+        let uploaded = outcome.is_uploaded();
+        if uploaded {
+            // A recorded frame must be one that was really drawn, so the flag is
+            // consumed by `render` rather than here.
+            pipeline.presented_frame.store(true, Ordering::Release);
         }
         if let Some(buffer) = frame.rgba.take()
             && let Ok(mut mailbox) = self.mailbox.lock()
         {
             mailbox.recycle_rgba(buffer);
+        }
+        if let Ok(mut pending) = pipeline.pending_avc_timing.lock() {
+            *pending = uploaded.then_some(avc_timing).flatten();
+        }
+        // A recreated texture that has not yet collected all four native slices
+        // is incomplete, not broken. Only a frame that failed validation is a
+        // rendering failure, and a later successful upload clears it — without
+        // that recovery the error text replaced the remote desktop for the rest
+        // of the session.
+        match outcome {
+            UploadOutcome::Invalid if frame.nv12.is_some() => {
+                pipeline.reported_failure = true;
+                if let Ok(mut mailbox) = self.mailbox.lock() {
+                    mailbox.push_event(SessionEvent::RenderFailed(
+                        "原生 NV12 帧未通过 GPU 纹理布局校验".into(),
+                    ));
+                }
+            }
+            UploadOutcome::Uploaded => {
+                if pipeline.reported_failure
+                    && let Ok(mut mailbox) = self.mailbox.lock()
+                {
+                    mailbox.push_event(SessionEvent::RenderRecovered);
+                    pipeline.reported_failure = false;
+                }
+            }
+            UploadOutcome::Invalid | UploadOutcome::Incomplete => {}
         }
     }
 
@@ -162,6 +195,43 @@ struct NativeNv12Texture {
     uv_texture: wgpu::Texture,
     conversion_buffer: wgpu::Buffer,
     render_bind_group: wgpu::BindGroup,
+    /// Colour description of the planes currently uploaded. Recording keeps it so
+    /// a captured frame can be tagged with the same matrix and range the
+    /// presenter used.
+    range: crate::media::YuvRange,
+    matrix: crate::media::YuvMatrix,
+    /// Primary set the planes are encoded in. The presentation surface is
+    /// sRGB, so a Display P3 stream has to be converted instead of presented
+    /// with its numbers unchanged.
+    primaries: crate::media::YuvPrimaries,
+    /// Native AVC splits a desktop frame into four independent slices. A
+    /// texture that has not yet received all four has unwritten regions, so it
+    /// must not be presented until every slice has contributed at least once.
+    fully_initialized: bool,
+    initialized_y: Vec<bool>,
+    initialized_uv: Vec<bool>,
+}
+
+/// Outcome of uploading one frame to the GPU pipeline.
+///
+/// The three cases must stay distinct. Reporting an incomplete slice set as a
+/// rendering failure produced a permanent on-screen error, and presenting the
+/// half-written texture instead blanked the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadOutcome {
+    /// The frame reached the presentation texture.
+    Uploaded,
+    /// The frame was valid but not yet displayable (fewer than four native
+    /// slices on a fresh texture, or no dirty tiles). Previous content stays.
+    Incomplete,
+    /// The frame failed validation and was discarded.
+    Invalid,
+}
+
+impl UploadOutcome {
+    fn is_uploaded(self) -> bool {
+        matches!(self, Self::Uploaded)
+    }
 }
 
 struct UploadBuffer {
@@ -198,6 +268,14 @@ pub struct RemotePipeline {
     mvs_bind_group: Option<wgpu::BindGroup>,
     pending_mvs_decode: Mutex<Option<u32>>,
     pending_avc_timing: Mutex<Option<crate::media::AvcFrameTiming>>,
+    /// Recording control shared with the session window, and the capture state
+    /// built for the take that is currently running.
+    recording: Option<Arc<RecordingControl>>,
+    recording_tap: Mutex<Option<RecordingTap>>,
+    presented_frame: AtomicBool,
+    /// Whether this session has reported a rendering failure that a later
+    /// successful upload must clear.
+    reported_failure: bool,
     mailbox: Option<SharedMailbox>,
     bounds: Rectangle,
     zoom: f32,
@@ -450,6 +528,10 @@ impl shader::Pipeline for RemotePipeline {
             mvs_bind_group: None,
             pending_mvs_decode: Mutex::new(None),
             pending_avc_timing: Mutex::new(None),
+            recording: None,
+            recording_tap: Mutex::new(None),
+            presented_frame: AtomicBool::new(false),
+            reported_failure: false,
             mailbox: None,
             bounds: Rectangle::default(),
             zoom: 1.0,
@@ -478,6 +560,9 @@ impl RemotePipeline {
         if let Ok(mut pending) = self.pending_avc_timing.lock() {
             *pending = None;
         }
+        // The previous session's textures are gone, so a frame that was never
+        // drawn must not be captured against the new one.
+        self.presented_frame.store(false, Ordering::Release);
     }
 
     fn ensure_texture(&mut self, width: u32, height: u32) -> bool {
@@ -533,13 +618,19 @@ impl RemotePipeline {
         true
     }
 
-    fn upload(&mut self, frame: &mut FramePacket) -> bool {
+    fn upload(&mut self, frame: &mut FramePacket) -> UploadOutcome {
         if let Some(native) = frame.nv12.as_ref() {
             self.upload_nv12(native)
         } else if frame.rgba.is_some() {
-            self.upload_rgba(frame)
+            if self.upload_rgba(frame) {
+                UploadOutcome::Uploaded
+            } else {
+                UploadOutcome::Invalid
+            }
+        } else if self.upload_mvs(frame) {
+            UploadOutcome::Uploaded
         } else {
-            self.upload_mvs(frame)
+            UploadOutcome::Incomplete
         }
     }
 
@@ -566,7 +657,12 @@ impl RemotePipeline {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                // `COPY_SRC` lets the recorder read the decoded planes back
+                // verbatim; it costs nothing for a texture the presenter already
+                // keeps on the GPU.
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             })
         };
@@ -586,7 +682,7 @@ impl RemotePipeline {
         let uv_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let conversion_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ARD NV12 YCbCr conversion"),
-            size: 48,
+            size: YUV_CONVERSION_UNIFORM_BYTES,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -619,17 +715,23 @@ impl RemotePipeline {
             uv_texture,
             conversion_buffer,
             render_bind_group,
+            range: crate::media::YuvRange::Video,
+            matrix: crate::media::YuvMatrix::Bt709,
+            primaries: crate::media::YuvPrimaries::Bt709,
+            fully_initialized: false,
+            initialized_y: vec![false; height as usize],
+            initialized_uv: vec![false; height.div_ceil(2) as usize],
         });
         true
     }
 
-    fn upload_nv12(&mut self, frame: &crate::media::DecodedFrame) -> bool {
+    fn upload_nv12(&mut self, frame: &crate::media::DecodedFrame) -> UploadOutcome {
         let width = frame.width;
         let height = frame.height;
         let uv_width = width.div_ceil(2);
         let uv_height = height.div_ceil(2);
         let Some(uv_bytes_per_row) = uv_width.checked_mul(2) else {
-            return false;
+            return UploadOutcome::Invalid;
         };
         for update in &frame.updates {
             let pixels = &update.pixels;
@@ -642,6 +744,7 @@ impl RemotePipeline {
             if pixels.width != width
                 || pixels.range != frame.range
                 || pixels.matrix != frame.matrix
+                || pixels.primaries != frame.primaries
                 || expected_y != Some(pixels.y_plane.len())
                 || expected_uv != Some(pixels.uv_plane.len())
                 || update.y_origin.saturating_add(update.y_rows) > height
@@ -649,22 +752,32 @@ impl RemotePipeline {
                 || update.y_rows > pixels.height
                 || update.uv_rows > pixels.height.div_ceil(2)
             {
-                return false;
+                return UploadOutcome::Invalid;
             }
         }
         let recreated = self.ensure_nv12_texture(width, height);
         if !recreated && self.native_nv12.is_none() {
-            return false;
+            return UploadOutcome::Invalid;
         }
-        if recreated && frame.updates.len() < 4 {
-            // A fresh texture must be initialized by all four native desktop
-            // slices. The compositor guarantees this after startup, loss, or
-            // a dimension change.
-            self.native_nv12 = None;
-            return false;
+        // Partial frames may initialize the surface across several redraws.
+        // Counting updates neither proves coverage nor remembers earlier rows.
+        let native = self.native_nv12.as_mut().expect("native textures exist");
+        native.range = frame.range;
+        native.matrix = frame.matrix;
+        native.primaries = frame.primaries;
+        for update in &frame.updates {
+            native.initialized_y
+                [update.y_origin as usize..(update.y_origin + update.y_rows) as usize]
+                .fill(true);
+            native.initialized_uv
+                [update.uv_origin as usize..(update.uv_origin + update.uv_rows) as usize]
+                .fill(true);
         }
+        native.fully_initialized = native.initialized_y.iter().all(|&row| row)
+            && native.initialized_uv.iter().all(|&row| row);
         *self.pending_mvs_decode.lock().expect("decode lock") = None;
-        self.present_native_nv12 = true;
+        let native = self.native_nv12.as_ref().expect("native textures exist");
+        self.present_native_nv12 = native.fully_initialized;
         let native = self.native_nv12.as_ref().expect("native textures exist");
         for update in &frame.updates {
             if update.y_rows != 0 {
@@ -732,7 +845,11 @@ impl RemotePipeline {
             0,
             bytemuck::cast_slice(&conversion),
         );
-        true
+        if self.present_native_nv12 {
+            UploadOutcome::Uploaded
+        } else {
+            UploadOutcome::Incomplete
+        }
     }
 
     fn upload_rgba(&mut self, frame: &FramePacket) -> bool {
@@ -758,6 +875,9 @@ impl RemotePipeline {
         }
         *self.pending_mvs_decode.lock().expect("decode lock") = None;
         self.present_native_nv12 = false;
+        // The CPU framebuffer overwrites these pixels. Coefficient equality
+        // with an earlier MVS frame no longer proves the texture is current.
+        self.uploaded_mvs_tiles = None;
         let decoded = self.decoded.as_ref().expect("texture exists");
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -797,15 +917,36 @@ impl RemotePipeline {
             self.uploaded_quantization != Some(quantization) || self.quantization_buffer.is_none();
         let mut tiles = if same_dimensions {
             let mut tiles = self.uploaded_mvs_tiles.take().expect("dimensions checked");
-            tiles.merge(incoming, recreated || quantization_changed);
+            // prepare can run again before render consumes the pending dispatch.
+            // Keep its dirty tiles until that dispatch has actually been encoded.
+            if self
+                .pending_mvs_decode
+                .lock()
+                .expect("decode lock")
+                .is_none()
+            {
+                tiles.clear_dirty();
+            }
+            tiles.merge(incoming, false);
+            if recreated {
+                tiles.mark_all_dirty();
+            }
             tiles
         } else {
             incoming
         };
         let dirty = tiles.dirty_len();
-        if dirty == 0 {
+        if dirty == 0 && !recreated {
             tiles.clear_dirty();
             self.uploaded_mvs_tiles = Some(tiles);
+            return false;
+        }
+        if dirty == 0 {
+            // `ensure_texture` just replaced the presentation texture, so the
+            // previous tile set no longer matches it and there is nothing new
+            // to decode. Skip this frame instead of presenting a texture that
+            // has never been written (which showed as a black canvas).
+            self.uploaded_mvs_tiles = None;
             return false;
         }
         pack_dirty_gpu_tiles(&tiles, &mut self.records_scratch, &mut self.payload_scratch);
@@ -880,9 +1021,63 @@ impl RemotePipeline {
         }
         *self.pending_mvs_decode.lock().expect("decode lock") =
             Some(u32::try_from(dirty).expect("tile count fits u32"));
-        tiles.clear_dirty();
         self.uploaded_mvs_tiles = Some(tiles);
         true
+    }
+
+    /// Hand the frame that was just drawn to the recorder.
+    ///
+    /// The capture reads the same source texture the draw sampled, so an MVS
+    /// frame is recorded exactly as the GPU decoded it and an AVC frame is
+    /// recorded as the decoded planes, at the remote resolution — never as a
+    /// second, differently scaled or filtered copy of the window.
+    fn capture_recording(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(control) = self.recording.as_ref() else {
+            return;
+        };
+        let Ok(mut slot) = self.recording_tap.lock() else {
+            return;
+        };
+        let tap = slot.get_or_insert_with(|| RecordingTap::new(&self.device));
+        if !tap.sync(control) {
+            return;
+        }
+        // The first frame of a take is whatever is already on screen, even if
+        // this redraw uploaded nothing new.
+        let started = tap.take_started();
+        let pending = self.presented_frame.swap(false, Ordering::AcqRel);
+        if !started && !pending {
+            return;
+        }
+        let source = if self.present_native_nv12
+            && self
+                .native_nv12
+                .as_ref()
+                .is_some_and(|native| native.fully_initialized)
+        {
+            let Some(native) = self.native_nv12.as_ref() else {
+                return;
+            };
+            PresentationSource::Nv12 {
+                y: &native.y_texture,
+                uv: &native.uv_texture,
+                width: native.width,
+                height: native.height,
+                range: native.range,
+                matrix: native.matrix,
+                primaries: native.primaries,
+            }
+        } else {
+            let Some(decoded) = self.decoded.as_ref() else {
+                return;
+            };
+            PresentationSource::Rgba {
+                texture: &decoded.texture,
+                width: decoded.width,
+                height: decoded.height,
+            }
+        };
+        tap.capture(encoder, source, Instant::now());
     }
 
     fn render(
@@ -905,7 +1100,12 @@ impl RemotePipeline {
             let (workgroups_x, workgroups_y) = mvs_dispatch_size(workgroups);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
-        let (frame_width, frame_height) = if self.present_native_nv12 {
+        let (frame_width, frame_height) = if self.present_native_nv12
+            && self
+                .native_nv12
+                .as_ref()
+                .is_some_and(|native| native.fully_initialized)
+        {
             let Some(native) = &self.native_nv12 else {
                 return;
             };
@@ -930,6 +1130,12 @@ impl RemotePipeline {
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return;
         }
+        // Zooming a large framebuffer on a HiDPI canvas can compute a viewport
+        // larger than the device's maximum texture dimension, which wgpu rejects
+        // as an invalid viewport (and, with iced's default error handling, kills
+        // the frame). Shrink about the centre instead: the scissor already clips
+        // to the canvas, so the visible result is unchanged.
+        let viewport = clamp_viewport(viewport, self.device.limits().max_texture_dimension_2d);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ARD frame presentation"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1003,6 +1209,7 @@ impl RemotePipeline {
         }
         pass.draw(0..3, 0..1);
         drop(pass);
+        self.capture_recording(encoder);
         let timing = self
             .pending_avc_timing
             .lock()
@@ -1018,7 +1225,28 @@ impl RemotePipeline {
     }
 }
 
-fn yuv_conversion(range: crate::media::YuvRange, matrix: crate::media::YuvMatrix) -> [f32; 12] {
+/// Size of the presentation conversion uniform: three `vec4` rows for the
+/// YCbCr-to-RGB matrix followed by an identity primaries matrix in the padded
+/// three-column layout WGSL uses for `mat3x3<f32>` in uniform address space.
+///
+/// The primaries step stays the identity on purpose. The reference client
+/// presents the decoded planes with their numbers unchanged, so a stream that
+/// declares Display P3 reaches the screen as those same sRGB numbers:
+///
+/// * the native client's own snapshot of the take
+///   (`屏幕共享图片2026年9月22日 GMT+8下午1.12.27.jpeg`, 3548x1996, sRGB) has a flat
+///   background of `(51.96, 117.96, 115.96)`;
+/// * the decoded planes of the same desktop are `(52.01, 117.01, 115.01)`, and
+///   a recording of them carries those numbers too;
+/// * rotating the planes' P3 numbers into sRGB instead produces
+///   `(4.0, 120.0, 116.0)` — 48 levels of red away from what the native client
+///   shows, which is exactly the whole-frame colour error being fixed here.
+///
+/// The recorder still tags the recorded frames with the stream's real primaries;
+/// only this presentation step is pass-through.
+const YUV_CONVERSION_UNIFORM_BYTES: u64 = 24 * 4;
+
+fn yuv_conversion(range: crate::media::YuvRange, matrix: crate::media::YuvMatrix) -> [f32; 24] {
     let (kr, kb) = match matrix {
         crate::media::YuvMatrix::Bt601 => (0.299_f32, 0.114_f32),
         crate::media::YuvMatrix::Bt709 => (0.2126_f32, 0.0722_f32),
@@ -1047,6 +1275,18 @@ fn yuv_conversion(range: crate::media::YuvRange, matrix: crate::media::YuvMatrix
         blue_cb,
         0.0,
         -y_scale * y_offset - blue_cb * chroma_offset,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
     ]
 }
 
@@ -1105,10 +1345,39 @@ fn pack_dirty_gpu_tiles(tiles: &TileSet, records: &mut Vec<u32>, payload: &mut V
     payload.clear();
     records.reserve(1 + tiles.dirty_len().saturating_mul(8));
     records.push(u32::try_from(tiles.dirty_len()).expect("tile count fits u32"));
-    tiles.for_each_dirty(|update| pack_one_gpu_tile(update, records, payload));
+    tiles.for_each_dirty(|update| {
+        pack_one_gpu_tile(update, tiles.quantization_for(update), records, payload)
+    });
     if payload.is_empty() {
         payload.push(0);
     }
+}
+
+/// Shrinks `viewport` about its centre until it fits inside `max_dimension`.
+///
+/// wgpu rejects a viewport wider or taller than the device's maximum texture
+/// dimension. Large framebuffers zoomed on a HiDPI canvas can exceed it, so the
+/// viewport is scaled down (preserving aspect) rather than being submitted
+/// invalid. Clipping to the canvas is the scissor's job, so the visible result
+/// is unchanged.
+fn clamp_viewport(viewport: Rectangle, max_dimension: u32) -> Rectangle {
+    if max_dimension == 0 {
+        return viewport;
+    }
+    let max = max_dimension as f32;
+    if viewport.width <= max && viewport.height <= max {
+        return viewport;
+    }
+    let shrink = (max / viewport.width).min(max / viewport.height);
+    let width = viewport.width * shrink;
+    let height = viewport.height * shrink;
+    Rectangle::new(
+        iced::Point::new(
+            viewport.center_x() - width / 2.0,
+            viewport.center_y() - height / 2.0,
+        ),
+        iced::Size::new(width, height),
+    )
 }
 
 fn mvs_dispatch_size(workgroups: u32) -> (u32, u32) {
@@ -1121,7 +1390,12 @@ fn mvs_dispatch_size(workgroups: u32) -> (u32, u32) {
     (workgroups_x, workgroups_y)
 }
 
-fn pack_one_gpu_tile(update: &MvsGpuTileUpdate, records: &mut Vec<u32>, payload: &mut Vec<i32>) {
+fn pack_one_gpu_tile(
+    update: &MvsGpuTileUpdate,
+    quantization: &[[u16; 64]; 2],
+    records: &mut Vec<u32>,
+    payload: &mut Vec<i32>,
+) {
     let data_offset = payload.len() as u32;
     let (kind, color) = match &update.tile {
         MvsGpuTile::SolidYcbcr(sample) => (0, pack_bytes(*sample, 255)),
@@ -1135,14 +1409,26 @@ fn pack_one_gpu_tile(update: &MvsGpuTileUpdate, records: &mut Vec<u32>, payload:
             (3, 0)
         }
         MvsGpuTile::RiceDct(coefficients) => {
-            for component in coefficients.iter() {
-                payload.extend(component.iter().map(|&value| i32::from(value)));
+            for (index, component) in coefficients.iter().enumerate() {
+                let table = &quantization[usize::from(index != 0)];
+                payload.extend(
+                    component
+                        .iter()
+                        .zip(table)
+                        .map(|(&value, &quant)| i32::from(value) * i32::from(quant)),
+                );
             }
             (5, 0)
         }
         MvsGpuTile::Dct(coefficients) => {
-            for component in coefficients.iter() {
-                payload.extend(component.iter().map(|&value| i32::from(value)));
+            for (index, component) in coefficients.iter().enumerate() {
+                let table = &quantization[usize::from(index != 0)];
+                payload.extend(
+                    component
+                        .iter()
+                        .zip(table)
+                        .map(|(&value, &quant)| i32::from(value) * i32::from(quant)),
+                );
             }
             (4, 0)
         }
@@ -1170,7 +1456,16 @@ mod tests {
     use ard_rs::{ArdVideoQuality, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, PixelFormat};
 
     use super::{mvs_dispatch_size, remote_display, yuv_conversion};
+    #[allow(unused_imports)]
+    use crate::media::YuvPrimaries;
+    use crate::recording::RecordingControl;
     use crate::session_runtime::{FrameMailbox, FramePacket, framebuffer_to_rgba};
+
+    /// A control with no active take: these tests exercise rendering, not
+    /// recording, so the tap stays idle.
+    fn idle_recording() -> Arc<RecordingControl> {
+        Arc::new(RecordingControl::new())
+    }
 
     #[test]
     fn gpu_shader_is_valid_wgsl() {
@@ -1213,6 +1508,166 @@ mod tests {
         }
     }
 
+    /// End-to-end check of the presentation colour chain against the native
+    /// client's own snapshot of the same desktop.
+    ///
+    /// The flat background of `~/Movies/ARD Viewer` decodes to full-range NV12
+    /// `Y=104 U=134 V=95` while the stream declares Display P3 primaries with
+    /// the sRGB transfer function. The native client's snapshot of that desktop
+    /// (`屏幕共享图片2026年9月22日 GMT+8下午1.12.27.jpeg`, tagged sRGB) measures
+    /// `(51.96, 117.96, 115.96)` there, and the decoded planes measure
+    /// `(52.01, 117.01, 115.01)`: the reference presents the plane numbers as
+    /// they are. Rotating them through the P3 matrix would instead reach the
+    /// screen as `(4.0, 120.0, 116.0)`, 48 levels of red away from the
+    /// reference, which is the whole-frame colour error this keeps out.
+    #[test]
+    fn presentation_keeps_the_planes_colour_numbers() {
+        let yuv = yuv_conversion(crate::media::YuvRange::Full, crate::media::YuvMatrix::Bt709);
+        let y = 104.0 / 255.0;
+        let cb = 134.0 / 255.0;
+        let cr = 95.0 / 255.0;
+        let encoded = [0, 4, 8]
+            .map(|row| yuv[row] * y + yuv[row + 1] * cb + yuv[row + 2] * cr + yuv[row + 3]);
+        let srgb = encoded.map(|value| (value * 255.0).round());
+        assert_eq!(srgb, [52.0, 118.0, 115.0]);
+    }
+
+    /// The presenter hands the surface linear values and the surface encodes
+    /// them with the sRGB transfer function, so every 8-bit code must survive
+    /// that round trip: a curve mismatch would shift the whole picture by a
+    /// level against the reference client and against a recording.
+    #[test]
+    fn presentation_round_trip_is_exact() {
+        fn linearize(encoded: f32) -> f32 {
+            if encoded <= 0.04045 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn encode(linear: f32) -> f32 {
+            if linear <= 0.0031308 {
+                12.92 * linear
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            }
+        }
+        for code in 0..=255_u16 {
+            let encoded = f32::from(code) / 255.0;
+            let round_tripped = (encode(linearize(encoded)) * 255.0).round();
+            assert_eq!(
+                round_tripped,
+                f32::from(code),
+                "code {code} came back as {round_tripped}"
+            );
+        }
+    }
+
+    /// The conversion uniform's primaries block must stay the identity: a
+    /// rotation there is invisible in the YCbCr coefficients and would silently
+    /// move the whole picture's colour away from the reference client.
+    #[test]
+    fn conversion_uniform_does_not_rotate_primaries() {
+        let uniform = yuv_conversion(crate::media::YuvRange::Full, crate::media::YuvMatrix::Bt709);
+        assert_eq!(uniform.len(), 24);
+        assert_eq!(
+            &uniform[12..],
+            &[
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0,
+            ]
+        );
+    }
+
+    /// End-to-end check of the presented colour through the real GPU pipeline.
+    ///
+    /// The take's flat background is full-range NV12 with `Y=104 Cb=134 Cr=95`
+    /// and Display P3 primaries; the native client's snapshot of that desktop
+    /// measures it as `(51.97, 118.97, 115.96)` sRGB. Rotating the planes
+    /// through the P3 matrix instead reaches the screen as `(4, 120, 116)`,
+    /// which is the whole-frame colour error this presentation keeps out.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a GPU and writes a visual QA snapshot to /tmp"]
+    fn flat_background_reaches_the_screen_as_the_native_client_shows_it()
+    -> Result<(), iced_test::Error> {
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
+        mailbox.lock().expect("mailbox").latest = Some(FramePacket::from_nv12(
+            crate::media::DecodedFrame {
+                width: 2,
+                height: 2,
+                encoded_bytes: 6,
+                range: crate::media::YuvRange::Full,
+                matrix: crate::media::YuvMatrix::Bt709,
+                primaries: crate::media::YuvPrimaries::P3D65,
+                updates: vec![crate::media::DecodedSliceUpdate {
+                    slice_index: 0,
+                    y_origin: 0,
+                    y_rows: 2,
+                    uv_origin: 0,
+                    uv_rows: 1,
+                    pixels: crate::media::DecodedSlice {
+                        width: 2,
+                        height: 2,
+                        y_plane: vec![104, 104, 104, 104],
+                        uv_plane: vec![134, 95],
+                        range: crate::media::YuvRange::Full,
+                        matrix: crate::media::YuvMatrix::Bt709,
+                        primaries: crate::media::YuvPrimaries::P3D65,
+                    },
+                }],
+                timing: None,
+            },
+            ArdVideoQuality::HighPerformanceAvc,
+        ));
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(320.0, 200.0),
+            remote_display::<()>(mailbox, 1.0, false, true, false, idle_recording()),
+        );
+        let snapshot = ui.snapshot(&iced::Theme::Dark)?;
+        let base = "/tmp/ard-viewer-iced-nv12-flat-colour";
+        assert!(snapshot.matches_image(base)?);
+
+        let file = std::fs::File::open(format!("{base}-wgpu.png"))?;
+        let mut reader = png::Decoder::new(std::io::BufReader::new(file)).read_info()?;
+        let mut rgba = vec![0; reader.output_buffer_size().expect("snapshot size")];
+        let info = reader.next_frame(&mut rgba)?;
+        let offset =
+            ((info.height as usize / 2) * info.width as usize + info.width as usize / 2) * 4;
+        let pixel = &rgba[offset..offset + 4];
+        let (red, green, blue) = (pixel[0] as i32, pixel[1] as i32, pixel[2] as i32);
+        // The reference client's numbers for this colour, with room for the
+        // snapshot's own quantisation.
+        assert!(
+            (red - 52).abs() <= 3 && (green - 118).abs() <= 4 && (blue - 115).abs() <= 4,
+            "presented ({red}, {green}, {blue}) is not the reference client's (52, 118, 115)"
+        );
+
+        // The source is one flat colour, so every presented pixel of it must be
+        // that same colour: a dither, banding, or a filter footprint would show
+        // up here as more than one value, which is the "background is not a
+        // solid colour" a viewer reports.
+        let mut seen: Vec<(u8, u8, u8)> = Vec::new();
+        for row in (info.height as usize / 4)..(info.height as usize * 3 / 4) {
+            for column in (info.width as usize / 4)..(info.width as usize * 3 / 4) {
+                let at = (row * info.width as usize + column) * 4;
+                let value = (rgba[at], rgba[at + 1], rgba[at + 2]);
+                if !seen.contains(&value) {
+                    seen.push(value);
+                }
+            }
+        }
+        assert!(
+            seen.len() <= 2,
+            "a flat source reached the screen with {} distinct values: {:?}",
+            seen.len(),
+            seen
+        );
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires a GPU and writes a visual QA snapshot to /tmp"]
@@ -1225,6 +1680,7 @@ mod tests {
                 encoded_bytes: 12,
                 range: crate::media::YuvRange::Video,
                 matrix: crate::media::YuvMatrix::Bt709,
+                primaries: crate::media::YuvPrimaries::Bt709,
                 updates: (0..4)
                     .map(|slice_index| crate::media::DecodedSliceUpdate {
                         slice_index,
@@ -1239,6 +1695,7 @@ mod tests {
                             uv_plane: vec![128, 128],
                             range: crate::media::YuvRange::Video,
                             matrix: crate::media::YuvMatrix::Bt709,
+                            primaries: crate::media::YuvPrimaries::Bt709,
                         },
                     })
                     .collect(),
@@ -1249,7 +1706,7 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0, false, true, false),
+            remote_display::<()>(mailbox, 1.0, false, true, false, idle_recording()),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
         let snapshot_base = "/tmp/ard-viewer-iced-nv12-slice-pipeline";
@@ -1303,10 +1760,20 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0, false, true, false),
+            remote_display::<()>(mailbox, 1.0, false, false, false, idle_recording()),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
-        assert!(snapshot.matches_image("/tmp/ard-viewer-iced-rgba-pipeline")?);
+        let pixels = snapshot_pixels(snapshot, "rgba");
+        for (x, y, expected) in [
+            (270, 100, [255, 0, 0, 255]),
+            (370, 100, [0, 255, 0, 255]),
+            (270, 300, [0, 0, 255, 255]),
+            (370, 300, [255, 255, 255, 255]),
+        ] {
+            let pixel = &pixels[(y * 640 + x) * 4..(y * 640 + x + 1) * 4];
+            // Sample within each nearest-neighbour colour quadrant.
+            assert_eq!(pixel, expected);
+        }
         Ok(())
     }
 
@@ -1333,10 +1800,239 @@ mod tests {
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
             iced::Size::new(320.0, 200.0),
-            remote_display::<()>(mailbox, 1.0, false, true, false),
+            remote_display::<()>(mailbox, 1.0, false, true, false, idle_recording()),
         );
         let snapshot = ui.snapshot(&iced::Theme::Dark)?;
         assert!(snapshot.matches_image("/tmp/ard-viewer-iced-mvs-pipeline")?);
+        Ok(())
+    }
+    fn snapshot_pixels(snapshot: iced_test::simulator::Snapshot, name: &str) -> Vec<u8> {
+        let base = std::env::temp_dir().join(format!("ard-pixels-{}-{name}", std::process::id()));
+        let path = base.with_file_name(format!(
+            "{}-wgpu.png",
+            base.file_name().unwrap().to_string_lossy()
+        ));
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert!(snapshot.matches_image(&base).unwrap());
+        let mut reader =
+            png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+                .read_info()
+                .unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut pixels).unwrap();
+        pixels
+    }
+
+    fn dct_frame(x: u16, quant: u16) -> MvsGpuFrame {
+        let mut coefficients = [[0; 64]; 3];
+        coefficients[0][0] = 8;
+        MvsGpuFrame {
+            framebuffer_width: 16,
+            framebuffer_height: 8,
+            luminance_quantization: [quant; 64],
+            chrominance_quantization: [1; 64],
+            tiles: vec![MvsGpuTileUpdate {
+                x,
+                y: 0,
+                width: 8,
+                height: 8,
+                tile: MvsGpuTile::Dct(Arc::new(coefficients)),
+            }],
+        }
+    }
+
+    #[test]
+    fn mvs_coalescing_preserves_each_tiles_quantization() {
+        let mut first = FramePacket::from_mvs(dct_frame(0, 8), ArdVideoQuality::Adaptive);
+        let second = FramePacket::from_mvs(dct_frame(8, 24), ArdVideoQuality::Adaptive);
+        first.tiles.merge(second.tiles, false);
+        let mut records = Vec::new();
+        let mut payload = Vec::new();
+        super::pack_dirty_gpu_tiles(&first.tiles, &mut records, &mut payload);
+        assert_eq!(records[0], 2);
+        for record in records[1..].chunks_exact(8) {
+            assert_eq!(
+                payload[record[5] as usize],
+                if record[0] == 0 { 64 } else { 192 }
+            );
+        }
+        first.tiles.clear_dirty();
+        first.tiles.merge(
+            FramePacket::from_mvs(dct_frame(0, 16), ArdVideoQuality::Adaptive).tiles,
+            false,
+        );
+        assert_eq!(
+            first.tiles.dirty_len(),
+            1,
+            "same coefficients with a new quantizer must be redrawn"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU; exports and checks actual presentation pixels"]
+    fn incremental_mvs_quantization_pixels_match_expected_luma() -> Result<(), iced_test::Error> {
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
+        let mut initial = FramePacket::from_mvs(dct_frame(0, 8), ArdVideoQuality::Adaptive);
+        initial.tiles.merge(
+            FramePacket::from_mvs(dct_frame(8, 24), ArdVideoQuality::Adaptive).tiles,
+            false,
+        );
+        mailbox.lock().unwrap().latest = Some(initial);
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(8.0, 4.0),
+            remote_display::<()>(
+                Arc::clone(&mailbox),
+                1.0,
+                false,
+                false,
+                false,
+                idle_recording(),
+            ),
+        );
+        let pixels = snapshot_pixels(ui.snapshot(&iced::Theme::Dark)?, "mvs-quantization");
+        assert_eq!(pixels.len(), 16 * 8 * 4);
+        for y in 0..8 {
+            for x in 0..16 {
+                let expected = if x < 8 { 136 } else { 152 };
+                assert_eq!(
+                    &pixels[(y * 16 + x) * 4..(y * 16 + x + 1) * 4],
+                    &[expected, expected, expected, 255]
+                );
+            }
+        }
+        mailbox.lock().unwrap().latest = Some(FramePacket::from_mvs(
+            dct_frame(0, 16),
+            ArdVideoQuality::Adaptive,
+        ));
+        let pixels = snapshot_pixels(ui.snapshot(&iced::Theme::Dark)?, "mvs-incremental");
+        for y in 0..8 {
+            for x in 0..16 {
+                let expected = if x < 8 { 144 } else { 152 };
+                assert_eq!(
+                    &pixels[(y * 16 + x) * 4..(y * 16 + x + 1) * 4],
+                    &[expected, expected, expected, 255]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a GPU; verifies switching CPU and GPU frame updates"]
+    fn rgba_overwrite_invalidates_mvs_pixel_cache() -> Result<(), iced_test::Error> {
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
+        let mut initial = FramePacket::from_mvs(dct_frame(0, 8), ArdVideoQuality::Adaptive);
+        initial.tiles.merge(
+            FramePacket::from_mvs(dct_frame(8, 8), ArdVideoQuality::Adaptive).tiles,
+            false,
+        );
+        mailbox.lock().unwrap().latest = Some(initial);
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(8.0, 4.0),
+            remote_display::<()>(
+                Arc::clone(&mailbox),
+                1.0,
+                false,
+                false,
+                false,
+                idle_recording(),
+            ),
+        );
+        let _ = ui.snapshot(&iced::Theme::Dark)?;
+        mailbox.lock().unwrap().latest = Some(FramePacket::from_rgba(
+            16,
+            8,
+            [0, 255, 0, 255].repeat(128),
+            ArdVideoQuality::Adaptive,
+        ));
+        let _ = ui.snapshot(&iced::Theme::Dark)?;
+        mailbox.lock().unwrap().latest = Some(FramePacket::from_mvs(
+            dct_frame(0, 8),
+            ArdVideoQuality::Adaptive,
+        ));
+        let pixels = snapshot_pixels(ui.snapshot(&iced::Theme::Dark)?, "mvs-after-rgba");
+        for y in 0..8 {
+            for x in 0..16 {
+                let expected = if x < 8 {
+                    [136, 136, 136, 255]
+                } else {
+                    [0, 255, 0, 255]
+                };
+                assert_eq!(&pixels[(y * 16 + x) * 4..(y * 16 + x + 1) * 4], &expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a GPU; exports and checks actual presentation pixels"]
+    fn nv12_partial_initialization_preserves_all_rows() -> Result<(), iced_test::Error> {
+        use crate::media::{DecodedFrame, DecodedSlice, DecodedSliceUpdate, YuvMatrix, YuvRange};
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(4.0, 4.0),
+            remote_display::<()>(
+                Arc::clone(&mailbox),
+                1.0,
+                false,
+                false,
+                false,
+                idle_recording(),
+            ),
+        );
+        for index in 0..4 {
+            mailbox.lock().unwrap().latest = Some(FramePacket::from_nv12(
+                DecodedFrame {
+                    width: 8,
+                    height: 8,
+                    encoded_bytes: 0,
+                    range: YuvRange::Full,
+                    matrix: YuvMatrix::Bt709,
+                    primaries: YuvPrimaries::Bt709,
+                    timing: None,
+                    updates: vec![DecodedSliceUpdate {
+                        slice_index: index,
+                        y_origin: index as u32 * 2,
+                        y_rows: 2,
+                        uv_origin: index as u32,
+                        uv_rows: 1,
+                        pixels: DecodedSlice {
+                            width: 8,
+                            height: 2,
+                            y_plane: vec![32 + index as u8 * 48; 16],
+                            uv_plane: vec![128; 8],
+                            range: YuvRange::Full,
+                            matrix: YuvMatrix::Bt709,
+                            primaries: YuvPrimaries::Bt709,
+                        },
+                    }],
+                },
+                ArdVideoQuality::HighPerformanceHevc,
+            ));
+            let pixels = snapshot_pixels(
+                ui.snapshot(&iced::Theme::Dark)?,
+                &format!("nv12-partial-{index}"),
+            );
+            if index == 3 {
+                assert_eq!(pixels.len(), 8 * 8 * 4);
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let expected = 32 + (y / 2) as u8 * 48;
+                        let pixel = &pixels[(y * 8 + x) * 4..(y * 8 + x + 1) * 4];
+                        assert!(
+                            pixel[..3].iter().all(|&v| v.abs_diff(expected) <= 1),
+                            "row {y}: {pixel:?}, expected {expected}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

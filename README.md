@@ -67,6 +67,37 @@ arbitrarily cropped. The optional performance HUD exposes RTP reassembly, DON
 reorder, receive/decode/render-command timing, input queue/write latency, and
 requested-versus-decoded resolution.
 
+## Session recording
+
+The record button in the session toolbar (and its elapsed-time badge) writes the
+session to an MP4 file. Recording is attached to the presentation boundary: the
+renderer copies the texture it is about to draw — the GPU-decoded MVS tiles, the
+RGB framebuffer, or the decoded AVC planes — so the file holds the frames that
+were actually on screen, at the remote resolution and in the formats the system
+encoder takes (BGRA or the decoded NV12 planes, with the same colour range and
+matrix the presenter used).
+
+Every frame is stamped with the instant it was presented and the container stores
+the measured duration of each sample, so the recording is variable-rate and
+playback holds each frame for exactly as long as the viewer did. A static desktop
+is one long sample instead of repeated identical frames, and a slow window never
+shifts the frames that follow it.
+
+Encoding uses the platform hardware encoder — VideoToolbox H.264 on macOS and the
+Media Foundation H.264 encoder on Windows — on a dedicated thread, so the render
+thread only encodes a GPU copy and never waits for a readback. Recording captures
+every presented frame in the three quality modes that were exercised against a
+live server (adaptive MVS, full-quality zlib, and high-performance AVC), with the
+capture and encode counters and drop count shown in the performance HUD. The
+output directory and the encoder quality (bits per pixel) are configured in
+Settings → 常规 (General) → 录制 (Recording); the default is `~/Movies/ARD Viewer`, and files are named
+after the remote host with a number that never overwrites an existing recording.
+
+Stopping is asynchronous: the frames already staged for the presentation in
+flight are handed over on the next redraw and the encoder is flushed afterwards,
+which is why the badge shows "saving" for a moment. Closing the window or quitting
+finalizes the file as well.
+
 For a remote Mac behind explicit port forwarding, the connection form accepts
 independent external UDP overrides for audio, primary video, and secondary
 video. Empty fields use the ports advertised by the server. An override changes
@@ -109,11 +140,6 @@ ZRLE, and Apple's three sub-zlib encodings. `ard-core` retains the negotiated
 RFB pixel bytes; the viewer converts them at its presentation boundary before
 uploading complete snapshots to the GPU texture. Pending full-frame snapshots
 are coalesced so a slow window cannot grow latency or memory without bound.
-
-Reverse-engineering notes are in
-[`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md). A step-by-step playbook
-for reproducing the native-code investigation and oracle validation is in
-[`docs/REVERSE_ENGINEERING_PLAYBOOK.md`](docs/REVERSE_ENGINEERING_PLAYBOOK.md).
 
 ARD reuses RFB message framing, but it is not merely a normal VNC session. This
 crate implements Apple-specific protocol behavior directly and does not depend
@@ -179,6 +205,9 @@ on a VNC library or a native operating-system library.
   MVS tile/DCT output, viewer-side RGBA upload, mouse/keyboard/IME input, bidirectional
   clipboard synchronization, live FPS/traffic metrics, and
   Metal/D3D12/Vulkan presentation
+- session recording to MP4 (`ard-viewer/src/recording/`) that captures the
+  presented texture through the GPU, encodes it with the platform hardware
+  encoder, and stores a variable-rate timeline of the frames that were on screen
 - high-performance AVC media mode (`1010`) with binary-plist negotiation,
   authenticated cipher-suite-5 SRTP/AES-256-CTR, cross-SSRC DON/DONL-ordered
   H.264/HEVC depacketization, dedicated UDP receive, macOS VideoToolbox or
@@ -199,9 +228,6 @@ records while exercising keyboard, pointer, and clipboard messages. A Rust
 client has also completed a private live
 session against macOS `screensharingd` and decoded a fully covered framebuffer;
 the captured payload and pixels are deliberately not stored in this repository.
-See
-[`docs/SCREENSHARING_RE.md`](docs/SCREENSHARING_RE.md) for confirmed evidence
-and the exact remaining work.
 
 ## Pure Rust guarantee
 
@@ -225,6 +251,18 @@ cargo check -p ard-core --target wasm32-wasip1
 cargo check -p ard-viewer --target x86_64-unknown-linux-musl --bin ard-viewer
 cargo check -p ard-viewer --target x86_64-pc-windows-gnu --bin ard-viewer
 ```
+
+Recording is verified at two levels. Unit tests drive the real platform encoder
+and container with synthetic frames, then decode the result with an independent
+decoder (`ffmpeg`) and compare every frame and every presentation timestamp
+against its source. Separate tests render the presentation texture through an
+actual `wgpu` device and assert that the captured staging buffer is byte-for-byte
+the presented frame — both the swizzled BGRA path and the NV12 plane path.
+
+A third test drives the dump through the real encoder, container and dump writer
+and then checks with `ffprobe` that the dump's samples and the video's packets
+agree on every presentation time and duration, and that the dumped bytes are the
+frames the encoder was handed.
 
 The test suite includes the exact ARD banner and security offer captured from
 the local macOS Screen Sharing server, Apple type-30 authentication framing,

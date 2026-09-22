@@ -4,7 +4,8 @@ use std::thread;
 use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdDisplayConfiguration, ArdDisplaySelection,
     ArdFrameOutput, ArdReconnectPolicy, ArdVideoQuality, EncryptedTransportOracle, MvsGpuTile,
-    OracleMode, PixelFormat,
+    OracleMode, PixelFormat, RawStreamIndex, RawStreamKind, RawStreamSink, RecordFraming,
+    TakeOrigin,
 };
 
 #[test]
@@ -17,7 +18,6 @@ fn client_sends_fixed_display_configuration_inside_encrypted_transport() {
         command_support[3] |= 0x04;
         EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             command_support,
             ..EncryptedTransportOracle::default()
         }
@@ -53,7 +53,6 @@ fn receive_only_client_delivers_gpu_mvs_tiles_without_cpu_frame_expansion() {
         let (stream, peer) = listener.accept().unwrap();
         EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             ..EncryptedTransportOracle::default()
         }
         .run(stream, peer)
@@ -125,7 +124,6 @@ fn full_quality_client_negotiates_lossless_zlib_and_updates_native_pixels() {
         let (stream, peer) = listener.accept().unwrap();
         EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             ..EncryptedTransportOracle::default()
         }
         .run(stream, peer)
@@ -166,7 +164,6 @@ fn client_selects_one_display_inside_the_encrypted_preface() {
         let (stream, peer) = listener.accept().unwrap();
         EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             close_after_frames: Some(1),
             ..EncryptedTransportOracle::default()
         }
@@ -197,7 +194,6 @@ fn client_can_retain_server_native_pixel_bytes() {
         let (stream, peer) = listener.accept().unwrap();
         EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             ..EncryptedTransportOracle::default()
         }
         .run(stream, peer)
@@ -236,7 +232,6 @@ fn fixture_oracle_serves_every_rfb_quality_mode() {
             let (stream, peer) = listener.accept().unwrap();
             EncryptedTransportOracle {
                 allowed_peer: Some(peer.ip()),
-                expect_security_selection: false,
                 mode,
                 close_after_frames: Some(1),
                 ..EncryptedTransportOracle::default()
@@ -267,7 +262,6 @@ fn fixture_oracle_negotiates_both_media_codecs() {
             let (stream, peer) = listener.accept().unwrap();
             EncryptedTransportOracle {
                 allowed_peer: Some(peer.ip()),
-                expect_security_selection: false,
                 mode,
                 close_after_frames: Some(1),
                 ..EncryptedTransportOracle::default()
@@ -300,7 +294,6 @@ fn client_reconnects_after_a_server_disconnect() {
         let (stream, peer) = listener.accept().unwrap();
         let first = EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             close_after_frames: Some(1),
             ..EncryptedTransportOracle::default()
         }
@@ -310,7 +303,6 @@ fn client_reconnects_after_a_server_disconnect() {
         let (stream, peer) = listener.accept().unwrap();
         let second = EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             ..EncryptedTransportOracle::default()
         }
         .run(stream, peer)
@@ -339,7 +331,6 @@ fn encrypted_client_input_sends_keyboard_pointer_and_clipboard_messages() {
         let (stream, peer) = listener.accept().unwrap();
         EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             ..EncryptedTransportOracle::default()
         }
         .run(stream, peer)
@@ -359,6 +350,15 @@ fn encrypted_client_input_sends_keyboard_pointer_and_clipboard_messages() {
     input.send_pointer_event(0x01, 31, 29).unwrap();
     input.send_pointer_event(0, 31, 29).unwrap();
     input.send_clipboard_text("from viewer").unwrap();
+    // The writer thread is asynchronous. Wait for the queue to drain instead of
+    // relying on a teardown race: before `ArdClient` gained an ordered writer
+    // shutdown, the clipboard could still be queued when the session socket
+    // closed, so under load message type 6 (and occasionally type 4) never
+    // reached the oracle.
+    assert!(
+        client.flush_input(std::time::Duration::from_secs(5)),
+        "queued input must be written before the session is inspected"
+    );
     client.next_frame().unwrap();
 
     drop(input);
@@ -377,7 +377,6 @@ fn next_event_delivers_server_clipboard_text() {
         let (stream, peer) = listener.accept().unwrap();
         EncryptedTransportOracle {
             allowed_peer: Some(peer.ip()),
-            expect_security_selection: false,
             server_clipboard_text: Some(b"from remote".to_vec()),
             ..EncryptedTransportOracle::default()
         }
@@ -402,4 +401,116 @@ fn next_event_delivers_server_clipboard_text() {
 
     drop(client);
     server.join().unwrap();
+}
+
+/// The dump has to hold the take's decrypted server data, not what the client
+/// made of it: every record the take read is in the dump, in order, on the
+/// video's own clock, with the index describing the bytes exactly.
+#[test]
+fn the_raw_stream_dump_holds_the_takes_decrypted_records() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, peer) = listener.accept().unwrap();
+        EncryptedTransportOracle {
+            allowed_peer: Some(peer.ip()),
+            ..EncryptedTransportOracle::default()
+        }
+        .run(stream, peer)
+        .unwrap()
+    });
+
+    let directory = std::env::temp_dir().join(format!(
+        "ard-server-stream-client-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let sink = RawStreamSink::new(&directory, address.to_string());
+    // The dump is armed like a take: it starts at the recording's first frame and
+    // stops with the recording. Nothing outside that interval is dumped.
+    let origin = TakeOrigin::new();
+    sink.start_recording(origin.clone());
+    let mut client = ArdClient::connect(
+        ArdClientConfig::new(address.to_string(), b"viewer".to_vec(), b"oracle".to_vec())
+            .with_raw_stream(sink.clone()),
+    )
+    .unwrap();
+    // Everything the client reads before the take starts is not part of it.
+    assert!(
+        !directory.join("192.0.2.10 server stream.raw").exists()
+            || sink
+                .raw_path(RawStreamKind::Server)
+                .metadata()
+                .is_ok_and(|m| m.len() == 0),
+        "a dump before the take writes nothing"
+    );
+    origin.set(std::time::Instant::now());
+    for _ in 0..3 {
+        client.next_frame().unwrap();
+    }
+    // The path has to be captured before the sink goes away: the dump is
+    // flushed when the last holder of the sink is dropped.
+    assert!(
+        sink.failure().is_none(),
+        "the dump was written without failing"
+    );
+    let raw_path = sink.raw_path(RawStreamKind::Server);
+    drop(client);
+    sink.stop_recording();
+    drop(sink);
+
+    assert!(raw_path.exists());
+    let report = server.join().unwrap();
+    let index_path = raw_path.with_extension("jsonl");
+    let index = RawStreamIndex::read(&index_path).expect("the dump index is readable");
+    assert!(!index.records.is_empty(), "the take's records were dumped");
+    // Every entry sits inside the take's interval, and the clock it carries is
+    // the recorded video's own clock.
+    let take_ms = index.take_ms.expect("the footer records the take's length");
+    assert!(index.records.iter().all(|record| record.t <= take_ms));
+    let raw = std::fs::read(&raw_path).expect("the raw stream is readable");
+    // The index has to describe the file exactly, or a replay would read the
+    // wrong bytes.
+    let mut expected_offset = 0_u64;
+    for (number, record) in index.records.iter().enumerate() {
+        assert_eq!(record.offset, expected_offset, "record {number} offset");
+        assert!(record.length > 0, "record {number} is empty");
+
+        assert_eq!(
+            record.framing,
+            RecordFraming::TcpRecord,
+            "record {number} is a TCP record"
+        );
+        expected_offset += record.length;
+    }
+    assert_eq!(expected_offset, raw.len() as u64);
+    // Sequence numbers arrive in order, and the payload is the server's message
+    // stream: the dumped bytes are exactly the FramebufferUpdate records the
+    // oracle sent and not a header the client invented.
+    for pair in index.records.windows(2) {
+        assert_eq!(pair[1].sequence, pair[0].sequence + 1);
+    }
+    assert_eq!(
+        &raw[..8],
+        &[0, 0, 0, 1, 0, 0, 0, 0],
+        "the first record is a server FramebufferUpdate, byte for byte"
+    );
+
+    // The dump covers the take and not the session around it: it holds every
+    // record the take read, in arrival order, and nothing else. This client stops
+    // reading once it has the frames it asked for, so records the server sent
+    // afterwards stay in the socket and are correctly absent from the dump.
+    assert!(
+        index.records.len() <= report.server_to_client_records,
+        "the dump cannot hold more records than the server sent ({} > {})",
+        index.records.len(),
+        report.server_to_client_records,
+    );
+    // The transport's record sequence numbers are the order the server sent them
+    // in, so a replay reproduces the server's sequence and not merely its bytes.
+    assert_eq!(index.records[0].sequence + 1, index.records[1].sequence);
+
+    std::fs::remove_dir_all(&directory).ok();
 }

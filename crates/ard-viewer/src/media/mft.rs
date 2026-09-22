@@ -15,7 +15,7 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 
-use super::{DecodedOutput, DecodedSlice, YuvMatrix, YuvRange};
+use super::{DecodedOutput, DecodedSlice, YuvMatrix, YuvPrimaries, YuvRange};
 
 #[derive(Debug, Clone, Copy)]
 struct Submission {
@@ -583,6 +583,9 @@ fn copy_contiguous_nv12(bytes: &[u8], format: OutputFormat) -> Result<DecodedSli
         uv_plane: bytes[y_len..required].to_vec(),
         range: format.range,
         matrix: format.matrix,
+        // Media Foundation reports no colour primaries for these NV12 outputs,
+        // so the planes keep the historical sRGB/Rec.709 interpretation.
+        primaries: YuvPrimaries::Bt709,
     })
 }
 

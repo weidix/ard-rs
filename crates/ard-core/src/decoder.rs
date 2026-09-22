@@ -10,6 +10,13 @@ use crate::{
 
 const MAX_REUSABLE_ZRLE_SCRATCH: usize = 8 * 1024 * 1024;
 
+/// Largest encoding-`1104` cursor id that names a system-defined cursor which
+/// the native client resolves locally instead of reading image data.
+const ARD_SYSTEM_CURSOR_MAX_ID: u32 = 999;
+
+/// Native bound on the compressed encoding-`1104` cursor image size.
+const ARD_MAX_CURSOR_IMAGE_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeLimits {
     pub max_rectangles: usize,
@@ -135,6 +142,19 @@ impl Decoder {
             return fixed_payload_len(payload, consumed);
         }
         if encoding == Encoding::ArdDisplayInfo2 {
+            // Live protocol probe: the DisplayInfo2 rectangle axis order is the
+            // one layout question the disassembly could not settle, so make the
+            // raw byte order observable against a real server.
+            if std::env::var_os("ARD_TRACE_DISPLAY_INFO2").is_some() {
+                eprintln!(
+                    "DisplayInfo2 wire: rect=({},{},{}x{}) bytes={:02x?}",
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    &payload[..payload.len().min(160)]
+                );
+            }
             let (layout, consumed) = parse_ard_display_info2(payload)?;
             let width = if layout.framebuffer_width == 0 {
                 rect.width
@@ -724,7 +744,30 @@ fn apple_length_prefixed_payload_len(payload: &[u8]) -> Result<usize> {
     fixed_payload_len(payload, total)
 }
 
+/// Length of an Apple encoding-`1104` cursor-image rectangle payload.
+///
+/// The native client reads a big-endian `u32` cursor id first
+/// (`_HandleCursorImageWithAlphaUpdate`). An id of 999 or less names one of
+/// Apple's system-defined cursors, which the client resolves locally, and the
+/// rectangle is exactly those four bytes with no length and no image. Only an
+/// id above 999 is followed by a `u32` compressed length and zlib data; the
+/// native bound on that length is 1 MiB.
+///
+/// Requiring eight bytes unconditionally made a real four-byte system-cursor
+/// rectangle report `NeedMore { needed: 8, available: 4 }`, which the streaming
+/// dispatcher treats as "wait for more bytes". Those bytes never arrive, so the
+/// session stopped delivering frames.
 fn ard_cursor_payload_len(payload: &[u8], max_compressed_bytes: usize) -> Result<usize> {
+    if payload.len() < 4 {
+        return Err(Error::NeedMore {
+            needed: 4,
+            available: payload.len(),
+        });
+    }
+    let cursor_id = u32::from_be_bytes(payload[0..4].try_into().expect("cursor id checked"));
+    if cursor_id <= ARD_SYSTEM_CURSOR_MAX_ID {
+        return Ok(4);
+    }
     if payload.len() < 8 {
         return Err(Error::NeedMore {
             needed: 8,
@@ -735,7 +778,7 @@ fn ard_cursor_payload_len(payload: &[u8], max_compressed_bytes: usize) -> Result
         payload[4..8].try_into().expect("cursor length checked"),
     ))
     .map_err(|_| Error::LimitExceeded("ARD cursor image"))?;
-    if compressed > max_compressed_bytes {
+    if compressed > max_compressed_bytes.min(ARD_MAX_CURSOR_IMAGE_BYTES) {
         return Err(Error::LimitExceeded("ARD cursor image"));
     }
     let total = compressed

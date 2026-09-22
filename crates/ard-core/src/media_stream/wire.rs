@@ -527,19 +527,26 @@ impl MediaStreamMessage1 {
     }
 
     fn parse_compact_tail(body: &[u8]) -> Result<Self> {
+        // Native layout is `{BE16 port, flag_word}` triples at audio 0x0a/0x0c,
+        // video1 0x10/0x12 and video2 0x16/0x18. The flag word is a small
+        // integer (1 or 3) read big-endian, so HDR is bit 1 (`& 0x2`). Reading
+        // 0x0c/0x12 as the flag words mixed audio's flags into video1 and tested
+        // the wrong bit entirely.
         let audio_port = u16::from_be_bytes(body[0x0a..0x0c].try_into().expect("tail checked"));
         let video1_port = u16::from_be_bytes(body[0x10..0x12].try_into().expect("tail checked"));
         let video2_port = u16::from_be_bytes(body[0x16..0x18].try_into().expect("tail checked"));
-        let video1_flags = u32::from_be_bytes(body[0x0c..0x10].try_into().expect("tail checked"));
-        let video2_flags = u32::from_be_bytes(body[0x12..0x16].try_into().expect("tail checked"));
+        let video1_flags = u32::from_be_bytes(body[0x12..0x16].try_into().expect("tail checked"));
+        let video2_flags = u32::from_be_bytes(body[0x18..0x1c].try_into().expect("tail checked"));
         Ok(Self {
             encoding: super::ENCODING_AVC_MEDIA_STREAM,
             video1_port,
             video2_port: (video2_port != 0).then_some(video2_port),
             audio_port: (audio_port != 0).then_some(audio_port),
-            video1_hdr: video1_flags & 0x0200_0000 != 0,
-            video2_hdr: video2_flags & 0x0200_0000 != 0,
-            stream_count: u16::from_be_bytes(body[0x02..0x04].try_into().expect("tail checked")),
+            video1_hdr: video1_flags & 0x2 != 0,
+            video2_hdr: video2_flags & 0x2 != 0,
+            // The payload carries no stream count; a video2 stream exists only
+            // when its port is present.
+            stream_count: u16::from(video2_port != 0) + 1,
         })
     }
 

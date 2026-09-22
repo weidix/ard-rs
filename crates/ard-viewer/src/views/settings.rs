@@ -2,6 +2,7 @@ use iced::widget::{checkbox, column, container, row, space, stack, text};
 use iced::{Alignment, Element, Fill, window};
 
 use crate::icons::{Icon, icon};
+use crate::recording::{RecordingQuality, available as recording_available};
 use crate::state::ToolbarButton;
 use crate::state::{SettingsSection, ThemePreference};
 use crate::theme::{
@@ -192,6 +193,68 @@ fn general(app: &ArdViewer) -> Element<'_, Message> {
                     .size(16)
                     .text_size(BODY_SIZE)
                     .style(theme::checkbox),
+            ]
+            .spacing(12),
+        ),
+        settings_group(
+            app.language.tr("录制"),
+            column![
+                muted(
+                    app.language
+                        .tr("留空时保存到系统影片目录下的 ARD Viewer 文件夹。")
+                ),
+                setting_field(
+                    app.language.tr("录制目录"),
+                    iced::widget::text_input(
+                        &app.recording_location().display().to_string(),
+                        &app.recording_directory,
+                    )
+                    .on_input(Message::RecordingDirectoryChanged)
+                    .padding([10, 12])
+                    .size(BODY_SIZE)
+                    .width(Fill)
+                    .style(theme::input),
+                ),
+                setting_field(
+                    app.language.tr("录制画质"),
+                    dropdown(
+                        app.recording_quality.label(app.language),
+                        vec![DropdownSection::new(
+                            None,
+                            RecordingQuality::ALL
+                                .into_iter()
+                                .map(|quality| {
+                                    DropdownOption::new(
+                                        quality.label(app.language),
+                                        app.recording_quality == quality,
+                                        Message::RecordingQualityChanged(quality),
+                                    )
+                                    .id(match quality {
+                                        RecordingQuality::High => "recording-quality-high",
+                                        RecordingQuality::Balanced => "recording-quality-balanced",
+                                        RecordingQuality::Compact => "recording-quality-compact",
+                                    })
+                                })
+                                .collect(),
+                        )],
+                        280.0,
+                        BODY_SIZE,
+                        app.open_dropdown == Some(DropdownMenu::RecordingQuality),
+                        Message::ToggleDropdown(DropdownMenu::RecordingQuality),
+                        Message::CloseDropdown,
+                    ),
+                ),
+                if recording_available() {
+                    muted(
+                        app.language
+                            .tr("录制写入 MP4（H.264），画面与远程会话一致。"),
+                    )
+                } else {
+                    muted(
+                        app.language
+                            .tr("当前平台没有系统 H.264 编码器，无法录制会话"),
+                    )
+                },
             ]
             .spacing(12),
         ),

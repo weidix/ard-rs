@@ -7,6 +7,11 @@ struct YuvConversion {
     red: vec4<f32>,
     green: vec4<f32>,
     blue: vec4<f32>,
+    // Kept at the identity by the presenter: the reference client shows the
+    // decoded planes' numbers unchanged, so a stream tagged Display P3 must not
+    // be rotated here (that moved the take's flat background 48 levels in red).
+    // See `session_renderer::yuv_conversion` for the measurement.
+    primaries: mat3x3<f32>,
 }
 
 @vertex
@@ -36,13 +41,17 @@ fn srgb_to_linear_component(value: f32) -> f32 {
 }
 
 fn encoded_to_output(encoded: vec3<f32>) -> vec4<f32> {
+    // The surface re-encodes with the sRGB transfer function, so the values have
+    // to be linear here. `primaries` is the identity (see the struct field), which
+    // makes this a round trip of the decoded numbers: that is what the reference
+    // client puts on screen, and what a recording of the same planes carries.
     let clamped = clamp(encoded, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(
+    let linear = vec3<f32>(
         srgb_to_linear_component(clamped.r),
         srgb_to_linear_component(clamped.g),
-        srgb_to_linear_component(clamped.b),
-        1.0
+        srgb_to_linear_component(clamped.b)
     );
+    return vec4<f32>(clamp(conversion.primaries * linear, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 
 fn convert_yuv(sample: vec3<f32>) -> vec3<f32> {

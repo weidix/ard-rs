@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use crate::i18n::Language;
 use ard_rs::{
     ArdClient, ArdClientConfig, ArdClientEvent, ArdClientInput, ArdDisplayConfiguration,
-    ArdInputMetrics, ArdKey, ArdNamedKey, ArdScrollWheelEvent, ArdVideoQuality, Framebuffer,
-    MediaUdpPortOverrides, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
+    ArdInputMetrics, ArdKey, ArdNamedKey, ArdScrollWheelEvent, ArdShutdownHandle, ArdVideoQuality,
+    Framebuffer, MediaUdpPortOverrides, MvsGpuFrame, MvsGpuTile, MvsGpuTileUpdate, keysym_for_key,
 };
 use iced::futures::StreamExt;
 use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -21,6 +21,9 @@ use iced::{Point, Rectangle, Size, Subscription};
 
 const MAX_EVENTS: usize = 32;
 const MAX_INPUT_COMMANDS: usize = 128;
+/// Headroom in the input queue kept free for key/button releases so a burst of
+/// input can never evict an event that would strand a key on the remote host.
+const RELEASE_RESERVE: usize = 16;
 const MAX_RGBA_POOL: usize = 2;
 const MAX_RECONNECT_ATTEMPTS: usize = 5;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -41,6 +44,10 @@ pub struct SessionConfig {
     pub frame_interval: Duration,
     pub should_interpolate: bool,
     pub sharp_sampling: bool,
+    /// Shared development dump of the server's streams, when the application
+    /// asked for one. It holds what the server sent, not what the viewer decoded
+    /// it into, and both the record stream and the UDP media stream write to it.
+    pub raw_stream: Option<Arc<ard_rs::RawStreamSink>>,
 }
 
 impl Drop for SessionConfig {
@@ -186,17 +193,23 @@ impl std::fmt::Debug for FramePacket {
 
 impl FramePacket {
     pub(crate) fn from_mvs(frame: MvsGpuFrame, quality: ArdVideoQuality) -> Self {
+        let mut tiles = TileSet::from_updates(
+            frame.framebuffer_width,
+            frame.framebuffer_height,
+            frame.tiles,
+        );
+        tiles.set_quantization(Arc::new([
+            frame.luminance_quantization,
+            frame.chrominance_quantization,
+        ]));
         Self {
             width: frame.framebuffer_width,
             height: frame.framebuffer_height,
             quality,
-            luminance_quantization: frame.luminance_quantization,
-            chrominance_quantization: frame.chrominance_quantization,
-            tiles: TileSet::from_updates(
-                frame.framebuffer_width,
-                frame.framebuffer_height,
-                frame.tiles,
-            ),
+            // Coefficients are dequantized per tile when packed for the GPU.
+            luminance_quantization: [1; 64],
+            chrominance_quantization: [1; 64],
+            tiles,
             rgba: None,
             nv12: None,
         }
@@ -235,13 +248,8 @@ impl FramePacket {
     }
 
     fn merge_mvs(&mut self, frame: MvsGpuFrame) {
-        self.width = frame.framebuffer_width;
-        self.height = frame.framebuffer_height;
-        self.luminance_quantization = frame.luminance_quantization;
-        self.chrominance_quantization = frame.chrominance_quantization;
-        for tile in frame.tiles {
-            self.tiles.insert(tile);
-        }
+        self.tiles
+            .merge(Self::from_mvs(frame, self.quality).tiles, false);
     }
 }
 
@@ -333,8 +341,21 @@ impl FrameMailbox {
 
 pub type SharedMailbox = Arc<Mutex<FrameMailbox>>;
 
+/// Monotonic identity for [`FrameWake`].
+///
+/// The wake channel is handed to iced as a `Subscription::run_with` recipe, and
+/// iced keys running recipes by their hash. Hashing the heap address of the
+/// `Arc` is unsafe here: dropping one session and starting the next frees and
+/// immediately re-allocates the same 40-byte allocation (measured 100% reuse on
+/// this allocator), so the replacement runtime produced the *same* subscription
+/// id. iced then treats the new wake as already running, never spawns its
+/// stream, and `SessionPoll` is never delivered again — the session goes
+/// permanently silent with no error. A monotonic counter can never collide.
+static FRAME_WAKE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug)]
 struct FrameWake {
+    id: u64,
     sender: UnboundedSender<()>,
     receiver: Mutex<Option<UnboundedReceiver<()>>>,
     pending: AtomicBool,
@@ -344,6 +365,7 @@ impl FrameWake {
     fn new() -> Arc<Self> {
         let (sender, receiver) = unbounded();
         Arc::new(Self {
+            id: FRAME_WAKE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             sender,
             receiver: Mutex::new(Some(receiver)),
             pending: AtomicBool::new(false),
@@ -366,7 +388,7 @@ struct FrameWakeSubscription(Arc<FrameWake>);
 
 impl Hash for FrameWakeSubscription {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state);
+        self.0.id.hash(state);
     }
 }
 
@@ -389,6 +411,9 @@ pub struct SessionRuntime {
     sharp_sampling: bool,
     cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// Published by the session worker so the UI thread can unblock its
+    /// socket read before joining it.
+    shutdown: Arc<Mutex<Option<ArdShutdownHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     avc_worker: Option<JoinHandle<()>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -410,9 +435,11 @@ impl SessionRuntime {
         let mailbox = Arc::new(Mutex::new(FrameMailbox::default()));
         let frame_wake = FrameWake::new();
         let cancel = Arc::new(AtomicBool::new(false));
+        let shutdown: Arc<Mutex<Option<ArdShutdownHandle>>> = Arc::new(Mutex::new(None));
         let worker_mailbox = Arc::clone(&mailbox);
         let worker_frame_wake = Arc::clone(&frame_wake);
         let worker_cancel = Arc::clone(&cancel);
+        let worker_shutdown = Arc::clone(&shutdown);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let avc_stop = Arc::new(Mutex::new(None));
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -425,6 +452,7 @@ impl SessionRuntime {
                     worker_mailbox,
                     worker_frame_wake,
                     worker_cancel,
+                    worker_shutdown,
                     #[cfg(any(target_os = "macos", target_os = "windows"))]
                     worker_avc_stop,
                 )
@@ -437,6 +465,7 @@ impl SessionRuntime {
             sharp_sampling,
             cancel,
             worker: Some(worker),
+            shutdown,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             avc_worker: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -473,7 +502,6 @@ impl SessionRuntime {
 
     pub fn disconnect(&mut self) {
         self.cancel.store(true, Ordering::Release);
-        self.worker.take();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             if let Ok(mut avc_stop) = self.avc_stop.lock()
@@ -483,66 +511,21 @@ impl SessionRuntime {
             }
             self.avc_worker.take();
         }
-    }
-
-    /// Start the AVC media stream video path (encoding 1010) on top of an
-    /// already established RFB session. The negotiated UDP endpoints, the
-    /// video1 server-to-viewer SRTP key and the negotiated codec come from
-    /// `ard_rs::media_stream`. Frames are decoded with VideoToolbox or MFT and pushed into
-    /// the same mailbox as the rectangle/MVS paths.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    #[allow(dead_code)]
-    pub fn start_avc_media_stream(
-        &mut self,
-        media: ard_rs::ArdMediaStream,
-        quality: ArdVideoQuality,
-        target_dimensions: (u32, u32),
-    ) {
-        use crate::media::spawn_avc_video_pipeline;
-
-        let mailbox = Arc::clone(&self.mailbox);
-        let frame_wake = Arc::clone(&self.frame_wake);
-        let stop = Arc::new(AtomicBool::new(false));
-        if let Ok(mut current) = self.avc_stop.lock() {
-            if let Some(previous) = current.take() {
-                previous.store(true, Ordering::Release);
-            }
-            *current = Some(Arc::clone(&stop));
+        // After the handshake the receive socket deliberately has no read
+        // timeout, so a worker parked in `next_event` would never observe the
+        // cancel flag on its own. Shutting the socket down makes that read
+        // return immediately, which lets the join below actually complete.
+        // Without this, every Connect/Close leaked a thread, a socket and the
+        // server-side session until thread creation failed and the `.expect`
+        // in `start` panicked on the UI thread.
+        if let Ok(mut handle) = self.shutdown.lock()
+            && let Some(handle) = handle.take()
+        {
+            let _ = handle.shutdown();
         }
-        if let Some(previous) = self.avc_worker.take() {
-            let _ = previous.join();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
-        let mut render_failed = false;
-        let handle = spawn_avc_video_pipeline(media, target_dimensions, stop, move |result| {
-            if let Ok(mut mailbox) = mailbox.lock() {
-                match result {
-                    Ok(frame) => {
-                        let width = u16::try_from(frame.width).unwrap_or(u16::MAX);
-                        let height = u16::try_from(frame.height).unwrap_or(u16::MAX);
-                        let timing = frame.timing;
-                        mailbox.replace_latest(FramePacket::from_nv12(frame, quality));
-                        mailbox.metrics.width = width;
-                        mailbox.metrics.height = height;
-                        mailbox.metrics.native_nv12 = true;
-                        mailbox.metrics.gpu_mvs = false;
-                        if let Some(timing) = timing {
-                            mailbox.metrics.update_avc_decode(timing);
-                        }
-                        mailbox.metrics_dirty = true;
-                        if render_failed {
-                            mailbox.push_event(SessionEvent::RenderRecovered);
-                            render_failed = false;
-                        }
-                    }
-                    Err(error) => {
-                        mailbox.push_event(SessionEvent::RenderFailed(error));
-                        render_failed = true;
-                    }
-                }
-            }
-            frame_wake.notify();
-        });
-        self.avc_worker = Some(handle);
     }
 }
 
@@ -557,6 +540,7 @@ fn run_receiver(
     mailbox: SharedMailbox,
     frame_wake: Arc<FrameWake>,
     cancel: Arc<AtomicBool>,
+    shutdown: Arc<Mutex<Option<ArdShutdownHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] avc_stop_registry: Arc<
         Mutex<Option<Arc<AtomicBool>>>,
     >,
@@ -627,6 +611,9 @@ fn run_receiver(
         client_config.media_udp_port_overrides = config.media_udp_port_overrides;
         client_config.timeout = Duration::from_secs(2);
         client_config.frame_interval = config.frame_interval;
+        if let Some(sink) = config.raw_stream.clone() {
+            client_config = client_config.with_raw_stream(sink);
+        }
         let mut client = match ArdClient::connect(client_config) {
             Ok(client) => client,
             Err(error) => {
@@ -646,6 +633,26 @@ fn run_receiver(
                 continue;
             }
         };
+        // Publish an interrupt handle so `SessionRuntime::disconnect` can
+        // unblock this thread's socket read. Registration is refreshed on
+        // every reconnect because the socket changes.
+        match client.shutdown_handle() {
+            Ok(handle) => {
+                if let Ok(mut registered) = shutdown.lock() {
+                    *registered = Some(handle);
+                }
+            }
+            Err(error) => {
+                push_event(
+                    &mailbox,
+                    &frame_wake,
+                    SessionEvent::State(ConnectionState::Failed(format!(
+                        "无法创建会话中断句柄：{error}"
+                    ))),
+                );
+                return;
+            }
+        }
         attempts = 0;
         reconnecting = true;
         let media_negotiation_started = Instant::now();
@@ -662,6 +669,15 @@ fn run_receiver(
             return;
         }
         let session_input = client.input();
+        if let Some(sink) = config.raw_stream.as_ref() {
+            // The dump is armed by a take, not by connecting: say what will
+            // happen rather than what is happening, so an idle session does not
+            // look like a dump that failed to write.
+            eprintln!(
+                "ard-viewer: the server streams will be dumped to {} while recording",
+                sink.raw_path(ard_rs::RawStreamKind::Server).display()
+            );
+        }
         push_event(
             &mailbox,
             &frame_wake,
@@ -676,6 +692,8 @@ fn run_receiver(
             SessionEvent::State(ConnectionState::Connected),
         );
         let mut meter = RateMeter::new();
+        // The dump's failure is reported once per connection, not once per frame.
+        let mut raw_stream_reported = false;
         loop {
             if cancel.load(Ordering::Acquire) {
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -690,6 +708,20 @@ fn run_receiver(
             }
             match client.next_event() {
                 Ok(ArdClientEvent::Frame(info)) => {
+                    // A development dump that stopped being written must say so
+                    // once: the session can stay healthy while the dump silently
+                    // stops, and that would be worse than a visible error.
+                    if !raw_stream_reported
+                        && let Some(sink) = config.raw_stream.as_ref()
+                        && let Some(failure) = sink.failure()
+                    {
+                        raw_stream_reported = true;
+                        eprintln!(
+                            "ard-viewer: {} 裸流已停止记录：{}",
+                            failure.stream.label(),
+                            failure.message
+                        );
+                    }
                     if requested_quality.is_high_performance() {
                         if media_negotiation_started.elapsed() >= MEDIA_NEGOTIATION_TIMEOUT && {
                             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -788,6 +820,7 @@ fn run_receiver(
                             *media,
                             target_dimensions,
                             pipeline_stop,
+                            config.raw_stream.clone(),
                             move |result| {
                                 if let Ok(mut mailbox) = pipeline_mailbox.lock() {
                                     let frame = match result {
@@ -985,10 +1018,9 @@ fn queue_frame(
         for frame in gpu_frames {
             let can_merge = queued.latest.as_ref().is_some_and(|packet| {
                 packet.rgba.is_none()
+                    && packet.nv12.is_none()
                     && packet.width == frame.framebuffer_width
                     && packet.height == frame.framebuffer_height
-                    && packet.luminance_quantization == frame.luminance_quantization
-                    && packet.chrominance_quantization == frame.chrominance_quantization
             });
             if can_merge {
                 queued
@@ -1078,6 +1110,8 @@ pub struct TileSet {
     height: u16,
     tiles_wide: usize,
     storage: TileStorage,
+    // An adaptive quality change applies only to subsequent tile updates.
+    quantization: HashMap<(u16, u16), Arc<[[u16; 64]; 2]>>,
 }
 
 #[derive(Debug)]
@@ -1116,6 +1150,7 @@ impl TileSet {
             height,
             tiles_wide,
             storage,
+            quantization: HashMap::new(),
         }
     }
 
@@ -1151,6 +1186,7 @@ impl TileSet {
                     width,
                     height,
                     tiles_wide,
+                    quantization: HashMap::new(),
                     storage: TileStorage::Dense {
                         slots,
                         tiles: updates,
@@ -1172,6 +1208,7 @@ impl TileSet {
                 height,
                 tiles_wide,
                 storage: TileStorage::Sparse { tiles, dirty },
+                quantization: HashMap::new(),
             };
         }
 
@@ -1182,6 +1219,7 @@ impl TileSet {
         set
     }
 
+    #[cfg(test)]
     pub fn insert(&mut self, update: MvsGpuTileUpdate) {
         self.insert_inner(update, false);
     }
@@ -1251,18 +1289,60 @@ impl TileSet {
         }
     }
 
-    pub fn merge(&mut self, other: Self, force_dirty: bool) {
-        match other.storage {
-            TileStorage::Dense { tiles, .. } => {
-                for tile in tiles {
-                    self.insert_inner(tile, force_dirty);
+    fn set_quantization(&mut self, tables: Arc<[[u16; 64]; 2]>) {
+        let mut keys = Vec::new();
+        self.for_each_dirty(|tile| {
+            if matches!(tile.tile, MvsGpuTile::Dct(_) | MvsGpuTile::RiceDct(_)) {
+                keys.push((tile.x, tile.y));
+            }
+        });
+        for key in keys {
+            self.quantization.insert(key, Arc::clone(&tables));
+        }
+    }
+
+    pub fn quantization_for(&self, tile: &MvsGpuTileUpdate) -> &[[u16; 64]; 2] {
+        self.quantization
+            .get(&(tile.x, tile.y))
+            .map_or(&[[1; 64]; 2], |tables| tables.as_ref())
+    }
+
+    pub fn mark_all_dirty(&mut self) {
+        match &mut self.storage {
+            TileStorage::Dense {
+                slots,
+                dirty_bits,
+                dirty_positions,
+                ..
+            } => {
+                dirty_positions.clear();
+                dirty_bits.fill(0);
+                for (slot, &position) in slots.iter().enumerate() {
+                    if position != EMPTY_TILE_SLOT {
+                        dirty_bits[slot / 64] |= 1 << (slot % 64);
+                        dirty_positions.push(position as usize);
+                    }
                 }
             }
-            TileStorage::Sparse { tiles, .. } => {
-                for (_, tile) in tiles {
-                    self.insert_inner(tile, force_dirty);
-                }
+            TileStorage::Sparse { tiles, dirty } => dirty.extend(tiles.keys().copied()),
+        }
+    }
+
+    pub fn merge(&mut self, mut other: Self, force_dirty: bool) {
+        let tiles = match other.storage {
+            TileStorage::Dense { tiles, .. } => tiles,
+            TileStorage::Sparse { tiles, .. } => tiles.into_values().collect(),
+        };
+        for tile in tiles {
+            let key = (tile.x, tile.y);
+            let tables = other.quantization.remove(&key);
+            let changed = self.quantization.get(&key) != tables.as_ref();
+            if let Some(tables) = tables {
+                self.quantization.insert(key, tables);
+            } else {
+                self.quantization.remove(&key);
             }
+            self.insert_inner(tile, force_dirty || changed);
         }
     }
 
@@ -1563,6 +1643,20 @@ pub(crate) enum InputCommand {
     Clipboard(String),
 }
 
+impl InputCommand {
+    /// Whether dropping this command could leave the remote host in a stuck
+    /// state. Key releases and button releases must always reach the wire; a
+    /// dropped key-down is merely lost input.
+    fn is_release(&self) -> bool {
+        match self {
+            Self::Key { pressed, .. } => !pressed,
+            Self::Pointer { mask, .. } => *mask == 0,
+            Self::PointerBatch(batch) => batch.last().is_some_and(|(mask, _, _)| *mask == 0),
+            Self::PointerMotion { .. } | Self::Scroll(_) | Self::Clipboard(_) => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct InputDispatcher {
     queue: Arc<InputCommandQueue>,
@@ -1612,8 +1706,28 @@ impl InputCommandQueue {
         {
             state.commands.pop_back();
         }
-        if state.commands.len() >= MAX_INPUT_COMMANDS {
-            return Err("远程输入缓存已满".to_owned());
+        // Releases must never be dropped: a lost key-up or button-up leaves the
+        // remote host holding a key or a mouse button, and the local state has
+        // already forgotten it. Non-release traffic is therefore capped below
+        // the hard limit so a burst of releases always has room, and a release
+        // that still finds the queue full evicts the oldest droppable command
+        // rather than failing. Only non-release traffic may be refused.
+        let limit = if command.is_release() {
+            MAX_INPUT_COMMANDS
+        } else {
+            MAX_INPUT_COMMANDS - RELEASE_RESERVE
+        };
+        if state.commands.len() >= limit {
+            if command.is_release()
+                && let Some(index) = state
+                    .commands
+                    .iter()
+                    .position(|queued| !queued.is_release())
+            {
+                state.commands.remove(index);
+            } else {
+                return Err("远程输入缓存已满".to_owned());
+            }
         }
         state.commands.push_back(command);
         drop(state);
@@ -1636,13 +1750,22 @@ impl InputCommandQueue {
     }
 
     fn clear(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.commands.clear();
-        }
+        // Recover from poisoning like `submit`/`receive` do. Silently skipping
+        // the clear left queued input behind, and skipping it in `stop` left the
+        // dispatch thread parked on the condvar for the life of the process.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.commands.clear();
     }
 
     fn stop(&self) {
-        if let Ok(mut state) = self.state.lock() {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             state.stopped = true;
             state.commands.clear();
         }
@@ -1869,8 +1992,17 @@ impl InputState {
                 self.ime_active = false;
                 for character in text.chars() {
                     if let Some(keysym) = keysym_for_key(ArdKey::Character(character)) {
+                        // A failed key-down is only lost input, but a key-down
+                        // that was accepted and whose key-up then fails would
+                        // hold the key on the remote host until the next
+                        // focus change. Stop and let `release_all` cover it.
                         self.send_key(true, keysym)?;
-                        self.send_key(false, keysym)?;
+                        if let Err(error) = self.send_key(false, keysym) {
+                            // Record the still-held keysym so `release_all`
+                            // retries it on the next focus change.
+                            self.pressed_raw.entry(keysym).or_insert(keysym);
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -1965,35 +2097,45 @@ impl InputState {
     }
 
     pub fn release_all(&mut self) {
-        let keys = std::mem::take(&mut self.pressed_keys);
-        let raw_keys = std::mem::take(&mut self.pressed_raw);
-        if self.input.is_some() {
-            for keysym in keys.values().copied() {
-                let _ = self.dispatcher.submit(InputCommand::Key {
+        // Keep the local bookkeeping intact until each release is actually
+        // accepted. Clearing it first meant a full queue silently stranded the
+        // key on the remote host with no record left to retry from.
+        let keys: Vec<(_, u32)> = self.pressed_keys.iter().map(|(k, v)| (*k, *v)).collect();
+        for (key, keysym) in keys {
+            if self
+                .dispatcher
+                .submit(InputCommand::Key {
                     pressed: false,
                     keysym,
-                });
-            }
-            for keysym in raw_keys.into_values() {
-                let _ = self.dispatcher.submit(InputCommand::Key {
-                    pressed: false,
-                    keysym,
-                });
-            }
-            if self.button_mask != 0
-                && let Some((x, y)) = self.cursor
+                })
+                .is_ok()
             {
-                let _ = self
-                    .dispatcher
-                    .submit(InputCommand::Pointer { mask: 0, x, y });
+                self.pressed_keys.remove(&key);
             }
         }
-        self.button_mask = 0;
-        self.pressed_buttons.clear();
-        self.ime_suppressed.clear();
-        self.shortcut_suppressed.clear();
-        self.paste_suppressed.clear();
-        self.scroll.reset();
+        let raw_keys: Vec<(_, u32)> = self.pressed_raw.iter().map(|(k, v)| (*k, *v)).collect();
+        for (key, keysym) in raw_keys {
+            if self
+                .dispatcher
+                .submit(InputCommand::Key {
+                    pressed: false,
+                    keysym,
+                })
+                .is_ok()
+            {
+                self.pressed_raw.remove(&key);
+            }
+        }
+        if self.button_mask != 0
+            && let Some((x, y)) = self.cursor
+            && self
+                .dispatcher
+                .submit(InputCommand::Pointer { mask: 0, x, y })
+                .is_ok()
+        {
+            self.button_mask = 0;
+            self.pressed_buttons.clear();
+        }
     }
 }
 
@@ -2452,6 +2594,128 @@ mod tests {
     }
 
     #[test]
+    fn frame_wake_subscription_ids_are_unique_across_sessions() {
+        // Regression: the subscription id was the heap address of the `Arc`.
+        // Dropping a session and starting the next one re-used the same
+        // allocation (measured at 100% on this allocator), so iced saw the new
+        // runtime's wake as "already running", never spawned its stream, and
+        // `SessionPoll` was never delivered again — a permanently silent
+        // session with no error. Ids must therefore never repeat.
+        let mut ids = HashSet::new();
+        for _ in 0..1024 {
+            let wake = FrameWake::new();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            FrameWakeSubscription(Arc::clone(&wake)).hash(&mut hasher);
+            assert!(
+                ids.insert(hasher.finish()),
+                "frame-wake subscription id repeated"
+            );
+            drop(wake);
+        }
+    }
+
+    #[test]
+    fn input_queue_keeps_room_for_releases() {
+        let queue = InputCommandQueue::default();
+        // Non-release traffic stops short of the hard limit so releases fit.
+        let mut accepted = 0;
+        for index in 0..MAX_INPUT_COMMANDS {
+            if queue
+                .submit(InputCommand::Pointer {
+                    mask: 1,
+                    x: index as u16,
+                    y: 0,
+                })
+                .is_ok()
+            {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, MAX_INPUT_COMMANDS - RELEASE_RESERVE);
+        // A key release must still get through: dropping it would strand the
+        // key on the remote host.
+        queue
+            .submit(InputCommand::Key {
+                pressed: false,
+                keysym: 0xffe1,
+            })
+            .expect("a release must fit inside the reserved headroom");
+    }
+
+    #[test]
+    fn input_queue_evicts_a_droppable_command_for_a_release_at_the_hard_limit() {
+        let queue = InputCommandQueue::default();
+        // Fill the reserved headroom with releases so no room is left.
+        for keysym in 0..RELEASE_RESERVE {
+            queue
+                .submit(InputCommand::Key {
+                    pressed: false,
+                    keysym: keysym as u32,
+                })
+                .expect("reserve accepts releases");
+        }
+        for index in 0..(MAX_INPUT_COMMANDS - RELEASE_RESERVE) {
+            queue
+                .submit(InputCommand::PointerMotion {
+                    mask: 1,
+                    x: index as u16,
+                    y: 0,
+                })
+                .expect("droppable traffic fills the rest");
+        }
+        // The queue is now exactly full of releases plus a single motion entry:
+        // a further release evicts the motion rather than being dropped.
+        queue
+            .submit(InputCommand::Key {
+                pressed: false,
+                keysym: 0xffff,
+            })
+            .expect("a release evicts a droppable command");
+    }
+
+    #[test]
+    fn input_command_release_classification_is_precise() {
+        assert!(
+            InputCommand::Key {
+                pressed: false,
+                keysym: 1
+            }
+            .is_release()
+        );
+        assert!(
+            !InputCommand::Key {
+                pressed: true,
+                keysym: 1
+            }
+            .is_release()
+        );
+        assert!(
+            InputCommand::Pointer {
+                mask: 0,
+                x: 0,
+                y: 0
+            }
+            .is_release()
+        );
+        assert!(
+            !InputCommand::Pointer {
+                mask: 1,
+                x: 0,
+                y: 0
+            }
+            .is_release()
+        );
+        assert!(
+            !InputCommand::PointerMotion {
+                mask: 0,
+                x: 0,
+                y: 0
+            }
+            .is_release()
+        );
+    }
+
+    #[test]
     fn frame_wake_rearms_after_the_ui_acknowledges_a_frame() {
         let wake = FrameWake::new();
         let subscription = FrameWakeSubscription(Arc::clone(&wake));
@@ -2532,6 +2796,7 @@ mod tests {
             encoded_bytes: 2,
             range: crate::media::YuvRange::Video,
             matrix: crate::media::YuvMatrix::Bt709,
+            primaries: crate::media::YuvPrimaries::Bt709,
             updates: vec![crate::media::DecodedSliceUpdate {
                 slice_index,
                 y_origin: slice_index as u32,
@@ -2545,6 +2810,7 @@ mod tests {
                     uv_plane: vec![128; 2],
                     range: crate::media::YuvRange::Video,
                     matrix: crate::media::YuvMatrix::Bt709,
+                    primaries: crate::media::YuvPrimaries::Bt709,
                 },
             }],
             timing: None,

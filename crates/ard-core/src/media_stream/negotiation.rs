@@ -27,6 +27,7 @@ use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use crate::{Error, Result};
 
 use super::MAX_MEDIA_STREAM_MESSAGE;
+use super::pixel_format::MediaPixelFormats;
 
 /// Maximum nesting depth accepted by the plist reader.
 const MAX_PLIST_DEPTH: usize = 16;
@@ -377,11 +378,13 @@ fn parse_video_format_parameters(
 }
 
 /// Native `rtpPayloadWithPayload:` maps the two AVC video payload enums to
-/// RTP 123 (H.264) and RTP 100 (HEVC). Unknown payload numbers remain
-/// unknown; they must not be guessed from packet bytes.
-fn native_codec_for_rtp_payload(payload_type: u8) -> Option<MediaStreamCodec> {
+/// RTP 123 (H.264) and RTP 100 (HEVC). The receive path also accepts 126 for
+/// H.264 (`X-H264`), which the server can answer with instead of 123; leaving
+/// it unmapped made the negotiator reject an otherwise valid answer. Unknown
+/// payload numbers remain unknown; they must not be guessed from packet bytes.
+pub(crate) fn native_codec_for_rtp_payload(payload_type: u8) -> Option<MediaStreamCodec> {
     match payload_type {
-        123 => Some(MediaStreamCodec::H264),
+        123 | 126 => Some(MediaStreamCodec::H264),
         100 => Some(MediaStreamCodec::Hevc),
         _ => None,
     }
@@ -721,37 +724,62 @@ fn build_media_stream_offer_with_optional_codec(
 }
 
 // These are the protobuf payloads emitted by AVCMediaStreamNegotiator for
-// Screen Sharing's audio (mode 8) and video (mode 7) streams on macOS 26.6.
-// The payload is zlib-compressed before it is put in the binary plist. The
-// only per-offer value that must change is the five-byte protobuf varint used
-// as the stream SSRC; keeping its width stable preserves the surrounding
-// length-delimited fields.
+// Screen Sharing's audio (mode 8) and video (mode 7) streams. The payload is
+// zlib-compressed before it is put in the binary plist. The only per-offer
+// value that must change is the five-byte protobuf varint used as the stream
+// SSRC; keeping its width stable preserves the surrounding length-delimited
+// fields.
+//
+// The video template is taken from the *live* negotiator on the machine that
+// runs the viewer, not from a captured or documented payload: mode 7 with
+// `AVCMediaStreamNegotiatorSettingsRemoteDesktopScreenSharing`
+// (`+[AVCMediaStreamNegotiatorSettings negotiatorSettingsForMode:deviceRole:options:errorString:]`
+// with device role 1) and its `mediaBlobCompressed`. Every field below is
+// byte-identical to that output except the two that the native negotiator
+// randomizes per instance (the SSRC varint, rewritten by
+// `write_fixed_five_byte_varint`, and the trailing 64-bit nonce) and the order
+// of the repeated video-rule entries, which the native encoder also emits in a
+// different order on every run.
+//
+// Two capability fields in this template were missing from the copy this
+// client used to send, and the server configures the screen encoder from them:
+// the `SW` token in both feature strings (4 for H.264, 0 for HEVC) and the
+// video-settings pixel-format bitmask in field 8, which sits where
+// `pixelFormats` sits in the native
+// `initWithSSRC:allowRTCPFB:videoRuleCollections:featureStrings:isCellular16x9Capable:tilesPerFrame:ltrpEnabled:pixelFormats:...`
+// initializer and which the native client sets to 0xff rather than 0x3f. A
+// server that is told the client supports fewer formats and no `SW` selects a
+// different encoder configuration, so the template must stay byte-identical to
+// the live native offer;
+// `native_video_media_blob_matches_the_live_negotiator_capabilities` pins the
+// fields that differ.
 const NATIVE_VIDEO_MEDIA_BLOB: &[u8] = &[
-    0x08, 0x01, 0x10, 0x01, 0x2a, 0xf3, 0x01, 0x08, 0xb8, 0x82, 0x9f, 0xad, 0x0e, 0x10, 0x00, 0x1a,
-    0x7f, 0x08, 0x7b, 0x12, 0x0a, 0x08, 0x01, 0x10, 0x01, 0x18, 0xc3, 0x87, 0x03, 0x20, 0x00, 0x12,
-    0x0a, 0x08, 0x01, 0x10, 0x02, 0x18, 0xc3, 0x87, 0x03, 0x20, 0x00, 0x12, 0x0a, 0x08, 0x01, 0x10,
-    0x01, 0x18, 0xc3, 0x87, 0x03, 0x20, 0x00, 0x12, 0x0a, 0x08, 0x01, 0x10, 0x02, 0x18, 0xc3, 0x87,
-    0x03, 0x20, 0x00, 0x1a, 0x49, 0x46, 0x4c, 0x53, 0x3b, 0x4d, 0x53, 0x3a, 0x2d, 0x31, 0x3b, 0x4c,
-    0x46, 0x3a, 0x2d, 0x31, 0x3b, 0x4c, 0x54, 0x52, 0x3b, 0x43, 0x41, 0x42, 0x41, 0x43, 0x3b, 0x50,
-    0x4f, 0x53, 0x3a, 0x30, 0x3b, 0x45, 0x4f, 0x44, 0x3a, 0x31, 0x3b, 0x48, 0x54, 0x53, 0x3a, 0x32,
-    0x3b, 0x52, 0x52, 0x3a, 0x33, 0x3b, 0x41, 0x52, 0x3a, 0x31, 0x36, 0x2f, 0x39, 0x2c, 0x35, 0x2f,
-    0x38, 0x3b, 0x58, 0x52, 0x3a, 0x31, 0x36, 0x2f, 0x39, 0x2c, 0x35, 0x2f, 0x38, 0x3b, 0x20, 0x01,
-    0x1a, 0x5e, 0x08, 0x64, 0x12, 0x0a, 0x08, 0x01, 0x10, 0x01, 0x18, 0xc3, 0x87, 0x03, 0x20, 0x00,
-    0x12, 0x0a, 0x08, 0x01, 0x10, 0x02, 0x18, 0xc3, 0x87, 0x03, 0x20, 0x00, 0x1a, 0x40, 0x46, 0x4c,
-    0x53, 0x3b, 0x4c, 0x46, 0x3a, 0x2d, 0x31, 0x3b, 0x50, 0x4f, 0x53, 0x3a, 0x35, 0x3b, 0x45, 0x4f,
-    0x44, 0x3a, 0x31, 0x3b, 0x48, 0x54, 0x53, 0x3a, 0x32, 0x3b, 0x52, 0x52, 0x3a, 0x33, 0x3b, 0x50,
-    0x4f, 0x53, 0x45, 0x3a, 0x34, 0x3b, 0x41, 0x52, 0x3a, 0x31, 0x36, 0x2f, 0x39, 0x2c, 0x35, 0x2f,
-    0x38, 0x3b, 0x58, 0x52, 0x3a, 0x31, 0x36, 0x2f, 0x39, 0x2c, 0x35, 0x2f, 0x38, 0x3b, 0x20, 0x0e,
-    0x30, 0x04, 0x38, 0x01, 0x40, 0x3f, 0x48, 0x01, 0x60, 0x01, 0x32, 0x0d, 0x56, 0x69, 0x63, 0x65,
-    0x72, 0x6f, 0x79, 0x20, 0x31, 0x2e, 0x37, 0x2e, 0x30, 0x40, 0x00, 0x4a, 0x09, 0x08, 0xea, 0x1f,
-    0x10, 0x00, 0x18, 0x80, 0x80, 0x01, 0x4a, 0x0b, 0x08, 0x00, 0x10, 0x80, 0xda, 0xc4, 0x09, 0x18,
-    0x80, 0x80, 0x06, 0x4a, 0x0a, 0x08, 0x00, 0x10, 0x80, 0xb4, 0x89, 0x13, 0x18, 0x80, 0x60, 0x4a,
-    0x0b, 0x08, 0x00, 0x10, 0x80, 0xc2, 0xd7, 0x2f, 0x18, 0x80, 0x80, 0x40, 0x4a, 0x0b, 0x08, 0x00,
-    0x10, 0x80, 0x9b, 0xee, 0x02, 0x18, 0x80, 0x80, 0x08, 0x4a, 0x05, 0x08, 0x01, 0x10, 0xab, 0x02,
-    0x4a, 0x05, 0x08, 0x10, 0x10, 0x84, 0x20, 0x4a, 0x0b, 0x08, 0x00, 0x10, 0x80, 0x8e, 0xce, 0x1c,
-    0x18, 0x80, 0x80, 0x10, 0x4a, 0x05, 0x08, 0x04, 0x10, 0xe4, 0x32, 0x4a, 0x0b, 0x08, 0x00, 0x10,
-    0xc0, 0xd1, 0xe1, 0x23, 0x18, 0x80, 0x80, 0x20, 0x68, 0x80, 0xf0, 0x92, 0xa5, 0xc1, 0xf8, 0xf0,
-    0x91, 0xee, 0x01, 0x70, 0x02, 0x80, 0x01, 0x00,
+    0x08, 0x01, 0x10, 0x01, 0x2a, 0xff, 0x01, 0x08, 0xb8, 0x82, 0x9f, 0xad, 0x0e, 0x10, 0x00, 0x1a,
+    0x84, 0x01, 0x08, 0x7b, 0x12, 0x0a, 0x08, 0x01, 0x10, 0x01, 0x18, 0xc3, 0x87, 0x03, 0x20, 0x00,
+    0x12, 0x0a, 0x08, 0x01, 0x10, 0x02, 0x18, 0xc3, 0x87, 0x03, 0x20, 0x00, 0x12, 0x0a, 0x08, 0x01,
+    0x10, 0x01, 0x18, 0xc3, 0x87, 0x03, 0x20, 0x00, 0x12, 0x0a, 0x08, 0x01, 0x10, 0x02, 0x18, 0xc3,
+    0x87, 0x03, 0x20, 0x00, 0x1a, 0x4e, 0x46, 0x4c, 0x53, 0x3b, 0x4d, 0x53, 0x3a, 0x2d, 0x31, 0x3b,
+    0x4c, 0x46, 0x3a, 0x2d, 0x31, 0x3b, 0x4c, 0x54, 0x52, 0x3b, 0x43, 0x41, 0x42, 0x41, 0x43, 0x3b,
+    0x50, 0x4f, 0x53, 0x3a, 0x30, 0x3b, 0x45, 0x4f, 0x44, 0x3a, 0x31, 0x3b, 0x48, 0x54, 0x53, 0x3a,
+    0x32, 0x3b, 0x52, 0x52, 0x3a, 0x33, 0x3b, 0x53, 0x57, 0x3a, 0x34, 0x3b, 0x41, 0x52, 0x3a, 0x31,
+    0x36, 0x2f, 0x39, 0x2c, 0x35, 0x2f, 0x38, 0x3b, 0x58, 0x52, 0x3a, 0x31, 0x36, 0x2f, 0x39, 0x2c,
+    0x35, 0x2f, 0x38, 0x3b, 0x20, 0x01, 0x1a, 0x63, 0x08, 0x64, 0x12, 0x0a, 0x08, 0x01, 0x10, 0x01,
+    0x18, 0xc3, 0x87, 0x03, 0x20, 0x00, 0x12, 0x0a, 0x08, 0x01, 0x10, 0x02, 0x18, 0xc3, 0x87, 0x03,
+    0x20, 0x00, 0x1a, 0x45, 0x46, 0x4c, 0x53, 0x3b, 0x4c, 0x46, 0x3a, 0x2d, 0x31, 0x3b, 0x50, 0x4f,
+    0x53, 0x3a, 0x35, 0x3b, 0x45, 0x4f, 0x44, 0x3a, 0x31, 0x3b, 0x48, 0x54, 0x53, 0x3a, 0x32, 0x3b,
+    0x52, 0x52, 0x3a, 0x33, 0x3b, 0x50, 0x4f, 0x53, 0x45, 0x3a, 0x34, 0x3b, 0x53, 0x57, 0x3a, 0x30,
+    0x3b, 0x41, 0x52, 0x3a, 0x31, 0x36, 0x2f, 0x39, 0x2c, 0x35, 0x2f, 0x38, 0x3b, 0x58, 0x52, 0x3a,
+    0x31, 0x36, 0x2f, 0x39, 0x2c, 0x35, 0x2f, 0x38, 0x3b, 0x20, 0x0e, 0x30, 0x04, 0x38, 0x01, 0x40,
+    0xff, 0x01, 0x48, 0x01, 0x60, 0x01, 0x32, 0x0d, 0x56, 0x69, 0x63, 0x65, 0x72, 0x6f, 0x79, 0x20,
+    0x31, 0x2e, 0x37, 0x2e, 0x30, 0x40, 0x00, 0x4a, 0x09, 0x08, 0xea, 0x1f, 0x10, 0x00, 0x18, 0x80,
+    0x80, 0x01, 0x4a, 0x0b, 0x08, 0x00, 0x10, 0x80, 0xda, 0xc4, 0x09, 0x18, 0x80, 0x80, 0x06, 0x4a,
+    0x0a, 0x08, 0x00, 0x10, 0x80, 0xb4, 0x89, 0x13, 0x18, 0x80, 0x60, 0x4a, 0x0b, 0x08, 0x00, 0x10,
+    0x80, 0xc2, 0xd7, 0x2f, 0x18, 0x80, 0x80, 0x40, 0x4a, 0x0b, 0x08, 0x00, 0x10, 0x80, 0x9b, 0xee,
+    0x02, 0x18, 0x80, 0x80, 0x08, 0x4a, 0x05, 0x08, 0x01, 0x10, 0xab, 0x02, 0x4a, 0x05, 0x08, 0x10,
+    0x10, 0x84, 0x20, 0x4a, 0x0b, 0x08, 0x00, 0x10, 0x80, 0x8e, 0xce, 0x1c, 0x18, 0x80, 0x80, 0x10,
+    0x4a, 0x05, 0x08, 0x04, 0x10, 0xe4, 0x32, 0x4a, 0x0b, 0x08, 0x00, 0x10, 0xc0, 0xd1, 0xe1, 0x23,
+    0x18, 0x80, 0x80, 0x20, 0x68, 0x80, 0xf0, 0x92, 0xa5, 0xc1, 0xf8, 0xf0, 0x91, 0xee, 0x01, 0x70,
+    0x02, 0x80, 0x01, 0x00,
 ];
 
 const NATIVE_AUDIO_MEDIA_BLOB: &[u8] = &[
@@ -781,6 +809,23 @@ fn build_media_stream_media_blob(
     let mut payload = template.to_vec();
     let offset = if mode == 7 { 8 } else { 7 };
     write_fixed_five_byte_varint(&mut payload, offset, ssrc);
+    if mode == 7 {
+        // The offer's format menu, written from the typed set rather than left
+        // as a byte in the template. Bits for every format the client can decode
+        // is what the native negotiator advertises and what makes the server
+        // choose the richest chroma it can; `ARD_MEDIA_PIXEL_FORMATS` narrows it
+        // for an A/B, and the server then picks from the smaller menu.
+        write_video_pixel_formats(&mut payload, pixel_formats_from_environment())?;
+    }
+    // The native client offers every codec its video config carries and lets the
+    // server choose; a client that wants one codec in particular strips the rest
+    // here. The development switch `ARD_MEDIA_OFFER_CODECS=both` keeps both, so a
+    // take can see which codec the server picks when it is free to choose.
+    let codec = if mode == 7 && offer_both_video_codecs() {
+        None
+    } else {
+        codec
+    };
     if let Some(codec) = codec {
         payload = retain_video_codec(&payload, codec)?;
     }
@@ -792,6 +837,120 @@ fn build_media_stream_media_blob(
     encoder
         .finish()
         .map_err(|_| Error::Invalid("AVC media stream blob compression failed"))
+}
+
+/// Whether the development switch that offers both video codecs is set.
+fn offer_both_video_codecs() -> bool {
+    matches!(
+        std::env::var("ARD_MEDIA_OFFER_CODECS").ok().as_deref(),
+        Some("both")
+    )
+}
+
+/// The format menu to offer: every entry, or the mask `ARD_MEDIA_PIXEL_FORMATS`
+/// names in hex.
+///
+/// Narrowing this is the client's half of the chroma negotiation. A live session
+/// with `ARD_MEDIA_PIXEL_FORMATS=0x07` (4:2:0 only) made the server answer with
+/// HEVC Main `yuv420p` instead of Rext `yuv444p`.
+fn pixel_formats_from_environment() -> MediaPixelFormats {
+    std::env::var("ARD_MEDIA_PIXEL_FORMATS")
+        .ok()
+        .and_then(|value| parse_pixel_formats(&value))
+        .unwrap_or_else(MediaPixelFormats::all)
+}
+
+/// Parse a hex mask such as `0x07` or `ff`.
+fn parse_pixel_formats(value: &str) -> Option<MediaPixelFormats> {
+    let digits = value.trim();
+    let digits = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+        .unwrap_or(digits);
+    u32::from_str_radix(digits, 16)
+        .ok()
+        .map(MediaPixelFormats::from_bits)
+}
+
+/// Overwrite the video settings' `pixelFormats` bitmask in an offer payload.
+///
+/// The field is written as a two-byte varint, which protobuf permits to be
+/// non-minimal, so narrowing the set does not change the payload's length and
+/// the template's other offsets stay put. A live session confirmed the server
+/// accepts that padded form: a mask of `0x07` written as `87 00` made it answer
+/// with HEVC Main `yuv420p`.
+fn write_video_pixel_formats(payload: &mut [u8], formats: MediaPixelFormats) -> Result<()> {
+    let value = u64::from(formats.bits());
+    let mut position = 0;
+    while position < payload.len() {
+        let tag = read_proto_varint(payload, &mut position)
+            .ok_or(Error::Invalid("native media payload tag"))?;
+        let field = tag >> 3;
+        match tag & 0x07 {
+            0 => {
+                read_proto_varint(payload, &mut position)
+                    .ok_or(Error::Invalid("native media payload varint"))?;
+            }
+            1 => position += 8,
+            5 => position += 4,
+            2 => {
+                let length = usize::try_from(
+                    read_proto_varint(payload, &mut position)
+                        .ok_or(Error::Invalid("native media payload length"))?,
+                )
+                .map_err(|_| Error::LimitExceeded("native media payload length"))?;
+                let end = position
+                    .checked_add(length)
+                    .filter(|end| *end <= payload.len())
+                    .ok_or(Error::Invalid("native media payload field"))?;
+                if field == 5 {
+                    let mut inner = position;
+                    while inner < end {
+                        let inner_tag = read_proto_varint(payload, &mut inner)
+                            .ok_or(Error::Invalid("native video settings tag"))?;
+                        match inner_tag & 0x07 {
+                            0 => {
+                                let value_start = inner;
+                                read_proto_varint(payload, &mut inner)
+                                    .ok_or(Error::Invalid("native video settings varint"))?;
+                                if inner_tag >> 3 == 8 {
+                                    if inner - value_start != 2 {
+                                        return Err(Error::Invalid(
+                                            "native video settings pixel format field",
+                                        ));
+                                    }
+                                    payload[value_start] = ((value & 0x7f) as u8) | 0x80;
+                                    payload[value_start + 1] = (value >> 7) as u8;
+                                    return Ok(());
+                                }
+                            }
+                            1 => inner += 8,
+                            5 => inner += 4,
+                            2 => {
+                                let skip = usize::try_from(
+                                    read_proto_varint(payload, &mut inner)
+                                        .ok_or(Error::Invalid("native video settings length"))?,
+                                )
+                                .map_err(|_| {
+                                    Error::LimitExceeded("native video settings length")
+                                })?;
+                                inner = inner
+                                    .checked_add(skip)
+                                    .filter(|next| *next <= end)
+                                    .ok_or(Error::Invalid("native video settings field"))?;
+                            }
+                            _ => return Err(Error::Invalid("native video settings wire type")),
+                        }
+                    }
+                }
+                position = end;
+            }
+            _ => return Err(Error::Invalid("native media payload wire type")),
+        }
+    }
+    Err(Error::Invalid(
+        "native media payload has no pixel format field",
+    ))
 }
 
 fn retain_video_codec(payload: &[u8], codec: MediaStreamCodec) -> Result<Vec<u8>> {
@@ -1677,6 +1836,197 @@ fn parse_sdp_text(raw: &[u8], config: &mut VideoCodecConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walk one protobuf message and return the raw payload of every field
+    /// with the given number, plus its varint value when the field is a
+    /// varint. Length-delimited fields come back as `(Some(bytes), None)`.
+    fn proto_field(message: &[u8], wanted: u64) -> Vec<(Option<Vec<u8>>, Option<u64>)> {
+        let mut found = Vec::new();
+        let mut position = 0;
+        while position < message.len() {
+            let tag = read_proto_varint(message, &mut position).expect("tag");
+            let field = tag >> 3;
+            let wire_type = tag & 0x07;
+            if field == wanted {
+                if wire_type == 0 {
+                    let value = read_proto_varint(message, &mut position).expect("varint");
+                    found.push((None, Some(value)));
+                } else if wire_type == 2 {
+                    let length =
+                        usize::try_from(read_proto_varint(message, &mut position).expect("length"))
+                            .expect("length fits");
+                    let end = position + length;
+                    found.push((Some(message[position..end].to_vec()), None));
+                    position = end;
+                }
+            } else {
+                position = skip_proto_value(message, position, wire_type).expect("skip");
+            }
+        }
+        found
+    }
+
+    /// The video media blob this client offers the server configures the
+    /// screen encoder, so it has to carry exactly the capabilities the live
+    /// `AVCMediaStreamNegotiator` on this machine advertises. An earlier copy
+    /// of this template dropped the `SW` token from both feature strings and
+    /// sent a `pixelFormats` bitmask of `0x3f` instead of `0xff`.
+    ///
+    /// What the bitmask measurably controls is the *stream's* chroma format:
+    /// advertising `0x07` (4:2:0 only) makes the server answer with HEVC Main
+    /// `yuv420p`, while the native `0xff` set gets HEVC Rext `yuv444p`. It does
+    /// not by itself change how often the encoder refreshes: silencing the
+    /// viewer's feedback packets leaves the keyframe count unchanged, and the
+    /// refresh behaviour measured in the recorded takes tracks the captured
+    /// desktop, not this field.
+    #[test]
+    fn native_video_media_blob_matches_the_live_negotiator_capabilities() {
+        let settings = proto_field(NATIVE_VIDEO_MEDIA_BLOB, 5)
+            .into_iter()
+            .find_map(|(payload, _)| payload)
+            .expect("video settings message");
+
+        // Feature strings: the live negotiator sends SW:4 for H.264 and SW:0
+        // for HEVC, immediately before the aspect-ratio tokens.
+        let feature_strings: Vec<String> = proto_field(&settings, 3)
+            .into_iter()
+            .filter_map(|(payload, _)| payload)
+            .map(|payload| {
+                proto_field(&payload, 3)
+                    .into_iter()
+                    .filter_map(|(text, _)| text)
+                    .map(|text| String::from_utf8_lossy(&text).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        assert_eq!(feature_strings.len(), 2, "one feature string per codec");
+        assert!(
+            feature_strings[0].contains("RR:3;SW:4;AR:16/9"),
+            "H.264 feature string must keep SW:4: {}",
+            feature_strings[0],
+        );
+        assert!(
+            feature_strings[1].contains("POSE:4;SW:0;AR:16/9"),
+            "HEVC feature string must keep SW:0: {}",
+            feature_strings[1],
+        );
+
+        // The live client advertises every pixel format it can decode (0xff),
+        // and four tiles per frame for the four-band screen stream.
+        let pixel_formats = proto_field(&settings, 8);
+        assert_eq!(
+            pixel_formats,
+            vec![(None, Some(0xff))],
+            "pixelFormats bitmask must match the live negotiator",
+        );
+        assert_eq!(
+            proto_field(&settings, 6),
+            vec![(None, Some(4))],
+            "tilesPerFrame must stay four",
+        );
+
+        // The outer length prefix has to describe the template exactly, or the
+        // server's protobuf reader consumes the wrong bytes.
+        let outer = proto_field(NATIVE_VIDEO_MEDIA_BLOB, 5)
+            .into_iter()
+            .find_map(|(payload, _)| payload)
+            .expect("video settings message");
+        assert_eq!(outer, settings);
+    }
+
+    /// The format menu is written from the typed set rather than left as a byte
+    /// in the template, so narrowing it is a one-line change. A narrowed menu
+    /// has to land in the same two bytes: a live session showed the server
+    /// reads a padded varint and answers with a matching stream.
+    #[test]
+    fn the_pixel_format_menu_is_written_from_the_typed_set() {
+        let mut payload = NATIVE_VIDEO_MEDIA_BLOB.to_vec();
+        let length = payload.len();
+        write_video_pixel_formats(&mut payload, MediaPixelFormats::all()).expect("writes");
+        assert_eq!(payload.len(), length);
+        let settings = |payload: &[u8]| {
+            proto_field(payload, 5)
+                .into_iter()
+                .find_map(|(payload, _)| payload)
+                .expect("video settings message")
+        };
+        assert_eq!(
+            proto_field(&settings(&payload), 8),
+            vec![(None, Some(0xff))]
+        );
+
+        // Four-by-two only: same bytes, a different value.
+        write_video_pixel_formats(&mut payload, MediaPixelFormats::from_bits(0x07))
+            .expect("writes");
+        assert_eq!(payload.len(), length);
+        assert_eq!(
+            proto_field(&settings(&payload), 8),
+            vec![(None, Some(0x07))]
+        );
+        // Only the two varint bytes of that field may differ: a narrowed menu
+        // must not move any other byte the template pins.
+        let differing: Vec<usize> = payload
+            .iter()
+            .zip(NATIVE_VIDEO_MEDIA_BLOB)
+            .enumerate()
+            .filter(|(_, (written, template))| written != template)
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(
+            differing.len(),
+            2,
+            "only the varint may move: {differing:?}"
+        );
+    }
+
+    /// The switch that narrows the format menu parses what it is given, and an
+    /// unset or unreadable value keeps the native set.
+    #[test]
+    fn the_pixel_format_switch_parses_a_hex_mask() {
+        assert_eq!(parse_pixel_formats("0x07").map(|f| f.bits()), Some(0x07));
+        assert_eq!(parse_pixel_formats("FF").map(|f| f.bits()), Some(0xff));
+        assert_eq!(parse_pixel_formats(" 0X8 ").map(|f| f.bits()), Some(0x08));
+        assert_eq!(parse_pixel_formats("0xff").map(|f| f.bits()), Some(0xff));
+        assert_eq!(parse_pixel_formats("nonsense"), None);
+        assert_eq!(parse_pixel_formats(""), None);
+    }
+
+    /// The offered blob must survive the client's own reader: the SSRC rewrite
+    /// and the codec filter have to leave a message the parser still accepts,
+    /// and the codec filter must not disturb the SSRC or the capabilities.
+    #[test]
+    fn offered_video_blob_keeps_its_declared_length_after_the_ssrc_rewrite() {
+        let payload = build_media_stream_media_blob(7, 0x6445_c090, None).expect("media blob");
+        let mut decompressed = Vec::new();
+        ZlibDecoder::new(payload.as_slice())
+            .take((MAX_MEDIA_BLOB_DECOMPRESSED + 1) as u64)
+            .read_to_end(&mut decompressed)
+            .expect("zlib payload");
+        assert_eq!(decompressed.len(), NATIVE_VIDEO_MEDIA_BLOB.len());
+        assert_eq!(
+            &decompressed[..8],
+            &NATIVE_VIDEO_MEDIA_BLOB[..8],
+            "everything before the SSRC varint is the template",
+        );
+        assert_eq!(
+            &decompressed[13..],
+            &NATIVE_VIDEO_MEDIA_BLOB[13..],
+            "the SSRC occupies exactly the five-byte slot after the fixed prefix",
+        );
+        let info = parse_media_blob_info(&payload).expect("offered blob parses");
+        assert_eq!(info.remote_ssrc, Some(0x6445_c090));
+        assert_eq!(info.payload_mappings.len(), 2);
+
+        for codec in [MediaStreamCodec::Hevc, MediaStreamCodec::H264] {
+            let payload =
+                build_media_stream_media_blob(7, 0x6445_c090, Some(codec)).expect("filtered blob");
+            let info = parse_media_blob_info(&payload).expect("filtered blob parses");
+            assert_eq!(info.remote_ssrc, Some(0x6445_c090));
+            assert_eq!(info.payload_mappings.len(), 1);
+            assert_eq!(info.payload_mappings[0].codec, Some(codec));
+        }
+    }
 
     #[test]
     fn parses_minimal_binary_plist_dict() {

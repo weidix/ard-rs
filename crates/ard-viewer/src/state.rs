@@ -47,9 +47,7 @@ impl WindowKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum DeviceState {
-    Online,
     Saved,
     RecentlyUsed,
 }

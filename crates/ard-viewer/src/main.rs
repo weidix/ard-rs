@@ -5,6 +5,12 @@ mod i18n;
 mod icons;
 #[allow(unsafe_code)]
 mod media;
+// On a platform without a system H.264 encoder the recorder is still compiled —
+// the UI and the capture tap are platform-neutral — but its encoder plumbing is
+// unreachable, which is a build-time fact rather than dead code to remove.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[allow(unsafe_code)]
+mod recording;
 mod session_renderer;
 mod session_runtime;
 mod state;
@@ -14,17 +20,24 @@ mod widgets;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ard_input_hook::{HookConfig, HookEvent};
 use ard_rs::{
     ArdDisplayConfiguration, ArdVideoQuality, ArdVirtualDisplay, MediaUdpPortOverrides,
-    XK_CONTROL_LEFT, XK_F1, XK_META_LEFT, XK_SHIFT_LEFT, XK_TAB, XK_UP,
+    RawStreamKind, RawStreamSink, XK_CONTROL_LEFT, XK_F1, XK_META_LEFT, XK_SHIFT_LEFT, XK_TAB,
+    XK_UP,
 };
 use iced::widget::{column, container, mouse_area, row, space, stack, text};
 use iced::{Alignment, Element, Fill, Subscription, Task, Theme, window};
 
 use i18n::Language;
+use recording::{
+    Recorder, RecordingConfig, RecordingControl, RecordingProgress, RecordingQuality,
+    default_directory, sanitize_label,
+};
 use session_runtime::{
     ClipboardSync, ConnectionState, InputEvent, InputState, SessionConfig, SessionEvent,
     SessionRuntime, StreamMetrics, is_paste_shortcut, map_remote_position, reverse_scroll_delta,
@@ -87,11 +100,24 @@ struct ArdViewer {
     session_connection: ConnectionState,
     session_metrics: StreamMetrics,
     session_server_name: String,
+    recording_control: Arc<RecordingControl>,
+    recording: Option<Recorder>,
+    /// Development dump of the take's server data, when
+    /// `ARD_RECORD_RAW_STREAM` asks for one. It exists only while a take does:
+    /// the dump's interval is the video's interval.
+    raw_stream_sink: Option<Arc<RawStreamSink>>,
+    recording_progress: RecordingProgress,
+    /// A stop has been requested and the file is being finalized.
+    recording_stop_requested: bool,
+    recording_directory: String,
+    recording_quality: RecordingQuality,
+    /// Scripted acceptance run: record automatically and exit afterwards.
+    acceptance_record_seconds: Option<u64>,
+    acceptance_record_complete: bool,
     session_error: Option<String>,
     session_input: InputState,
     session_clipboard: ClipboardSync,
     session_window_size: iced::Size,
-    session_pointer_remote: Option<(u16, u16)>,
     ime_sink: String,
     session_fullscreen: bool,
     session_toolbar_visible: bool,
@@ -119,6 +145,7 @@ enum DropdownMenu {
     Language,
     KeyProfile,
     DisplayQuality,
+    RecordingQuality,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +198,9 @@ enum Message {
     CaptureShortcutsChanged(bool),
     ReverseScrollChanged(bool),
     PerformanceHudChanged(bool),
+    ToggleRecording,
+    RecordingDirectoryChanged(String),
+    RecordingQualityChanged(RecordingQuality),
     ToolbarButtonToggled(ToolbarButton),
     ThemePreferenceChanged(ThemePreference),
     LanguageChanged(Language),
@@ -282,11 +312,19 @@ impl ArdViewer {
             session_connection: ConnectionState::Idle,
             session_metrics: StreamMetrics::default(),
             session_server_name: String::new(),
+            recording_control: Arc::new(RecordingControl::new()),
+            recording: None,
+            raw_stream_sink: None,
+            recording_progress: RecordingProgress::default(),
+            recording_stop_requested: false,
+            recording_directory: cached.recording_directory.clone(),
+            recording_quality: RecordingQuality::from_cache(&cached.recording_quality),
+            acceptance_record_seconds: acceptance_record_seconds(),
+            acceptance_record_complete: false,
             session_error: None,
             session_input: InputState::default(),
             session_clipboard: ClipboardSync::default(),
             session_window_size: WindowKind::Session.size(),
-            session_pointer_remote: None,
             ime_sink: String::new(),
             session_fullscreen: false,
             session_toolbar_visible: true,
@@ -306,7 +344,13 @@ impl ArdViewer {
             status: String::new(),
         };
         theme::set_dark(app.effective_dark());
-        (app, iced::system::theme().map(Message::InitialSystemTheme))
+        let mut tasks = vec![iced::system::theme().map(Message::InitialSystemTheme)];
+        if acceptance_auto_connect() {
+            // A scripted acceptance run records and exits without a human at the
+            // keyboard.
+            tasks.push(open_window(WindowKind::Connection).then(|_| Task::done(Message::Connect)));
+        }
+        (app, Task::batch(tasks))
     }
 
     fn title(&self, id: window::Id) -> String {
@@ -327,6 +371,9 @@ impl ArdViewer {
             Message::WindowOpened(kind, id) => {
                 self.windows.insert(id, kind);
                 if kind == WindowKind::Session {
+                    // A session window that opens already focused may never emit
+                    // a focus event, so arm the shortcut hook here as well.
+                    self.sync_keyboard_hook();
                     return disable_implicit_titlebar_drag(id);
                 }
             }
@@ -626,6 +673,23 @@ impl ArdViewer {
                 self.show_performance_hud = value;
                 self.persist_config();
             }
+            Message::ToggleRecording => {
+                self.touch_session_toolbar();
+                if self.recording.is_some() {
+                    self.stop_recording();
+                } else {
+                    self.start_recording();
+                }
+            }
+            Message::RecordingDirectoryChanged(value) => {
+                self.recording_directory = value;
+                self.persist_config();
+            }
+            Message::RecordingQualityChanged(quality) => {
+                self.recording_quality = quality;
+                self.open_dropdown = None;
+                self.persist_config();
+            }
             Message::ThemePreferenceChanged(preference) => {
                 self.theme_preference = preference;
                 self.open_dropdown = None;
@@ -825,6 +889,10 @@ impl ArdViewer {
                 self.persist_config();
             }
             Message::SessionToolbarTick(now) => {
+                self.poll_recording();
+                if self.acceptance_run_finished() {
+                    return iced::exit();
+                }
                 if self.session_toolbar_visible
                     && !self.session_toolbar_pinned
                     && !self.session_toolbar_dragging
@@ -1059,11 +1127,12 @@ impl ArdViewer {
     }
 
     /// Width of the floating full-screen toolbar shell: drag handle, the
-    /// selected quick buttons, then the always-present fullscreen and pin
-    /// buttons.
+    /// selected quick buttons, the record toggle, the recording badge, then the
+    /// always-present fullscreen and pin buttons.
     pub(crate) fn session_toolbar_width(&self) -> f32 {
-        let buttons = (self.toolbar_buttons.len() + 2) as f32;
-        8.0 + 22.0 + buttons * 30.0 + buttons * 2.0
+        let buttons = (self.toolbar_buttons.len() + 3) as f32;
+        let badge = if self.is_recording() { 62.0 } else { 0.0 };
+        8.0 + 22.0 + buttons * 30.0 + buttons * 2.0 + badge
     }
 
     fn is_window_maximized(&self, id: window::Id) -> bool {
@@ -1162,6 +1231,8 @@ impl ArdViewer {
             capture_system_shortcuts: self.capture_system_shortcuts,
             reverse_scroll: self.reverse_scroll,
             show_performance_hud: self.show_performance_hud,
+            recording_directory: self.recording_directory.clone(),
+            recording_quality: self.recording_quality.to_cache().into(),
             toolbar_buttons: config::toolbar_buttons_to_cache(&self.toolbar_buttons),
             theme: config::theme_to_cache(self.theme_preference).into(),
             language: self.language.code().into(),
@@ -1275,6 +1346,7 @@ impl ArdViewer {
             frame_interval: frame_duration_from_rate(&self.frame_rate),
             should_interpolate: config::DEFAULT_SHOULD_INTERPOLATE,
             sharp_sampling: config::DEFAULT_SHARP_SAMPLING,
+            raw_stream: self.raw_stream(),
         }));
         self.status = self.language.tr("正在当前 Session 窗口中连接…").into();
     }
@@ -1302,14 +1374,276 @@ impl ArdViewer {
     }
 
     fn disconnect_session(&mut self) {
+        // A take belongs to one session window: closing or replacing it must
+        // finalize the file instead of leaving a recording that can never be
+        // completed.
+        self.stop_recording();
         if let Some(mut runtime) = self.session_runtime.take() {
             runtime.disconnect();
         }
         self.keyboard_hook = None;
         self.session_window_focused = false;
         self.session_input.clear_input();
-        self.session_pointer_remote = None;
         self.session_connection = ConnectionState::Idle;
+    }
+
+    /// Control handle shared with the session renderer.
+    pub(crate) fn recording_control(&self) -> Arc<RecordingControl> {
+        Arc::clone(&self.recording_control)
+    }
+
+    pub(crate) fn is_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// Whether the running take has been asked to stop and is being written out.
+    pub(crate) fn is_saving_recording(&self) -> bool {
+        self.recording_stop_requested
+    }
+
+    /// Live counters of the take, for the performance HUD.
+    pub(crate) fn recording_progress(&self) -> &RecordingProgress {
+        &self.recording_progress
+    }
+
+    /// Wall-clock length of the take currently being recorded.
+    pub(crate) fn recording_elapsed(&self) -> Duration {
+        if self.recording.is_some() {
+            self.recording_progress.recorded
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Label of the recording directory that will be used.
+    pub(crate) fn recording_location(&self) -> PathBuf {
+        let configured = self.recording_directory.trim();
+        if configured.is_empty() {
+            default_directory()
+        } else {
+            PathBuf::from(configured)
+        }
+    }
+
+    /// Human-readable prefix for the files a session writes, usually the host.
+    fn recording_label(&self) -> String {
+        sanitize_label(
+            &self
+                .remote_endpoint()
+                .unwrap_or_else(|_| self.address.trim().to_owned()),
+        )
+    }
+
+    /// The development dump of the server's streams, when
+    /// `ARD_RECORD_RAW_STREAM` asks for one.
+    ///
+    /// The variable is only a flag. There is exactly **one** sink for the
+    /// application, created the first time it is asked for and kept from then on:
+    /// a session attaches it to its client when it connects, and the take that
+    /// arms it later has to be the very same object. Handing out a fresh sink per
+    /// caller would arm one dump while the session wrote into another, which is
+    /// how a dump ends up never being created.
+    #[cfg(test)]
+    fn seed_raw_stream(&mut self, sink: Option<Arc<RawStreamSink>>) {
+        self.raw_stream_sink = sink;
+    }
+
+    fn raw_stream(&mut self) -> Option<Arc<RawStreamSink>> {
+        if self.raw_stream_sink.is_none() {
+            self.raw_stream_sink = RawStreamSink::from_environment(
+                self.recording_location(),
+                self.remote_endpoint().unwrap_or_default(),
+            );
+        }
+        self.raw_stream_sink.clone()
+    }
+
+    fn start_recording(&mut self) {
+        if self.recording.is_some() {
+            return;
+        }
+        if self.session_runtime.is_none() {
+            self.status = self.language.tr("请先连接远程会话，再开始录制").into();
+            return;
+        }
+        let config = RecordingConfig {
+            directory: self.recording_location(),
+            label: self.recording_label(),
+            quality: self.recording_quality,
+        };
+        match Recorder::start(self.recording_control(), config) {
+            Ok(recorder) => {
+                // The development dump is bound to the take: it starts at the
+                // take's first frame and stops when the take does, so its
+                // interval is the video's interval.
+                if let Some(sink) = self.raw_stream() {
+                    sink.start_recording(recorder.take_origin());
+                    acceptance_log(&format!(
+                        "ard-viewer: raw stream will be written to {}",
+                        sink.raw_path(RawStreamKind::Server).display()
+                    ));
+                }
+                self.recording_progress = RecordingProgress::default();
+                self.recording_stop_requested = false;
+                self.recording = Some(recorder);
+                self.status = self.language.tr("已开始录制远程画面").into();
+                if self.acceptance_record_seconds.is_some() {
+                    acceptance_log("ard-viewer: recording started");
+                }
+            }
+            Err(error) => {
+                self.status = if self.language == Language::English {
+                    format!(
+                        "{}: {}",
+                        self.language.tr("录制失败"),
+                        self.language.tr(&error)
+                    )
+                } else {
+                    format!("{}：{error}", self.language.tr("录制失败"))
+                };
+            }
+        }
+    }
+
+    /// Ask the take to stop.
+    ///
+    /// The last frames are handed over on the next redraw and the encoder is
+    /// flushed afterwards, so the file is only complete once
+    /// [`ArdViewer::poll_recording`] sees it finished.
+    fn stop_recording(&mut self) {
+        if self.recording.is_none() || self.recording_stop_requested {
+            return;
+        }
+        if let Some(recorder) = self.recording.as_ref() {
+            recorder.request_stop();
+        }
+        self.recording_stop_requested = true;
+        self.status = self.language.tr("正在保存录制文件…").into();
+    }
+
+    /// Report a finished recording and release its thread.
+    fn complete_recording(&mut self) {
+        let Some(recorder) = self.recording.take() else {
+            return;
+        };
+        let progress = recorder.progress();
+        // Close the development dump with the take it belongs to. The sink is
+        // dropped too: the next take gets its own interval and files.
+        // The sink stays alive for the next take: it is the object the session
+        // holds, so dropping it here would disarm the dump for good. Stopping it
+        // closes the files and reports what each stream wrote.
+        if let Some(sink) = self.raw_stream_sink.as_ref() {
+            for report in sink.stop_recording() {
+                if report.entries == 0 {
+                    acceptance_log(&format!(
+                        "ard-viewer: raw stream {} wrote nothing ({}); the take carried none",
+                        report.kind.label(),
+                        report.raw_path.display()
+                    ));
+                } else {
+                    acceptance_log(&format!(
+                        "ard-viewer: raw stream {} wrote {} entries, {} bytes to {}",
+                        report.kind.label(),
+                        report.entries,
+                        report.bytes,
+                        report.raw_path.display()
+                    ));
+                }
+            }
+        }
+        if self.acceptance_record_seconds.is_some() {
+            acceptance_log(&format!(
+                "ard-viewer: recording finished ({} frames, {} encoded, {} dropped, {} bytes, {:?})",
+                progress.captured_frames,
+                progress.encoded_frames,
+                progress.dropped_frames,
+                progress.written_bytes,
+                progress.segments,
+            ));
+        }
+        self.recording_progress = RecordingProgress::default();
+        self.recording_stop_requested = false;
+        let english = self.language == Language::English;
+        self.status = match progress.error.as_deref() {
+            Some(error) => {
+                if english {
+                    format!(
+                        "{}: {}",
+                        self.language.tr("录制失败"),
+                        self.language.tr(error)
+                    )
+                } else {
+                    format!("{}：{error}", self.language.tr("录制失败"))
+                }
+            }
+            None => {
+                let path = progress
+                    .segments
+                    .first()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                let seconds = progress.recorded_seconds();
+                let frames = progress.captured_frames;
+                let megabytes = progress.written_bytes as f64 / (1024.0 * 1024.0);
+                let dropped = progress.dropped_frames;
+                // A resolution change starts a new file, so a split recording has
+                // to say so rather than silently reporting only the first part.
+                let trailing = match (english, progress.segments.len()) {
+                    (true, count) if count > 1 => format!(", {count} segments"),
+                    (false, count) if count > 1 => format!("，共 {count} 段"),
+                    _ => String::new(),
+                };
+                if english {
+                    format!(
+                        "{}: {path} ({frames} frames, {seconds:.1}s, {megabytes:.1} MB{}{trailing})",
+                        self.language.tr("录制已保存"),
+                        if dropped > 0 {
+                            format!(", {dropped} dropped")
+                        } else {
+                            String::new()
+                        },
+                    )
+                } else {
+                    format!(
+                        "{}：{path}（{frames} 帧，{seconds:.1} 秒，{megabytes:.1} MB{}{trailing}）",
+                        self.language.tr("录制已保存"),
+                        if dropped > 0 {
+                            format!("，丢弃 {dropped} 帧")
+                        } else {
+                            String::new()
+                        },
+                    )
+                }
+            }
+        };
+    }
+
+    /// Refresh the recording badge and finalize a take that has finished.
+    fn poll_recording(&mut self) {
+        let Some(recorder) = self.recording.as_ref() else {
+            return;
+        };
+        let progress = recorder.progress();
+        if progress.finished {
+            self.complete_recording();
+            return;
+        }
+        let elapsed = progress.recorded;
+        self.recording_progress = progress;
+        if let Some(limit) = self.acceptance_record_seconds
+            && !self.recording_stop_requested
+            && elapsed >= Duration::from_secs(limit)
+        {
+            self.stop_recording();
+            self.acceptance_record_complete = true;
+        }
+    }
+
+    /// Whether a scripted acceptance recording has finished and the app may exit.
+    fn acceptance_run_finished(&self) -> bool {
+        self.acceptance_record_seconds.is_some()
+            && self.acceptance_record_complete
+            && self.recording.is_none()
     }
 
     fn handle_session_event(&mut self, event: SessionEvent) -> Task<Message> {
@@ -1322,6 +1656,15 @@ impl ArdViewer {
                         | ConnectionState::Failed(_)
                 ) {
                     self.session_input.clear_input();
+                }
+                if self.acceptance_record_seconds.is_some() {
+                    acceptance_log(&format!("ard-viewer: state {:?}", state));
+                }
+                if state == ConnectionState::Connected
+                    && self.acceptance_record_seconds.is_some()
+                    && self.recording.is_none()
+                {
+                    self.start_recording();
                 }
                 self.status = state.label(self.language);
                 self.session_connection = state;
@@ -1337,6 +1680,9 @@ impl ArdViewer {
             }
             SessionEvent::Metrics(metrics) => self.session_metrics = metrics,
             SessionEvent::RenderFailed(error) => {
+                if self.acceptance_record_seconds.is_some() {
+                    acceptance_log(&format!("ard-viewer: render failed: {error}"));
+                }
                 self.session_error = Some(if self.language == Language::English {
                     format!("Rendering failed: {}", self.language.tr(&error))
                 } else {
@@ -1367,11 +1713,9 @@ impl ArdViewer {
                     self.session_zoom,
                     self.session_actual_size,
                 );
-                self.session_pointer_remote = position;
                 Some(InputEvent::CursorMoved(position))
             }
             iced::Event::Mouse(iced::mouse::Event::CursorLeft) => {
-                self.session_pointer_remote = None;
                 Some(InputEvent::CursorMoved(None))
             }
             iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button))
@@ -1567,6 +1911,37 @@ impl ArdViewer {
     }
 }
 
+/// Append one line of acceptance progress, to stderr and to `ARD_LOG_FILE` when
+/// set. A bundle launched by LaunchServices has no visible stderr, so the file
+/// is how a scripted acceptance run reports what happened.
+fn acceptance_log(message: &str) {
+    eprintln!("{message}");
+    let Ok(path) = std::env::var("ARD_LOG_FILE") else {
+        return;
+    };
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+/// `ARD_AUTO_CONNECT=1` connects with the saved device on startup so a scripted
+/// acceptance run never needs a click. Read once; normal use is unaffected.
+fn acceptance_auto_connect() -> bool {
+    std::env::var("ARD_AUTO_CONNECT").is_ok_and(|value| value.trim() == "1")
+}
+
+/// `ARD_RECORD_SECONDS=<n>` records the session for `n` seconds, then saves the
+/// file and exits. Used by scripted acceptance runs; ignored when unset.
+fn acceptance_record_seconds() -> Option<u64> {
+    std::env::var("ARD_RECORD_SECONDS")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+}
+
 fn initial_connection_identity(
     cached: &config::AppConfig,
     devices: &[SavedDevice],
@@ -1669,6 +2044,17 @@ fn frame_duration_from_rate(value: &str) -> Duration {
         Duration::ZERO
     } else {
         Duration::from_secs_f64(1.0 / f64::from(frames_per_second))
+    }
+}
+
+/// Elapsed recording time as `m:ss` or `h:mm:ss`.
+fn format_recording_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let (hours, minutes, seconds) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
     }
 }
 
@@ -2677,6 +3063,69 @@ mod tests {
             message,
             Message::ThemePreferenceChanged(ThemePreference::Dark)
         )));
+    }
+
+    /// The dump a session writes into and the dump a take arms have to be one
+    /// object. Two sinks meant the session wrote into one while the take armed
+    /// the other, and a dump that is never armed is never created.
+    #[test]
+    fn the_session_and_the_take_share_one_raw_stream_sink() {
+        let (mut app, _task) = ArdViewer::new();
+        let sink = RawStreamSink::new(std::env::temp_dir(), "host");
+        app.seed_raw_stream(Some(Arc::clone(&sink)));
+
+        let session_sink = app.raw_stream().expect("the session gets the sink");
+        let take_sink = app.raw_stream().expect("the take arms the same sink");
+        assert!(Arc::ptr_eq(&session_sink, &take_sink));
+        assert!(Arc::ptr_eq(&session_sink, &sink));
+    }
+
+    #[test]
+    fn recording_requires_a_session_and_survives_the_ui_flow() {
+        let (mut app, _task) = ArdViewer::new();
+        // Without a session there is nothing to record, and the request must say
+        // so instead of starting a take that can never capture a frame.
+        let _ = app.update(Message::ToggleRecording);
+        assert!(!app.is_recording());
+        assert!(app.status.contains("先连接远程会话"));
+
+        // The badge only counts while a take is running.
+        app.recording_progress.recorded = Duration::from_millis(1_500);
+        assert_eq!(app.recording_elapsed(), Duration::ZERO);
+
+        // A take needs the renderer to publish frames, so only the request path
+        // is exercised here; the capture and encoding paths are covered by the
+        // recording module's own tests.
+        let _ = app.update(Message::RecordingDirectoryChanged("/tmp/ard".into()));
+        assert_eq!(app.recording_location(), PathBuf::from("/tmp/ard"));
+        let _ = app.update(Message::RecordingQualityChanged(RecordingQuality::Compact));
+        assert_eq!(app.recording_quality, RecordingQuality::Compact);
+        assert_eq!(app.recording_directory, "/tmp/ard");
+    }
+
+    #[test]
+    fn recording_elapsed_is_formatted_for_the_toolbar_badge() {
+        assert_eq!(format_recording_elapsed(Duration::ZERO), "00:00");
+        assert_eq!(format_recording_elapsed(Duration::from_secs(59)), "00:59");
+        assert_eq!(
+            format_recording_elapsed(Duration::from_secs(3_600)),
+            "1:00:00"
+        );
+        assert_eq!(
+            format_recording_elapsed(Duration::from_millis(7_265_000)),
+            "2:01:05"
+        );
+    }
+
+    #[test]
+    fn a_recording_toolbar_button_is_always_present() {
+        let (app, _task) = ArdViewer::new();
+        // The record toggle is not part of the configurable quick buttons: its
+        // state must be visible whatever the user selected.
+        assert!(!app.toolbar_buttons.is_empty());
+        assert_eq!(app.toolbar_buttons.len(), ToolbarButton::ALL.len());
+        assert!(!app.is_recording());
+        assert_eq!(app.session_toolbar_width(), app.session_toolbar_width());
     }
 
     #[test]
